@@ -222,17 +222,30 @@ class Trainer:
         Prepare inputs based on model type. The model's forward pass will handle
         the specific training objective.
         """
+        is_pair = "text" in batch[0] and "text_pair" in batch[0]
+        text_pairs = [example["text_pair"] for example in batch]
+
         # Extract texts and labels from the batch of dictionaries
         texts = [example["text"] for example in batch]
             
         # Use tokenizer with padding and truncation
-        encoded = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.args.max_length,
-            return_tensors="mlx"
-        )
+        if is_pair:
+            encoded = self.tokenizer(
+                texts,
+                text_pairs,
+                padding=True,
+                truncation=True,
+                max_length=self.args.max_length,
+                return_tensors="mlx"
+            )
+        else:
+            encoded = self.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.args.max_length,
+                return_tensors="mlx"
+            )
         
         model_inputs = {
             "input_ids": encoded["input_ids"],

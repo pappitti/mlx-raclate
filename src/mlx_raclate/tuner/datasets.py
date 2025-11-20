@@ -250,7 +250,8 @@ def process_hf_dataset(
         dataset, 
         task_type: str, 
         text_field: str = "text", 
-        label_field: str = "label"
+        label_field: str = "label",
+        text_pair_field: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """Converts HuggingFace dataset to ModernBERT format"""
     processed_data = []
@@ -259,10 +260,13 @@ def process_hf_dataset(
         if task_type == "masked-lm":
             processed_data.append({"text": item.get(text_field)})
         elif task_type == "text-classification":
-            processed_data.append({
+            item_data = {
                 "text": item.get(text_field),
                 "label": item.get(label_field)
-            })
+            }
+            if text_pair_field:
+                item_data["text_pair"] = item.get(text_pair_field)
+            processed_data.append(item_data)
         elif task_type == "token-classification":
             processed_data.append({
                 "text": item.get(text_field),

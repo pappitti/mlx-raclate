@@ -2,16 +2,19 @@
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any, Literal
 
 import mlx.core as mx
 import mlx.nn as nn
 from .base import (
     BaseModelArgs,
-    BaseModelOutput,
     last_token_pooling,
     normalize_embeddings,
+    compute_similarity,
 )
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -40,6 +43,42 @@ class ModelArgs(BaseModelArgs):
     initializer_range: Optional[float] = (
         0.02  # Only needed in case of initializing weights
     )
+
+    ### pipeline args
+    decoder_bias=True,
+    classifier_pooling: Literal["cls", "mean"] = "cls"
+    classifier_dropout=0.0 
+    classifier_bias=False
+    sparse_prediction=True ### True seems a more appropriate value for MLM
+    sparse_pred_ignore_index=-100 
+    is_regression: Optional[bool] = None
+    label2id: Optional[Dict[str, int]] = None
+    id2label: Optional[Dict[int, str]] = None
+    pipeline_config: Optional[Dict[str, Any]] = None  # for Sequence Classification
+
+    @property
+    def num_labels(self) -> int:
+        """
+        Number of labels is determined by:
+        - For zero-shot classification: length of label_candidates
+        - For regression or binary with sigmoid: 1
+        - For classification: length of id2label mapping
+        """
+        
+        if self.is_regression:
+            return 1
+        
+        if self.pipeline_config and self.pipeline_config.get("binary_sigmoid", False):
+            return 1
+            
+        if self.id2label is None:
+            raise ValueError(
+                "id2label mapping must be provided for categorical classification. "
+                "For regression or binary classification with sigmoid output, "
+                "set is_regression=True or binary_sigmoid=True in pipeline_config."
+            )
+            
+        return len(self.id2label)
 
 
 class Attention(nn.Module):
@@ -147,6 +186,12 @@ class Qwen3Model(nn.Module):
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+
     def _update_attention_mask(self, attention_mask: Optional[mx.array] = None):
         """
         Creates a causal mask and combines it with the padding mask.
@@ -204,19 +249,10 @@ class Model(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
-        self.model_type = config.model_type
+        self.model_type = config.model_type # not used for now (placeholder)
         self.model = Qwen3Model(config)
 
-        # These are placeholders
-        # afaik, there is no Qwen3ForMaskedLM or Qwen3ForSequenceClassification models out there yet)
-        if config.architectures == ["Qwen3ForMaskedLM"]:
-            raise NotImplementedError("Qwen3ForMaskedLM is not implemented yet.")
-            self.head = Qwen3PredictionHead(config)
-            self.decoder = nn.Linear(
-                config.hidden_size, config.vocab_size, bias=config.decoder_bias
-            )
-
-        elif config.architectures == ["Qwen3ForSequenceClassification"]:
+        if config.architectures == ["Qwen3ForSequenceClassification"]:
             raise NotImplementedError(
                 "Qwen3ForSequenceClassification is not implemented yet."
             )
@@ -240,7 +276,12 @@ class Model(nn.Module):
             # Using softmax for multi-class classification
             return mx.softmax(logits, axis=-1)
 
-    def __call__(self, input_ids: mx.array, attention_mask: mx.array = None):
+    def __call__(
+            self, 
+            input_ids: mx.array, 
+            attention_mask: Optional[mx.array] = None, 
+            return_dict: Optional[bool] = True,
+        ) -> Dict:
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape
             attention_mask = mx.ones(
@@ -258,22 +299,13 @@ class Model(nn.Module):
 
         text_embeds = normalize_embeddings(pooled_embeddings)
 
-        pooled_output = None
-        # placeholder for masked LM and sequence classification heads
-        if self.config.architectures == ["Qwen3ForMaskedLM"]:
-            pooled_output = self.head(last_hidden_state)
-            pooled_output = self.decoder(pooled_output)
-        elif self.config.architectures == ["Qwen3ForSequenceClassification"]:
-            pooled_output = self.head(pooled_embeddings)
-            pooled_output = self.drop(pooled_output)
-            pooled_output = self.classifier(pooled_output)
-            pooled_output = self._process_outputs(pooled_output)
+        if not return_dict:
+            return (text_embeds, last_hidden_state) 
 
-        return BaseModelOutput(
-            last_hidden_state=last_hidden_state,
-            text_embeds=text_embeds,
-            pooler_output=pooled_output,
-        )
+        return {
+            "embeddings": text_embeds, # normalized embeddings
+            "last_hidden_state": last_hidden_state,
+        }
 
     def sanitize(self, weights):
         # no need for lm_head.weight in Qwen3 for embedding models
@@ -310,4 +342,381 @@ class Model(nn.Module):
 
             sanitized_weights[new_key] = value
 
+        return sanitized_weights
+
+
+class ModelForSentenceSimilarity(Model):
+    """
+    Computes similarity scores between input sequences and reference sentences.
+    """
+    def __init__(self, config):
+        super().__init__(config)
+    
+    def __call__(
+        self,
+        input_ids,
+        reference_input_ids : Optional[mx.array] = None,  # Shape: [num_references, seq_len]
+        attention_mask: Optional[mx.array] = None,
+        reference_attention_mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
+        similarity_scores: Optional[mx.array] = None,  # Shape: [batch_size, num_references]
+        return_dict: Optional[bool] = True,
+    ):
+        # Get embeddings for input batch
+        batch_outputs = super().__call__(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids, ### ?
+            return_dict=True
+        )
+        batch_embeddings = batch_outputs["embeddings"]  # [batch_size, hidden_size]
+
+        if reference_input_ids is not None:
+        
+            # Get embeddings for reference sentences
+            ref_outputs = super().__call__(
+                input_ids=reference_input_ids,
+                attention_mask=reference_attention_mask,
+                position_ids=position_ids, ### ?
+                return_dict=True
+            )
+            reference_embeddings = ref_outputs["embeddings"]  # [num_references, hidden_size]
+            
+            # Compute similarities between batch and references
+            similarities = compute_similarity(
+                batch_embeddings,  # [batch_size, hidden_size]
+                reference_embeddings  # [num_references, hidden_size]
+            )  # Result: [batch_size, num_references]
+            
+            loss = None
+            if similarity_scores is not None:
+                # MSE loss between computed similarities and target scores
+                # similarity_scores should be shape [batch_size, num_references]
+                loss = nn.losses.mse_loss(similarities, similarity_scores)
+        
+        else:
+            similarities = None
+            loss = None
+            
+        if not return_dict:
+            return (loss, similarities, batch_embeddings)
+            
+        return {
+            "loss": loss,
+            "similarities": similarities,  # [batch_size, num_references]
+            "embeddings": batch_embeddings,  # [batch_size, hidden_size]
+        }
+
+class ModelForSentenceTransformers(ModelForSentenceSimilarity):
+    """
+    Extends ModelForSentenceSimilarity to provide embeddings for input sequences.
+    This class sanitizes typical sentence transformers weights to align with the ModernBERT model.
+    """
+    def __init__(self, config: ModelArgs):
+        super().__init__(config)
+
+    def sanitize(self, weights):
+        """Convert sentence transformer weights to ModernBERT format."""
+        sanitized_weights = {}
+        
+        for k, v in weights.items():
+            if "position_ids" in k:
+                # Remove unused position_ids
+                continue
+            else:
+                new_key = "model." + k
+                sanitized_weights[new_key] = v
+        return sanitized_weights
+    
+class ModelForMaskedLM(nn.Module):
+    """
+    Computes masked language modeling (MLM) loss for input sequences.
+    """
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.model_type = config.model_type # not used for now (placeholder)
+        self.model = Qwen3Model(config)
+        self.head = Qwen3PredictionHead(config)
+        self.decoder = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=config.decoder_bias
+        )
+        logger.warning("Causal models such as Qwen3 are not ideal for Masked Language Modeling tasks.")
+
+        self.tie_weights() # TBC (if not, handle in sanitize)
+    
+    def tie_weights(self):
+        embedding_layer = self.model.get_input_embeddings()
+        self.decoder.weight = embedding_layer.weight
+    
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+    
+    def get_output_embeddings(self):
+        return self.decoder
+    
+    def set_input_embeddings(self, value):
+        self.model.set_input_embeddings(value)
+        self.tie_weights()  # Re-tie weights after setting new embeddings
+    
+    def set_output_embeddings(self, new_embeddings):
+        self.decoder = new_embeddings
+        self.tie_weights()  # Re-tie weights after setting new decoder
+
+    def __call__(
+        self,
+        input_ids,
+        attention_mask: Optional[mx.array] = None,
+        labels: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = True,
+    ) -> Dict:
+        if attention_mask is None:
+            batch_size, seq_len = input_ids.shape
+            attention_mask = mx.ones(
+                (batch_size, seq_len),
+                dtype=self.model.embed_tokens.weight.dtype,
+            )
+
+        out = self.model(input_ids, attention_mask)
+        last_hidden_state = (
+            out["last_hidden_state"] if isinstance(out, dict) else out[0]
+        )
+
+        logits = self.head(last_hidden_state)
+        logits = self.decoder(logits)
+
+        loss = None
+        if labels is not None :  
+            ### TBC
+            if getattr(self.config, "sparse_prediction", False):
+                # Flatten labels and predictions
+                flat_labels = labels.reshape(-1)
+                flat_predictions = logits.reshape(-1, logits.shape[-1])
+                
+                # Filter out non-masked tokens
+                ignore_index = getattr(self.config, "sparse_pred_ignore_index", -100)
+                mask_tokens = flat_labels != ignore_index
+                
+                # Only compute loss on masked tokens
+                masked_predictions = flat_predictions[mask_tokens]
+                masked_labels = flat_labels[mask_tokens]
+                
+                loss = nn.losses.cross_entropy(
+                    masked_predictions,
+                    masked_labels,
+                    reduction='mean'
+                )
+            else:
+                # Standard loss computation on all tokens
+                loss = nn.losses.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    labels.reshape(-1),
+                    reduction='mean'
+                )
+            
+        if not return_dict:
+            return [loss, logits, out[1:]]
+            
+        return {
+            "loss": loss,
+            "logits": logits,
+            "hidden_states": out.get("hidden_states", None),
+        }
+
+    def sanitize(self, weights):
+        # TBC (can't be tested without checkpoints)
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if "position_ids" in k:
+                # Remove unused position_ids
+                continue
+            if k == "model.embeddings.tok_embeddings.weight":
+                ### going around the weight tying issue. TODO : improve this
+                sanitized_weights["decoder.weight"] = v
+                sanitized_weights[k] = v
+            else:
+                sanitized_weights[k] = v
+        return sanitized_weights
+
+class ModelForSequenceClassification(nn.Module):
+    """
+    Computes sequence classification probabilities for input sequences.
+    Sanitization alignes typical BERT weights with the ModernBERT model.
+
+    NOTE : binary classification not tested.
+    """
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.num_labels = config.num_labels
+        self.is_regression = config.is_regression
+        
+        self.model = Qwen3Model(config)
+        self.head = Qwen3PredictionHead(config)
+        self.drop = nn.Dropout(p=config.classifier_dropout)
+        self.classifier = nn.Linear(
+            config.hidden_size, 
+            config.num_labels, 
+            bias=True ### bias=config.classifier_bias removed because mismatch with HF checkpoint
+        ) 
+    
+    def _process_outputs(self, logits: mx.array) -> mx.array:
+        """Apply the appropriate activation function to the logits."""
+        if self.is_regression:
+            return logits  # No activation for regression
+        elif self.num_labels == 1:
+            return mx.sigmoid(logits)  # Binary classification
+        else:
+            # Using softmax for multi-class classification
+            return mx.softmax(logits, axis=-1)
+
+    def _compute_loss(self, logits: mx.array, labels: mx.array) -> mx.array:
+        """Compute the appropriate loss based on label characteristics."""
+        if self.is_regression:
+            return nn.losses.mse_loss(logits.squeeze(), labels.squeeze())
+        elif self.num_labels == 1:
+            return nn.losses.binary_cross_entropy(mx.sigmoid(logits), labels)
+        else:
+            return nn.losses.cross_entropy(
+                logits.reshape(-1, self.num_labels),
+                labels.reshape(-1)
+            )
+
+    def __call__(
+        self,
+        input_ids,
+        attention_mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None, ### need this?
+        labels: Optional[mx.array] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = True,
+    ) -> Dict:
+        if attention_mask is None:
+            batch_size, seq_len = input_ids.shape
+            attention_mask = mx.ones(
+                (batch_size, seq_len),
+                dtype=self.model.embed_tokens.weight.dtype,
+            )
+
+        out = self.model(input_ids, attention_mask)
+        last_hidden_state = (
+            out["last_hidden_state"] if isinstance(out, dict) else out[0]
+        )
+
+        # pooling for AR models such as Qwen3 leverages the last token
+        pooled_embeddings = last_token_pooling(last_hidden_state, attention_mask)
+
+        pooled_output = self.head(pooled_embeddings)
+        pooled_output = self.drop(pooled_output)
+        logits = self.classifier(pooled_output)
+
+        processed_logits = self._process_outputs(logits)
+
+        loss = None
+        if labels is not None :
+            loss = self._compute_loss(logits, labels)
+
+        if not return_dict:
+            return [loss, processed_logits, out[1:]]
+
+        return {
+            "loss": loss,
+            "probabilities": processed_logits,
+            "hidden_states": out.get("hidden_states", None),
+        }
+    
+    def sanitize(self, weights):
+        # TBC (can't be tested without checkpoints)
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if "position_ids" in k:
+                # Remove unused position_ids
+                continue
+            if k in ["decoder.bias"]:
+                ### this is the hack
+                continue
+            elif k.startswith("bert"):
+                # Handle legacy BERT naming if needed
+                new_k = k.replace("bert.", "model.")
+                sanitized_weights[new_k] = v
+            else:
+                sanitized_weights[k] = v
+        return sanitized_weights
+
+class ModelForTokenClassification(nn.Module):
+    """
+    Computes token classification probabilities for input sequences.
+
+    NOTE: untested for now
+    """
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config       
+        self.num_labels = config.num_labels
+
+        self.model = Qwen3Model(config)
+        self.head = Qwen3PredictionHead(config)
+        self.drop = nn.Dropout(p=config.classifier_dropout)
+        self.classifier = nn.Linear(
+            config.hidden_size, 
+            config.num_labels, 
+            bias=config.classifier_bias
+        ) 
+
+    def __call__(
+        self,
+        input_ids,
+        attention_mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
+        labels: Optional[mx.array] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = True,
+    ) -> Dict:
+        if attention_mask is None:
+            batch_size, seq_len = input_ids.shape
+            attention_mask = mx.ones(
+                (batch_size, seq_len),
+                dtype=self.model.embed_tokens.weight.dtype,
+            )
+
+        out = self.model(input_ids, attention_mask)
+        last_hidden_state = (
+            out["last_hidden_state"] if isinstance(out, dict) else out[0]
+        )
+        
+        # Apply prediction head, dropout, and classification layer to each token (no pooling)
+        sequence_output = self.head(last_hidden_state)
+        sequence_output = self.drop(sequence_output)
+        logits = self.classifier(sequence_output)
+
+        # Process logits for inference
+        processed_logits = mx.softmax(logits, axis=-1)
+
+        loss = None
+        if labels is not None:
+            # Compute token classification loss
+            loss = nn.losses.cross_entropy(
+                logits.reshape(-1, self.num_labels),
+                labels.reshape(-1)
+            )
+
+        if not return_dict:
+            return [loss,  processed_logits, out[1:]]
+
+        return {
+            "loss": loss,
+            "probabilities": processed_logits,
+            "hidden_states": out.get("hidden_states", None),
+        }
+    
+    def sanitize(self, weights):
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if "position_ids" in k:
+                # Remove unused position_ids
+                continue
+            else:
+                sanitized_weights[k] = v
         return sanitized_weights

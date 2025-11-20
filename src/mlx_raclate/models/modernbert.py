@@ -5,11 +5,9 @@ from typing import Optional, Dict, Literal, Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, compute_similarity
+from .base import BaseModelArgs, compute_similarity, mean_pooling, normalize_embeddings
 
-""" NOTE : removed all the attention_outputs (eager mode), may add it back later
-given no flash attention 2, padded/unpadded was also removed
-"""
+""" NOTE : This implementation of ModernBERT excludes all features related to Flash Attention 2, padded/unpadded handling"""
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -19,7 +17,6 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
-    ### hidden_activation : str = "gelu" ## should not be necessary, we'd just apply gelu.
     max_position_embeddings: Optional[int] = None
     norm_eps: float = 1e-05
     norm_bias : bool = False
@@ -47,7 +44,6 @@ class ModelArgs(BaseModelArgs):
     classifier_pooling: Literal["cls", "mean"] = "cls"
     classifier_dropout=0.0 
     classifier_bias=False
-    # classifier_activation="gelu"
     sparse_prediction=True ### True seems a more appropriate value for MLM
     sparse_pred_ignore_index=-100 
     is_regression: Optional[bool] = None
@@ -354,7 +350,6 @@ class ModernBertModel(nn.Module):
 
 
 ### below are the classes for specific pipelines
-
 class Model(nn.Module):
     """
     Computes embeddings for input sequences using a ModernBERT model.
@@ -389,21 +384,22 @@ class Model(nn.Module):
             output_hidden_states=None, # Not needed, only last_hidden_state is returned
             return_dict=return_dict,
         )
-        hidden_state = encoder_outputs["last_hidden_state"] if isinstance(encoder_outputs, dict) else encoder_outputs[0] 
+        last_hidden_state = encoder_outputs["last_hidden_state"] if isinstance(encoder_outputs, dict) else encoder_outputs[0] 
         
-        # Do pooling here (unlike BERT)
+        # Pooling based on config
         if self.config.classifier_pooling == "cls":
-            pooled = hidden_state[:, 0]
+            pooled = last_hidden_state[:, 0]
         elif self.config.classifier_pooling == "mean":                
-            attention_mask = mx.expand_dims(attention_mask, -1)
-            pooled = mx.sum(hidden_state * attention_mask, axis=1) / mx.sum(attention_mask, axis=1)
+            pooled = mean_pooling(last_hidden_state, attention_mask)
+
+        text_embeds = normalize_embeddings(pooled)
 
         if not return_dict:
-            return (pooled, hidden_state) 
+            return (text_embeds, last_hidden_state) 
 
         return {
-            "embeddings": pooled,
-            "last_hidden_state": hidden_state,
+            "embeddings": text_embeds, # normalized embeddings
+            "last_hidden_state": last_hidden_state,
         }
     
     def sanitize(self, weights):
@@ -507,15 +503,16 @@ class ModelForSentenceTransformers(ModelForSentenceSimilarity):
 class ModernBertPredictionHead(nn.Module):
     def __init__(self, config : ModelArgs):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size, bias=False) ### current HF checkpoint does not have bias for the dense layer
+        self.dense = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=False
+        ) ### current HF checkpoint does not have bias for the dense layer
         self.act = nn.GELU()
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.norm = nn.LayerNorm(
+            config.hidden_size, eps=config.norm_eps, bias=config.norm_bias
+        )
 
     def __call__(self, hidden_states):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
+        return self.norm(self.act(self.dense(hidden_states)))
 
 
 class ModelForMaskedLM(nn.Module):
@@ -527,7 +524,9 @@ class ModelForMaskedLM(nn.Module):
         self.config = config
         self.model = ModernBertModel(config)
         self.head = ModernBertPredictionHead(config) ## no bias for this in the current HF checkpoint
-        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=config.decoder_bias)
+        self.decoder = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=config.decoder_bias
+        )
 
         # Tie weights ### does not seem to work (sanitizing the weights to enforce weight tying)
         self.tie_weights()
@@ -572,8 +571,8 @@ class ModelForMaskedLM(nn.Module):
             return_dict=return_dict,
         )
         
-        hidden_states = outputs["last_hidden_state"] if return_dict else outputs[0]
-        logits = self.head(hidden_states)  
+        last_hidden_state = outputs["last_hidden_state"] if return_dict else outputs[0]
+        logits = self.head(last_hidden_state)  
         logits = self.decoder(logits)
         
         loss = None
@@ -701,8 +700,7 @@ class ModelForSequenceClassification(nn.Module):
         if self.config.classifier_pooling == "cls":
             pooled = last_hidden_state[:, 0]
         elif self.config.classifier_pooling == "mean":
-            attention_mask = mx.expand_dims(attention_mask, -1)
-            pooled = mx.sum(last_hidden_state * attention_mask, axis=1) / mx.sum(attention_mask, axis=1)
+            pooled = mean_pooling(last_hidden_state, attention_mask)
 
         # Apply head, dropout and classifier
         pooled = self.head(pooled)
@@ -783,10 +781,10 @@ class ModelForTokenClassification(nn.Module):
             return_dict=return_dict,
         )
 
-        sequence_output = outputs["last_hidden_state"] if return_dict else outputs[0]
+        last_hidden_state = outputs["last_hidden_state"] if return_dict else outputs[0]
         
         # Apply prediction head, dropout, and classification layer to each token
-        sequence_output = self.head(sequence_output)
+        sequence_output = self.head(last_hidden_state)
         sequence_output = self.drop(sequence_output)
         logits = self.classifier(sequence_output)
 
