@@ -1,0 +1,22 @@
+[project]
+name = "mlx-raclate"
+version = "0.1.0"
+description = "Raclate is a python library to run and train models for Retrieval and Classification, built on top of MLX."
+readme = "README.md"
+authors = [
+    { name = "pappitti", email = "pap@pitti.io" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "mlx>=0.29.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.1",
+    "ruff>=0.14.5",
+]
