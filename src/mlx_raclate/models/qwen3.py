@@ -428,117 +428,8 @@ class ModelForSentenceTransformers(ModelForSentenceSimilarity):
                 sanitized_weights[new_key] = v
         return sanitized_weights
     
-class ModelForMaskedLM(nn.Module):
-    """
-    Computes masked language modeling (MLM) loss for input sequences.
-    """
-    def __init__(self, config: ModelArgs):
-        super().__init__()
-        self.config = config
-        self.model_type = config.model_type # not used for now (placeholder)
-        self.model = Qwen3Model(config)
-        self.head = Qwen3PredictionHead(config)
-        self.decoder = nn.Linear(
-            config.hidden_size, config.vocab_size, bias=config.decoder_bias
-        )
-        logger.warning("Causal models such as Qwen3 are not ideal for Masked Language Modeling tasks.")
-
-        self.tie_weights() # TBC (if not, handle in sanitize)
-    
-    def tie_weights(self):
-        embedding_layer = self.model.get_input_embeddings()
-        self.decoder.weight = embedding_layer.weight
-    
-    def get_input_embeddings(self):
-        return self.model.get_input_embeddings()
-    
-    def get_output_embeddings(self):
-        return self.decoder
-    
-    def set_input_embeddings(self, value):
-        self.model.set_input_embeddings(value)
-        self.tie_weights()  # Re-tie weights after setting new embeddings
-    
-    def set_output_embeddings(self, new_embeddings):
-        self.decoder = new_embeddings
-        self.tie_weights()  # Re-tie weights after setting new decoder
-
-    def __call__(
-        self,
-        input_ids,
-        attention_mask: Optional[mx.array] = None,
-        labels: Optional[mx.array] = None,
-        position_ids: Optional[mx.array] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = True,
-    ) -> Dict:
-        if attention_mask is None:
-            batch_size, seq_len = input_ids.shape
-            attention_mask = mx.ones(
-                (batch_size, seq_len),
-                dtype=self.model.embed_tokens.weight.dtype,
-            )
-
-        out = self.model(input_ids, attention_mask)
-        last_hidden_state = (
-            out["last_hidden_state"] if isinstance(out, dict) else out[0]
-        )
-
-        logits = self.head(last_hidden_state)
-        logits = self.decoder(logits)
-
-        loss = None
-        if labels is not None :  
-            ### TBC
-            if getattr(self.config, "sparse_prediction", False):
-                # Flatten labels and predictions
-                flat_labels = labels.reshape(-1)
-                flat_predictions = logits.reshape(-1, logits.shape[-1])
-                
-                # Filter out non-masked tokens
-                ignore_index = getattr(self.config, "sparse_pred_ignore_index", -100)
-                mask_tokens = flat_labels != ignore_index
-                
-                # Only compute loss on masked tokens
-                masked_predictions = flat_predictions[mask_tokens]
-                masked_labels = flat_labels[mask_tokens]
-                
-                loss = nn.losses.cross_entropy(
-                    masked_predictions,
-                    masked_labels,
-                    reduction='mean'
-                )
-            else:
-                # Standard loss computation on all tokens
-                loss = nn.losses.cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]),
-                    labels.reshape(-1),
-                    reduction='mean'
-                )
-            
-        if not return_dict:
-            return [loss, logits, out[1:]]
-            
-        return {
-            "loss": loss,
-            "logits": logits,
-            "hidden_states": out.get("hidden_states", None),
-        }
-
-    def sanitize(self, weights):
-        # TBC (can't be tested without checkpoints)
-        sanitized_weights = {}
-        for k, v in weights.items():
-            if "position_ids" in k:
-                # Remove unused position_ids
-                continue
-            if k == "model.embeddings.tok_embeddings.weight":
-                ### going around the weight tying issue. TODO : improve this
-                sanitized_weights["decoder.weight"] = v
-                sanitized_weights[k] = v
-            else:
-                sanitized_weights[k] = v
-        return sanitized_weights
+# MaskedLM not implemented for now AR models such as Qwen3
+# Attempting to train pretrained weights would be catastrophic 
 
 class ModelForSequenceClassification(nn.Module):
     """
@@ -634,8 +525,7 @@ class ModelForSequenceClassification(nn.Module):
             if "position_ids" in k:
                 # Remove unused position_ids
                 continue
-            if k in ["decoder.bias"]:
-                ### this is the hack
+            elif "lm_head" in k:
                 continue
             elif k.startswith("bert"):
                 # Handle legacy BERT naming if needed
@@ -685,7 +575,7 @@ class ModelForTokenClassification(nn.Module):
         last_hidden_state = (
             out["last_hidden_state"] if isinstance(out, dict) else out[0]
         )
-        
+
         # Apply prediction head, dropout, and classification layer to each token (no pooling)
         sequence_output = self.head(last_hidden_state)
         sequence_output = self.drop(sequence_output)
@@ -716,6 +606,8 @@ class ModelForTokenClassification(nn.Module):
         for k, v in weights.items():
             if "position_ids" in k:
                 # Remove unused position_ids
+                continue
+            elif "lm_head" in k:
                 continue
             else:
                 sanitized_weights[k] = v
