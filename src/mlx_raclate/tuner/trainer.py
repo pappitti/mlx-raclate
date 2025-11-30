@@ -10,84 +10,20 @@ from functools import partial
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers
+from datasets import Dataset as HFDataset
 
 from mlx.utils import tree_flatten, tree_map
 
-from .datasets import Dataset
+# from .datasets import Dataset
 
-
-def grad_checkpoint(model):
-    """
-    Apply gradient checkpointing to the model's forward pass to reduce memory usage.
-    Uses MLX's checkpoint mechanism to save memory during backpropagation.
-    """
-    def checkpoint_fn(module):
-        original_call = module.__call__
-
-        def checkpointed_call(self, **kwargs):
-            # Let MLX handle the parameter management, just checkpoint the function call
-            return mx.checkpoint(original_call)(self, **kwargs)
-
-        module.__call__ = checkpointed_call
-    
-    # Checkpoint transformer layers - these are the main memory users
-    for layer in model.model.layers:
-        checkpoint_fn(layer)
-
-    ### TODO : optionally checkpoint other layers  (head, classifier) 
-
-def create_mlm_masks(
-    input_ids: mx.array,
-    tokenizer,
-    mlm_probability: float = 0.15
-) -> Tuple[mx.array, mx.array]:
-    """
-    Creates masked input and corresponding labels for MLM training.
-    
-    Args:
-        input_ids: Original input token IDs
-        tokenizer: Tokenizer with special token information
-        mlm_probability: Probability of masking a token (default 15%)
-    
-    Returns:
-        Tuple of (masked_inputs, mlm_labels) where mlm_labels contains
-        the original tokens at masked positions and -100 elsewhere
-    """
-    # Create probability mask
-    probability_matrix = mx.random.uniform(input_ids.shape) < mlm_probability
-    
-    # Don't mask special tokens like [CLS], [SEP], etc.
-    special_tokens_mask = mx.array([
-        [1 if token_id in [tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.pad_token_id]
-         else 0 for token_id in input_sequence]
-        for input_sequence in input_ids
-    ])
-    probability_matrix = mx.where(special_tokens_mask, 0, probability_matrix)
-    
-    # Create labels: -100 for unmasked tokens (ignored in loss computation)
-    labels = mx.where(probability_matrix, input_ids, -100)
-    
-    # Decide replacement strategy for each masked token:
-    # 80% [MASK], 10% random, 10% unchanged
-    random_matrix = mx.random.uniform(input_ids.shape)
-    
-    # Indices for [MASK] tokens (80% of masked tokens)
-    mask_indices = (probability_matrix) & (random_matrix < 0.8)
-    # Indices for random tokens (10% of masked tokens)
-    random_indices = (probability_matrix) & (random_matrix >= 0.8) & (random_matrix < 0.9)
-    
-    # Create masked input
-    masked_inputs = input_ids.copy()
-    # Replace with [MASK] token
-    masked_inputs = mx.where(mask_indices, tokenizer.mask_token_id, masked_inputs)
-    # Replace with random tokens
-    random_tokens = mx.random.randint(
-        0, tokenizer.vocab_size, 
-        shape=input_ids.shape
-    )
-    masked_inputs = mx.where(random_indices, random_tokens, masked_inputs)
-    
-    return masked_inputs, labels
+from .collators import (
+    DataCollatorForMaskedLanguageModeling, 
+    DataCollatorForSequenceClassification,
+    DataCollatorForSentenceSimilarity,
+    DataCollatorForSentenceTransformers,
+    DataCollatorForTokenClassification,
+    DataCollator
+)
 
 @dataclass
 class TrainingArgs:
@@ -137,8 +73,8 @@ class Trainer:
         tokenizer,
         task_type: str,
         training_args: TrainingArgs,
-        train_dataset: Dataset,
-        eval_dataset: Optional[Dataset] = None,
+        train_dataset: HFDataset,
+        eval_dataset: Optional[HFDataset] = None,
         optimizer = None
     ):
         self.model = model
@@ -147,155 +83,123 @@ class Trainer:
         self.args = training_args
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
+        self.data_collator = self._get_collator()
         
         # Initialize optimizer
         self.optimizer = optimizer or mlx.optimizers.AdamW(
             learning_rate=training_args.learning_rate,
             weight_decay=training_args.weight_decay
         )
+
+        # Setup output directory
+        self.output_dir = Path(training_args.output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Setup training state and output directory
         self.global_step = 0
         self.epoch = 0
-        self.output_dir = Path(training_args.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+
         # Capture state that needs updating (random state for Dropout, etc.)
         self.state = [self.model.state, self.optimizer.state, mx.random.state]
         
         # Enable gradient checkpointing if requested
         if training_args.grad_checkpoint:
-            grad_checkpoint(model)
+            self._apply_grad_checkpointing()
+            
+        def loss_fn(model, batch):
+            outputs = model(**batch)
+            return mx.mean(outputs["loss"])
 
-        # Compile step function once
-        @partial(mx.compile, inputs=self.state, outputs=self.state)
-        def step(batch, is_accumulating): 
-            # Get the loss function 
-            loss_and_grad_fn = nn.value_and_grad(self.model, self._compute_loss)
-            loss, grads = loss_and_grad_fn(batch)
-            
-             # Scale gradients if accumulating
-            if self.args.gradient_accumulation_steps > 1:
-                scale = 1.0 / self.args.gradient_accumulation_steps
-                loss = loss * scale
-                grads = tree_map(lambda g: g * scale if isinstance(g, mx.array) else g, grads)
-                    
-            # Only update when we're not accumulating
-            if not is_accumulating:
-                self.optimizer.update(self.model, grads)
-                
-            return loss, grads
-            
-        self._step = step
+        self.loss_and_grad_fn = nn.value_and_grad(self.model, loss_fn)
         
-        # Log model type and config
-        self.push_to_hub = training_args.push_to_hub
-       
+        # Compile it
+        self.step_calc = mx.compile(self.loss_and_grad_fn)
+
+        # 2. Optimizer Update Function
+        # We define a function that takes the model and ACCUMULATED grads
+        def update_fn(model, optimizer, grads):
+            optimizer.update(model, grads)
+        
+        self.step_update = mx.compile(update_fn)
+        self.push_to_hub = training_args.push_to_hub 
+        
         print(f"Training {model.__class__.__name__}")
-            
+        # Log model type and config           
         self._save_config()
+
+    def _apply_grad_checkpointing(self):
+        """
+        Apply gradient checkpointing to the model's forward pass to reduce memory usage.
+        Uses MLX's checkpoint mechanism to save memory during backpropagation.
+        """
+        def checkpoint_fn(module):
+            original_call = module.__call__
+
+            def checkpointed_call(self, **kwargs):
+                # Let MLX handle the parameter management, just checkpoint the function call
+                return mx.checkpoint(original_call)(self, **kwargs)
+
+            module.__call__ = checkpointed_call
+        
+        # Checkpoint transformer layers - these are the main memory users
+        for layer in self.model.model.layers:
+            checkpoint_fn(layer)
+
+        ### TODO : optionally checkpoint other layers  (head, classifier) 
+
 
     def _compute_loss(self, batch_inputs): 
         """Compute the loss for training"""
         outputs = self.model(**batch_inputs)
         return mx.mean(outputs["loss"])
     
-    def _create_batches(self, dataset, batch_size, shuffle=False):
-        """Create optimized batches with minimal Python overhead"""
-        data_len = len(dataset)
+    def _get_collator(self) -> DataCollator:
+        if self.task_type == "masked-lm":
+            return DataCollatorForMaskedLanguageModeling(
+                tokenizer=self.tokenizer, 
+                max_length=self.args.max_length
+            )
+        elif self.task_type == "text-classification":
+            return DataCollatorForSequenceClassification(
+                tokenizer=self.tokenizer, 
+                max_length=self.args.max_length
+            )
+        elif self.task_type == "token-classification":
+            return DataCollatorForTokenClassification(
+                tokenizer=self.tokenizer, 
+                max_length=self.args.max_length
+            )
+        elif self.task_type == "sentence-similarity":
+            return DataCollatorForSentenceSimilarity(
+                tokenizer=self.tokenizer, 
+                max_length=self.args.max_length
+            )
+        elif self.task_type == "sentence-transformers":
+            return DataCollatorForSentenceTransformers(
+                tokenizer=self.tokenizer, 
+                max_length=self.args.max_length
+            )
+        # TODO : add other tasks & collators
+        raise ValueError(f"No collator defined for {self.task_type}")
 
-        # Create a shuffled copy of the dataset if needed
+
+    def _create_batches(self, dataset, batch_size, shuffle=False):
+        """
+        Iterates over HF dataset, slices it, and passes to collator.
+        """
+        data_len = len(dataset)
+        
+        # Use HF dataset's efficient shuffle which works with memory mapping
         if shuffle:
-            # Shuffle the entire dataset first
-            indices = mx.random.permutation(data_len).tolist()
-            shuffled_data = [dataset.data[i] for i in indices]
-        else:
-            shuffled_data = dataset.data
+            dataset = dataset.shuffle(seed=42) # ideally seed changes per epoch
             
-        # Now split into batches
+        # Standard iteration
         for start_idx in range(0, data_len, batch_size):
             end_idx = min(start_idx + batch_size, data_len)
-            batch_data = shuffled_data[start_idx:end_idx]
-            yield self._prepare_batch(batch_data)
-
-    def _prepare_batch(self, batch: List[Dict[str, Any]]) -> Dict[str, mx.array]:
-        """
-        Prepare inputs based on model type. The model's forward pass will handle
-        the specific training objective.
-        """
-        is_pair = "text" in batch[0] and "text_pair" in batch[0]
-        text_pairs = [example["text_pair"] for example in batch]
-
-        # Extract texts and labels from the batch of dictionaries
-        texts = [example["text"] for example in batch]
-            
-        # Use tokenizer with padding and truncation
-        if is_pair:
-            encoded = self.tokenizer(
-                texts,
-                text_pairs,
-                padding=True,
-                truncation=True,
-                max_length=self.args.max_length,
-                return_tensors="mlx"
-            )
-        else:
-            encoded = self.tokenizer(
-                texts,
-                padding=True,
-                truncation=True,
-                max_length=self.args.max_length,
-                return_tensors="mlx"
-            )
-        
-        model_inputs = {
-            "input_ids": encoded["input_ids"],
-            "attention_mask": encoded["attention_mask"],
-            "position_ids": mx.arange(encoded["input_ids"].shape[1])[None, :]
-        }
-        
-        # Add task-specific labels
-        ### TODO : do better than this (once all tasks are implemented)
-        if self.task_type == "text-classification" :
-            if self.model.is_regression:
-                model_inputs["labels"] = mx.array([example["label"] for example in batch], dtype=mx.float32)
-            else:
-                model_inputs["labels"] = mx.array([example["label"] for example in batch])
-
-        elif self.task_type == "token-classification":
-            model_inputs["labels"] = mx.array([example["label"] for example in batch])
-
-        elif self.task_type == "sentence-transformers" or self.task_type == "sentence-similarity":
-            similarity_scores = [example["similarity_score"] for example in batch]
-            model_inputs["similarity_score"] = mx.array(similarity_scores, dtype=mx.float32)
-            ### what's the format of the reference_texts?
-            ### placeholder below
-            reference_texts = [example["reference_text"] for example in batch]
-            reference_encoded = self.tokenizer(
-                reference_texts,
-                padding=True,
-                truncation=True,
-                max_length=self.args.max_length,
-                return_tensors="mlx"
-            )
-            model_inputs["reference_input_ids"] = reference_encoded["input_ids"]
-            model_inputs["reference_attention_mask"] = reference_encoded["attention_mask"]
-
-        elif self.task_type == "zero-shot-classification":
-            labels = [example["label"] for example in batch]
-            model_inputs["labels"] = mx.array(labels)
-            
-        elif self.task_type == "masked-lm":
-            # For MLM, we need to mask some tokens
-            inputs, labels = create_mlm_masks(
-                model_inputs["input_ids"],
-                self.tokenizer
-            )
-            model_inputs["input_ids"] = inputs
-            model_inputs["labels"] = labels
-        else:
-            raise ValueError(f"Unsupported task type: {self.task_type}")
-            
-        return model_inputs
+            batch_slice = dataset[start_idx:end_idx]
+            # HF Dataset slicing returns a Dict of lists: {'text': ['a', 'b'], 'label': [0, 1]}
+             # Convert HF Columnar batch (Dict[str, List]) to MLX batch (Dict[str, mx.array])
+            yield self.data_collator(batch_slice)
 
     def train(self):
         """Main training loop."""
@@ -316,39 +220,50 @@ class Trainer:
         total_loss = 0
         n_steps = 0
         start_time = time.time()
+        
+        # Accumulation container
         accumulated_grads = None
+        steps_to_accumulate = self.args.gradient_accumulation_steps
+        scale_factor = 1.0 / steps_to_accumulate if steps_to_accumulate > 1 else 1.0
 
-        # Create batches from dataset
         for batch in self._create_batches(self.train_dataset, self.args.batch_size, shuffle=True):
-
-            # Determine if we're still accumulating or ready to update
-            is_accumulating = (n_steps + 1) % self.args.gradient_accumulation_steps != 0
             
-            # Forward and backward pass with scaled gradients
-            loss, grads = self._step(batch, is_accumulating)
+            # Calculate Grads
+            loss, grads = self.step_calc(self.model, batch)
 
-            mx.eval(self.model.parameters())
-            mx.eval(self.optimizer.state)
-            
-            # Accumulate gradients
-            ### I never use the accumulated grads
             if accumulated_grads is None:
                 accumulated_grads = grads
             else:
                 accumulated_grads = tree_map(lambda x, y: x + y, accumulated_grads, grads)
-            # Update on accumulation boundary
-            if not is_accumulating:
-                accumulated_grads = None
-                mx.eval(self.model.parameters()) #, self.optimizer.state
-                
-            total_loss += loss.item()
+            
+            # Ensure evaluation to get the loss value out for logging
+            total_loss += loss.item() 
             n_steps += 1
-            self.global_step += 1
-            
-            if n_steps % self.args.logging_steps == 0:
-                elapsed = time.time() - start_time
-                print(f"Step {self.global_step}: loss = {total_loss/n_steps:.4f}, steps/sec = {n_steps/elapsed:.2f}")
-            
+
+            # Update Optimizer if Accumulation Done
+            if n_steps % steps_to_accumulate == 0:
+
+                # Scale Grads for Accumulation (only once per accumulation cycle)
+                if steps_to_accumulate > 1:
+                    accumulated_grads = tree_map(lambda g: g * scale_factor, accumulated_grads)
+
+                # Apply updates
+                self.step_update(self.model, self.optimizer, accumulated_grads)
+
+                # Reset
+                accumulated_grads = None
+                
+                # Eval state to actually trigger the computation graph
+                mx.eval(self.model.state, self.optimizer.state)
+                
+                self.global_step += 1
+                
+                if self.global_step % self.args.logging_steps == 0:
+                    elapsed = time.time() - start_time
+                    steps_per_sec = n_steps / elapsed
+                    avg_loss = total_loss / n_steps # Average over steps taken so far
+                    print(f"Step {self.global_step}: loss = {avg_loss:.4f}, steps/sec = {steps_per_sec:.2f}")
+        
         return total_loss / n_steps # placeholder if we want to use the average loss for anything
     
     def evaluate(self):
@@ -388,7 +303,7 @@ class Trainer:
             raise ValueError("No test dataset provided")
         
         # Perform evaluation
-        for batch in self._create_batches(self.eval_dataset, self.args.eval_batch_size):
+        for batch in self._create_batches(dataset_to_test, self.args.eval_batch_size):
             outputs = self.model(**batch)
             loss = mx.mean(outputs["loss"])
             total_loss += loss.item()
@@ -408,31 +323,32 @@ class Trainer:
         return metrics
     
     def _save_checkpoint(self, metrics: Dict[str, float]):
-        """Save a model checkpoint."""
         save_path = self.output_dir / f"checkpoint-{self.global_step}"
         save_path.mkdir(exist_ok=True)
 
-        # Save model config - using the actual model's configuration
         with open(save_path / "config.json", "w") as f:
             json.dump(self.model.config.__dict__, f, indent=2)
 
-        # Save tokenizer json
         self.tokenizer.save_pretrained(save_path)
         
-        # Save model weights
-        ### sharding not necessary for small models
-        weights = dict(tree_flatten(self.model.trainable_parameters())) ### need more than just the model. (everything included?)
-        mx.save_safetensors(str(save_path / "model.safetensors"), weights, metadata={"format": "mlx"})
+        weights = dict(tree_flatten(self.model.trainable_parameters()))
+        mx.save_safetensors(str(save_path / "model.safetensors"), weights)
         
-        # Save metrics
         with open(save_path / "metrics.json", "w") as f:
             json.dump(metrics, f, indent=2)
         
-        # upload to HF
-        if self.push_to_hub:
-            ### TODO
-            raise NotImplementedError("Push to HF not implemented yet")
-            upload_to_hub(save_path)
+        # Push to Hub
+        if self.args.push_to_hub:
+            print("Warning, push to hub is untested")
+            # Assumes args.output_dir is the repo name or you have a separate arg
+            repo_id = self.args.output_dir.split("/")[-1] # Simple heuristic
+            print(f"Pushing to hub: {repo_id}")
+            upload_to_hub(
+                path=str(save_path),
+                upload_repo=repo_id,
+                hf_path=self.model.config.model_type, # Or base model name
+                task_type=self.task_type
+            )
         
         # Manage checkpoint rotation
         if self.args.save_total_limit:
@@ -473,20 +389,14 @@ def upload_to_hub(
     model_path = Path(path)
 
     card = ModelCard.load(hf_path) if ModelCard.exist_in_hub(hf_path) else ModelCard()
-    card.data.tags = ["mlx" , "modernbert"] if card.data.tags is None else card.data.tags + ["mlx"] + ["modernbert"]
+    card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"] 
     card.data.base_model = hf_path
     card.data.task_type = task_type
     card.text = dedent(
         f"""
         # {upload_repo}
 
-        The Model [{upload_repo}](https://huggingface.co/{upload_repo}) was
-        converted to MLX format from [{hf_path}](https://huggingface.co/{hf_path})
-        TODO
-
-        # ModernBERT Model: {upload_repo}
-
-        This model was trained using MLX ModernBERT for {task_type}.
+        This model was trained using [MLX Raclate](https://github.com/pappitti/mlx-raclate) for {task_type}.
 
         ## Usage
 
@@ -512,7 +422,7 @@ def upload_to_hub(
     )
     print(f"Upload successful, go to https://huggingface.co/{upload_repo} for details.")
 
-## COMMENTED OUT FOR NOW
+## COMMENTED OUT FOR NOW (Sharding not needing for small models)
 # def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
 #     """
 #     Splits the weights into smaller shards.

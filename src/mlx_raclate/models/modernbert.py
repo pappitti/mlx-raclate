@@ -462,9 +462,20 @@ class ModelForSentenceSimilarity(Model):
             loss = None
             if similarity_scores is not None:
                 # MSE loss between computed similarities and target scores
-                # similarity_scores should be shape [batch_size, num_references]
-                loss = nn.losses.mse_loss(similarities, similarity_scores)
-        
+
+                # We only care about the diagonal (Query i vs Ref i)
+                # extract diagonal: [batch_size]
+                pairwise_sims = mx.diag(similarities)
+                    
+                # Ensure scores match shape
+                if len(similarity_scores.shape) > 1:
+                    similarity_scores = similarity_scores.flatten()
+                    
+                loss = nn.losses.mse_loss(pairwise_sims, similarity_scores)
+              
+            # TODO : contrastive loss over all similarities ?
+            # else:
+    
         else:
             similarities = None
             loss = None
@@ -480,11 +491,80 @@ class ModelForSentenceSimilarity(Model):
 
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """
-    Extends ModelForSentenceSimilarity to provide embeddings for input sequences.
+    Extends ModelForSentenceSimilarity.
+    Handles:
+    1. Inference: Generates embeddings.
+    2. Training (Standard): (Sentence1, Sentence2, Score) -> MSE/Cosine Loss.
+    3. Training (Triplets): (Anchor, Positive, Negative) -> MNRL with Hard Negatives (Cross-entropy Loss).
     This class sanitizes typical sentence transformers weights to align with the ModernBERT model.
     """
     def __init__(self, config: ModelArgs):
         super().__init__(config)
+
+    def __call__(
+        self,
+        input_ids,
+        reference_input_ids: Optional[mx.array] = None,
+        attention_mask: Optional[mx.array] = None,
+        reference_attention_mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
+        similarity_scores: Optional[mx.array] = None,
+        return_dict: Optional[bool] = True,
+    ):
+        # SCENARIO 1: TRIPLET TRAINING (MNRL with Hard Negatives over Anchor, Positive, Negative)
+        if self.training and reference_input_ids is None and similarity_scores is None:
+            
+            # Forward pass on [Anchors, Positives, Negatives] stacked
+            outputs = super(Model, self).__call__(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                return_dict=True
+            )
+            all_embeddings = outputs["embeddings"] 
+            
+            # Split back into [Anchors, Positives, Negatives]
+            batch_size = all_embeddings.shape[0] // 3
+            
+            anchors = all_embeddings[:batch_size]
+            positives = all_embeddings[batch_size : 2 * batch_size]
+            negatives = all_embeddings[2 * batch_size :] 
+                     
+            candidates = mx.concatenate([positives, negatives], axis=0)  # Shape: [2 * batch_size, hidden_size]
+            
+            # Compute similarity scores: [batch_size, 2 * batch_size]
+            scores = mx.matmul(anchors, candidates.T)
+            
+            # Scale scores (temperature)
+            scale = 20.0 
+            scores = scores * scale
+            
+            # The target for Anchor i is Positive i.
+            labels = mx.arange(batch_size)
+            
+            # Cross Entropy Loss: softmax normalizes over all 2*N candidates.
+            # This forces A_i to be close to P_i and far from P_j and ALL N.
+            loss = nn.losses.cross_entropy(scores, labels)
+            
+            if not return_dict:
+                return (loss, scores, all_embeddings)
+                
+            return {
+                "loss": loss,
+                "logits": scores, 
+                "embeddings": all_embeddings
+            }
+
+        # SCENARIO 2: STANDARD PAIRWISE SIMILARITY
+        return super().__call__(
+            input_ids=input_ids,
+            reference_input_ids=reference_input_ids,
+            attention_mask=attention_mask,
+            reference_attention_mask=reference_attention_mask,
+            position_ids=position_ids,
+            similarity_scores=similarity_scores,
+            return_dict=return_dict
+        )
 
     def sanitize(self, weights):
         """Convert sentence transformer weights to ModernBERT format."""
@@ -494,9 +574,11 @@ class ModelForSentenceTransformers(ModelForSentenceSimilarity):
             if "position_ids" in k:
                 # Remove unused position_ids
                 continue
-            else:
+            if not k.startswith("model."):
                 new_key = "model." + k
-                sanitized_weights[new_key] = v
+            else:
+                new_key = k
+            sanitized_weights[new_key] = v
         return sanitized_weights
     
 
