@@ -165,48 +165,62 @@ class DataCollatorForMaskedLanguageModeling(DataCollator):
 @dataclass
 class DataCollatorForSentenceSimilarity(DataCollator):
     """
-    Handles (Sentence1, Sentence2, Score).
-    Assumes datasets.py mapped these to specific keys.
-    """
-    def __call__(self, features: Dict[str, List[Any]]) -> Dict[str, mx.array]:
-        # TODO : is sentence similarity essentially just a regression classification?
-        if "text" in features and "text_pair" in features and "label" in features:
-             # Just use the classification/regression collator
-             delegate = DataCollatorForSequenceClassification(self.tokenizer, self.max_length)
-             return delegate(features)
-        else :
-            raise ValueError("Make sure to pass dataset args to convert sentence1, sentence2, score to text, text_pair, label. DatasetArgs(data=path, task_type=pipeline, text_field='sentence1', text_pair_field-'sentence2', label_field='score') ")
+    Handles data for Bi-Encoder models (Sentence Similarity / Retrieval).
+    Unlike SequenceClassification, this keeps sentences SEPARATE to produce
+    independent embeddings.
     
-@dataclass
-class DataCollatorForSentenceTransformers(DataCollator):
-    """
-    Handles tuples (Anchor, Positive, Negative) or (Sentence1, Sentence2, Score).
-    Assumes datasets.py mapped these to specific keys.
+    Expected keys in features (from dataset.py standardization):
+    - 'text': The Anchor / Sentence A
+    - 'text_pair': The Positive / Reference / Sentence B
+    - 'negative' (optional): The Hard Negative / Sentence C
+    - 'label' (optional): Similarity score for Regression
     """
     def __call__(self, features: Dict[str, List[Any]]) -> Dict[str, mx.array]:
-        if "text" in features and "text_pair" in features and "label" in features:
-             # Just use the classification/regression collator
-             delegate = DataCollatorForSequenceClassification(self.tokenizer, self.max_length)
-             return delegate(features)
-        
-        # Case: Triplets (Anchor, Positive, Negative)
-        elif "anchor" in features and "positive" in features and "negative" in features:
-            anchors = features["anchor"]
-            positives = features["positive"]
-            negatives = features["negative"]
-            
-            # Concatenate lists: [All Anchors, All Positives, All Negatives]
-            # ModelForSentenceTransformers will split the embeddings back into 3 chunks.
-            all_texts = anchors + positives + negatives
-            
-            batch = self.tokenizer(
-                all_texts,
+        batch = {}
+
+        # Tokenize Anchor (Sentence A) -> 'input_ids'
+        if "text" in features:
+            out_a = self.tokenizer(
+                features["text"],
                 padding=True,
                 truncation=True,
                 max_length=self.max_length,
                 return_tensors="mlx"
             )
-            
-            return dict(batch)
+            batch["input_ids"] = out_a["input_ids"]
+            batch["attention_mask"] = out_a["attention_mask"]
 
-        raise NotImplementedError("Sentence Transformer collation depends on specific loss function requirements")
+        # Tokenize Reference (Sentence B) -> 'reference_input_ids'
+        if "text_pair" in features:
+            out_b = self.tokenizer(
+                features["text_pair"],
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="mlx"
+            )
+            batch["reference_input_ids"] = out_b["input_ids"]
+            batch["reference_attention_mask"] = out_b["attention_mask"]
+
+        # Tokenize Negative (Sentence C) -> 'negative_input_ids'
+        neg_key = None
+        if "negative" in features: neg_key = "negative"
+        elif "text_negative" in features: neg_key = "text_negative"
+            
+        if neg_key:
+            out_n = self.tokenizer(
+                features[neg_key],
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="mlx"
+            )
+            batch["negative_input_ids"] = out_n["input_ids"]
+            batch["negative_attention_mask"] = out_n["attention_mask"]
+
+        # 4. Handle Scores (for Regression)
+        if "label" in features:
+            # Ensure float32 for regression targets
+            batch["similarity_scores"] = mx.array(features["label"], dtype=mx.float32)
+
+        return batch

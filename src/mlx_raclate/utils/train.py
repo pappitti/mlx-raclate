@@ -1,8 +1,8 @@
 import argparse
 import mlx.core as mx
 from .utils import load, PIPELINES
-from tuner.datasets import load_dataset, DatasetArgs
-from tuner.trainer import Trainer, TrainingArgs
+from mlx_raclate.tuner.datasets import load_dataset, DatasetArgs
+from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
 
 def main():
 

@@ -20,7 +20,7 @@ from transformers import PreTrainedTokenizer
 # Local imports
 from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 # Training imports 
-from tuner.utils import nparams #, load_adapters ### removing adapters for now
+from mlx_raclate.tuner.utils import nparams #, load_adapters ### removing adapters for now
 
 PIPELINES = [
     "embeddings",
@@ -33,8 +33,8 @@ PIPELINES = [
 ]
 
 HF_ARCH_TO_PIPELINE_MAPPING = {
-    "ModernBertForSequenceClassification": "text-classification",
-    "ModernBertForMaskedLM": "masked-lm",
+    "ForSequenceClassification": "text-classification",
+    "ForMaskedLM": "masked-lm",
 }
 
 MODEL_REMAPPING = {
@@ -49,6 +49,21 @@ class ModelNotFoundError(Exception):
         self.message = message
         super().__init__(self.message)
 
+def _get_pipeline_from_config(arch : str):
+    """
+    Retrieve the pipeline type based on the model configuration.
+
+    Args:
+        arch: first item of architectures from the model configuration.
+
+    Returns:
+        str: The pipeline type.
+    """
+    if arch is not None:
+        for k,v in HF_ARCH_TO_PIPELINE_MAPPING.items():
+            if k in arch:
+                return v
+    return None  
 
 def _get_classes(config: dict, pipeline: Optional[str] = 'masked-lm'):
     """
@@ -66,7 +81,7 @@ def _get_classes(config: dict, pipeline: Optional[str] = 'masked-lm'):
     model_type = config["model_type"]
     model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
-        arch = importlib.import_module(f"models.{model_type}")
+        arch = importlib.import_module(f"mlx_raclate.models.{model_type}")
     except ImportError:
         msg = f"Model type {model_type} not supported."
         logging.error(msg)
@@ -212,9 +227,9 @@ def load_model(
     config = load_config(model_path)
     config.update(model_config)
 
-    model_arch = config.get("architectures", None)
-    if model_arch is not None:
-        model_arch = HF_ARCH_TO_PIPELINE_MAPPING.get(model_arch[0], None)
+    arch = config.get("architectures", None)
+    if arch is not None:
+        model_arch = _get_pipeline_from_config(arch[0])
 
     if model_arch is not None:
         if pipeline is None:

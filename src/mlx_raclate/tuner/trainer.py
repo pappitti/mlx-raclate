@@ -169,17 +169,12 @@ class Trainer:
                 tokenizer=self.tokenizer, 
                 max_length=self.args.max_length
             )
-        elif self.task_type == "sentence-similarity":
+        elif self.task_type == "sentence-similarity" or self.task_type == "sentence-transformers":
             return DataCollatorForSentenceSimilarity(
                 tokenizer=self.tokenizer, 
                 max_length=self.args.max_length
             )
-        elif self.task_type == "sentence-transformers":
-            return DataCollatorForSentenceTransformers(
-                tokenizer=self.tokenizer, 
-                max_length=self.args.max_length
-            )
-        # TODO : add other tasks & collators
+        # TODO : Add other tasks & collators if needed
         raise ValueError(f"No collator defined for {self.task_type}")
 
 

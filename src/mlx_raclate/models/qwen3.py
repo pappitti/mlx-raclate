@@ -1,6 +1,5 @@
 # Copyright © 2023-2024 Apple Inc.
 import logging
-import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union, Any, Literal
 
@@ -210,7 +209,14 @@ class Qwen3Model(nn.Module):
 
         return causal_mask.astype(dtype)
 
-    def __call__(self, input_ids: mx.array, attention_mask: mx.array = None):
+    def __call__(
+            self, 
+            input_ids: mx.array, 
+            attention_mask: Optional[mx.array] = None,
+            output_hidden_states: Optional[bool] = False,
+            position_ids: Optional[mx.array] = None,
+            return_dict: Optional[bool] = True
+        ):
         attention_mask = self._update_attention_mask(
             attention_mask,
         )
@@ -227,8 +233,7 @@ class Qwen3Model(nn.Module):
             "last_hidden_state": hidden_states,
         }
 
-
-# Placeholder for prediction head Qwen3ForMaskedLM or Qwen3ForSequenceClassification models
+# Not used for now
 class Qwen3PredictionHead(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -237,8 +242,8 @@ class Qwen3PredictionHead(nn.Module):
             config.hidden_size, config.hidden_size, config.classifier_bias
         )
         self.act = nn.GELU(approx="precise")
-        self.norm = nn.LayerNorm(
-            config.hidden_size, eps=config.norm_eps, bias=config.norm_bias
+        self.norm = nn.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
         )
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
@@ -251,20 +256,6 @@ class Model(nn.Module):
         self.config = config
         self.model_type = config.model_type # not used for now (placeholder)
         self.model = Qwen3Model(config)
-
-        if config.architectures == ["Qwen3ForSequenceClassification"]:
-            raise NotImplementedError(
-                "Qwen3ForSequenceClassification is not implemented yet."
-            )
-            self.num_labels = config.num_labels
-            self.is_regression = config.is_regression
-            self.head = Qwen3PredictionHead(config)
-            self.drop = nn.Dropout(p=config.classifier_dropout)
-            self.classifier = nn.Linear(
-                config.hidden_size,
-                config.num_labels,
-                bias=True,  ### bias=config.classifier_bias removed because mismatch with HF checkpoint
-            )
 
     def _process_outputs(self, logits: mx.array) -> mx.array:
         """Apply the appropriate activation function to the logits for classification tasks."""
@@ -279,7 +270,9 @@ class Model(nn.Module):
     def __call__(
             self, 
             input_ids: mx.array, 
+            position_ids: Optional[mx.array] = None,
             attention_mask: Optional[mx.array] = None, 
+            output_hidden_states: Optional[bool] = False,
             return_dict: Optional[bool] = True,
         ) -> Dict:
         if attention_mask is None:
@@ -356,20 +349,24 @@ class ModelForSentenceSimilarity(Model):
         self,
         input_ids,
         reference_input_ids : Optional[mx.array] = None,  # Shape: [num_references, seq_len]
+        negative_input_ids : Optional[mx.array] = None,  # Shape: [num_negatives, seq_len]
         attention_mask: Optional[mx.array] = None,
         reference_attention_mask: Optional[mx.array] = None,
-        position_ids: Optional[mx.array] = None,
+        negative_attention_mask: Optional[mx.array] = None,
         similarity_scores: Optional[mx.array] = None,  # Shape: [batch_size, num_references]
+        position_ids: Optional[mx.array] = None,
         return_dict: Optional[bool] = True,
     ):
         # Get embeddings for input batch
         batch_outputs = super().__call__(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            position_ids=position_ids, ### ?
+            position_ids=position_ids,
             return_dict=True
         )
-        batch_embeddings = batch_outputs["embeddings"]  # [batch_size, hidden_size]
+        embeddings = batch_outputs["embeddings"]  # [batch_size, hidden_size]
+
+        loss = None
 
         if reference_input_ids is not None:
         
@@ -381,30 +378,59 @@ class ModelForSentenceSimilarity(Model):
                 return_dict=True
             )
             reference_embeddings = ref_outputs["embeddings"]  # [num_references, hidden_size]
-            
-            # Compute similarities between batch and references
-            similarities = compute_similarity(
-                batch_embeddings,  # [batch_size, hidden_size]
-                reference_embeddings  # [num_references, hidden_size]
-            )  # Result: [batch_size, num_references]
-            
-            loss = None
+
+            # MSE loss between computed similarities and target scores
             if similarity_scores is not None:
-                # MSE loss between computed similarities and target scores
-                # similarity_scores should be shape [batch_size, num_references]
-                loss = nn.losses.mse_loss(similarities, similarity_scores)
-        
+                assert reference_embeddings.shape[0] == input_ids.shape[0], "Number of references must match batch size for paired training"
+                assert similarity_scores.shape[0] == input_ids.shape[0], "Number of similarity scores must match batch size for paired training"
+                # No matmul here, we only care about Query i vs Ref i
+                pairwise_sims = mx.sum(embeddings * reference_embeddings, axis=-1)
+                    
+                # Ensure scores match shape
+                if len(similarity_scores.shape) > 1:
+                    similarity_scores = similarity_scores.flatten()
+                    
+                loss = nn.losses.mse_loss(pairwise_sims, similarity_scores)
+                similarities = pairwise_sims
+            
+            # Cross-entropy loss [for triplet training with hard negatives]
+            else:
+                if negative_input_ids is not None:
+                    assert reference_embeddings.shape[0] == input_ids.shape[0], "Number of references must match batch size for paired training"
+                    assert negative_input_ids.shape[0] == input_ids.shape[0], "Number of negatives must match batch size for triplet training"
+                    # Embed Negative
+                    neg_outputs = super().__call__(
+                        input_ids=negative_input_ids, 
+                        attention_mask=negative_attention_mask, 
+                        return_dict=True
+                    )
+                    neg_embeddings = neg_outputs["embeddings"]
+                    
+                    # Stack Candidates: [Positives, Negatives]
+                    candidates = mx.concatenate([reference_embeddings, neg_embeddings], axis=0) # Shape: [2 * batch, hidden]
+                    similarities = compute_similarity(embeddings, candidates)
+                
+                else:
+                    similarities = compute_similarity(embeddings, reference_embeddings)
+
+                scale = 20.0
+                scores = similarities * scale
+                
+                labels = mx.arange(embeddings.shape[0])
+                
+                loss = nn.losses.cross_entropy(scores, labels)
+    
         else:
             similarities = None
             loss = None
             
         if not return_dict:
-            return (loss, similarities, batch_embeddings)
+            return (loss, similarities, embeddings)
             
         return {
             "loss": loss,
             "similarities": similarities,  # [batch_size, num_references]
-            "embeddings": batch_embeddings,  # [batch_size, hidden_size]
+            "embeddings": embeddings,  # [batch_size, hidden_size]
         }
 
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
@@ -427,16 +453,13 @@ class ModelForSentenceTransformers(ModelForSentenceSimilarity):
                 new_key = "model." + k
                 sanitized_weights[new_key] = v
         return sanitized_weights
-    
-# MaskedLM not implemented for now AR models such as Qwen3
-# Attempting to train pretrained weights would be catastrophic 
 
 class ModelForSequenceClassification(nn.Module):
     """
     Computes sequence classification probabilities for input sequences.
-    Sanitization alignes typical BERT weights with the ModernBERT model.
+    Sanitization aligns typical BERT weights with HF's Qwen3ForSequenceClassification architecture.
 
-    NOTE : binary classification not tested.
+    NOTE : regression and binary classification not tested.
     """
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -445,12 +468,16 @@ class ModelForSequenceClassification(nn.Module):
         self.is_regression = config.is_regression
         
         self.model = Qwen3Model(config)
-        self.head = Qwen3PredictionHead(config)
-        self.drop = nn.Dropout(p=config.classifier_dropout)
-        self.classifier = nn.Linear(
+
+        ### The HF architecture Qwen3ForSequenceClassification 
+        ### does not have head and drop
+        #### and uses 'score' as the final layer name
+        # self.head = Qwen3PredictionHead(config)
+        # self.drop = nn.Dropout(p=config.classifier_dropout)
+
+        self.score = nn.Linear(
             config.hidden_size, 
             config.num_labels, 
-            bias=True ### bias=config.classifier_bias removed because mismatch with HF checkpoint
         ) 
     
     def _process_outputs(self, logits: mx.array) -> mx.array:
@@ -481,7 +508,7 @@ class ModelForSequenceClassification(nn.Module):
         attention_mask: Optional[mx.array] = None,
         position_ids: Optional[mx.array] = None, ### need this?
         labels: Optional[mx.array] = None,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
     ) -> Dict:
         if attention_mask is None:
@@ -491,17 +518,26 @@ class ModelForSequenceClassification(nn.Module):
                 dtype=self.model.embed_tokens.weight.dtype,
             )
 
-        out = self.model(input_ids, attention_mask)
+        outputs = self.model(
+            input_ids, 
+            attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
         last_hidden_state = (
-            out["last_hidden_state"] if isinstance(out, dict) else out[0]
+            outputs["last_hidden_state"] if isinstance(outputs, dict) else outputs[0]
         )
 
         # pooling for AR models such as Qwen3 leverages the last token
-        pooled_embeddings = last_token_pooling(last_hidden_state, attention_mask)
+        pooled = last_token_pooling(last_hidden_state, attention_mask)
 
-        pooled_output = self.head(pooled_embeddings)
-        pooled_output = self.drop(pooled_output)
-        logits = self.classifier(pooled_output)
+        ### The HF architecture Qwen3ForSequenceClassification 
+        ### does not have head and drop
+        #### and uses 'score' as the final layer name
+        # pooled = self.head(pooled)
+        # pooled = self.drop(pooled)
+        logits = self.score(pooled)
 
         processed_logits = self._process_outputs(logits)
 
@@ -510,12 +546,12 @@ class ModelForSequenceClassification(nn.Module):
             loss = self._compute_loss(logits, labels)
 
         if not return_dict:
-            return [loss, processed_logits, out[1:]]
+            return [loss, processed_logits, outputs[1:]]
 
         return {
             "loss": loss,
             "probabilities": processed_logits,
-            "hidden_states": out.get("hidden_states", None),
+            "hidden_states": outputs.get("hidden_states", None),
         }
     
     def sanitize(self, weights):
@@ -531,84 +567,23 @@ class ModelForSequenceClassification(nn.Module):
                 # Handle legacy BERT naming if needed
                 new_k = k.replace("bert.", "model.")
                 sanitized_weights[new_k] = v
+            
+            # elif "score" in k:
+            #     continue # TBC (the only checkpoint I have access to has both classifier and score layers)
+            elif k.startswith("classifier."):
+                if "bias" in k :
+                    new_k = k.replace("classifier.", "score.")
+                    sanitized_weights[new_k] = v
+                else:
+                    continue
+                # replace classifier with score to match HF naming convention 
+                # (ensuring compatibility with Qwen3ForSequenceClassification)
+                new_k = k.replace("classifier.", "score.")
+                sanitized_weights[new_k] = v  
+            
             else:
                 sanitized_weights[k] = v
         return sanitized_weights
 
-class ModelForTokenClassification(nn.Module):
-    """
-    Computes token classification probabilities for input sequences.
-
-    NOTE: untested for now
-    """
-    def __init__(self, config: ModelArgs):
-        super().__init__()
-        self.config = config       
-        self.num_labels = config.num_labels
-
-        self.model = Qwen3Model(config)
-        self.head = Qwen3PredictionHead(config)
-        self.drop = nn.Dropout(p=config.classifier_dropout)
-        self.classifier = nn.Linear(
-            config.hidden_size, 
-            config.num_labels, 
-            bias=config.classifier_bias
-        ) 
-
-    def __call__(
-        self,
-        input_ids,
-        attention_mask: Optional[mx.array] = None,
-        position_ids: Optional[mx.array] = None,
-        labels: Optional[mx.array] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = True,
-    ) -> Dict:
-        if attention_mask is None:
-            batch_size, seq_len = input_ids.shape
-            attention_mask = mx.ones(
-                (batch_size, seq_len),
-                dtype=self.model.embed_tokens.weight.dtype,
-            )
-
-        out = self.model(input_ids, attention_mask)
-        last_hidden_state = (
-            out["last_hidden_state"] if isinstance(out, dict) else out[0]
-        )
-
-        # Apply prediction head, dropout, and classification layer to each token (no pooling)
-        sequence_output = self.head(last_hidden_state)
-        sequence_output = self.drop(sequence_output)
-        logits = self.classifier(sequence_output)
-
-        # Process logits for inference
-        processed_logits = mx.softmax(logits, axis=-1)
-
-        loss = None
-        if labels is not None:
-            # Compute token classification loss
-            loss = nn.losses.cross_entropy(
-                logits.reshape(-1, self.num_labels),
-                labels.reshape(-1)
-            )
-
-        if not return_dict:
-            return [loss,  processed_logits, out[1:]]
-
-        return {
-            "loss": loss,
-            "probabilities": processed_logits,
-            "hidden_states": out.get("hidden_states", None),
-        }
-    
-    def sanitize(self, weights):
-        sanitized_weights = {}
-        for k, v in weights.items():
-            if "position_ids" in k:
-                # Remove unused position_ids
-                continue
-            elif "lm_head" in k:
-                continue
-            else:
-                sanitized_weights[k] = v
-        return sanitized_weights
+# TokenClassification and MaskedLM not implemented for now AR models such as Qwen3
+# Attempting to train pretrained weights would be catastrophic 

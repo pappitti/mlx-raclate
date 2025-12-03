@@ -11,35 +11,65 @@ class DatasetArgs:
     """Arguments for dataset loading"""
     def __init__(self, data: str, task_type: str, train : bool, 
                  text_field: Optional[str] = "text", label_field: Optional[str] = "label",
-                 text_pair_field: Optional[str] = None, test: Optional[bool]=False):
+                 text_pair_field: Optional[str] = None, negative_field: Optional[str] = None, test: Optional[bool]=False):
         self.data = data
         self.task_type = task_type
         self.train = train
         self.text_field = text_field
         self.label_field = label_field
         self.text_pair_field = text_pair_field
+        self.negative_field = negative_field
         self.test = test # whether to create a test set if not present
 
 def _standardize_column_names(dataset: HFDataset, args: DatasetArgs) -> HFDataset:
     """
-    Renames columns to standard 'text', 'label', 'text_pair' expected by collators.
+    Renames columns to standard 'text', 'label', 'text_pair', 'negative' expected by collators.
+
+    Common mappings for various tasks:
+    - similarity :  Anchor / Sentence A -> 'text'
+    - similarity : The Positive / Reference / Sentence B -> 'text_pair'
+    - similarity : The Hard Negative / Sentence C -> 'negative' (optional)
+    - similarity : Similarity score for Regression -> 'label' (optional)
+
+    Manual mappings can be specified via args usiing text_field, label_field, text_pair_field, negative_field.
+    text_field : column name for the main text input
+    label_field : column name for the label / score
+    text_pair_field (optional): column name for the paired text input / sentence B (used for cross-encoders or bi-encoders)
+    negative_field (optional): column name for the negative example (used for triplet training)
     """
+
     mapping = {}
+    # Manual field mappings
     if args.text_field != "text" and args.text_field in dataset.column_names:
         mapping[args.text_field] = "text"
+
+    if args.text_pair_field and args.text_pair_field != "text_pair" and args.text_pair_field in dataset.column_names:
+        mapping[args.text_pair_field] = "text_pair"
     
     if args.label_field != "label" and args.label_field in dataset.column_names:
         mapping[args.label_field] = "label"
-        
-    if args.text_pair_field and args.text_pair_field != "text_pair" and args.text_pair_field in dataset.column_names:
-        mapping[args.text_pair_field] = "text_pair"
 
-    # handle Sequence classification : "sentence1" -> "text", "sentence2" -> "text_pair", "score" = "label"
-    if args.task_type == "sentence-similarity":
-        if "sentence1 " in dataset.column_names and "sentence2 " in dataset.column_names and "score " in dataset.column_names:
+    if args.negative_field and args.negative_field != "negative" and args.negative_field in dataset.column_names:
+        mapping[args.negative_field] = "negative"
+
+    # Handle common alternative column names for text classification
+    if args.task_type == "sentence-similarity" or args.task_type == "sentence-transformers":
+         # handle Sequence classification : "sentence1" -> "text", "sentence2" -> "text_pair", "score" = "label"
+        if "sentence1" in dataset.column_names and "sentence2" in dataset.column_names and "score" in dataset.column_names:
             mapping["sentence1"] = "text"
             mapping["sentence2"] = "text_pair"
             mapping["score"] = "label"
+
+        # Handle Anchor, Positives and Negatives for Triplet Training
+        if "anchor" in dataset.column_names and "positive" in dataset.column_names and "negative" in dataset.column_names:
+            mapping["anchor"] = "text"
+            mapping["positive"] = "text_pair"
+            mapping["negative"] = "negative"
+
+        if "pos" in dataset.column_names:
+            mapping["pos"] = "text_pair"
+        if "neg" in dataset.column_names:
+            mapping["neg"] = "negative"
 
     # Handle Token Classification: usually "tokens" -> "text", "ner_tags" -> "labels"
     if args.task_type == "token-classification":

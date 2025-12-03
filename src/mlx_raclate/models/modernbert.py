@@ -111,7 +111,7 @@ class ModernBertMLP(nn.Module):
         x = self.Wi(hidden_states)
         
         split_dim = x.shape[-1] // 2
-        input, gate = x[:, :, :split_dim], x[:, :, split_dim:] # TODO explore : https://arxiv.org/pdf/2002.05202v1
+        input, gate = x[:, :, :split_dim], x[:, :, split_dim:] # gate : https://arxiv.org/pdf/2002.05202v1
         return self.Wo(self.drop(self.act(input) * gate))
 
 
@@ -334,15 +334,15 @@ class ModernBertModel(nn.Module):
         # Broadcast to match batch size
         window_mask = mx.broadcast_to(window_mask, global_attention_mask.shape)
         
-        # Creating sliding window attention mask
-        # Replacing non-window positions with large negative value
+        # Create sliding window attention mask
+        # Replace non-window positions with large negative value
         sliding_window_mask = mx.where(
             window_mask,
             global_attention_mask,
             neg_inf # if not broadcasted for some reason : neg_inf * mx.ones_like(global_attention_mask)
         )
 
-        # converting to model_dtype for scaled_dot_product_attention
+        # Convert to model_dtype for scaled_dot_product_attention
         global_attention_mask = global_attention_mask.astype(model_dtype)
         sliding_window_mask = sliding_window_mask.astype(model_dtype)
     
@@ -381,7 +381,7 @@ class Model(nn.Module):
             input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            output_hidden_states=None, # Not needed, only last_hidden_state is returned
+            output_hidden_states=output_hidden_states, 
             return_dict=return_dict,
         )
         last_hidden_state = encoder_outputs["last_hidden_state"] if isinstance(encoder_outputs, dict) else encoder_outputs[0] 
@@ -427,20 +427,24 @@ class ModelForSentenceSimilarity(Model):
         self,
         input_ids,
         reference_input_ids : Optional[mx.array] = None,  # Shape: [num_references, seq_len]
+        negative_input_ids : Optional[mx.array] = None,  # Shape: [num_negatives, seq_len]
         attention_mask: Optional[mx.array] = None,
         reference_attention_mask: Optional[mx.array] = None,
-        position_ids: Optional[mx.array] = None,
+        negative_attention_mask: Optional[mx.array] = None,
         similarity_scores: Optional[mx.array] = None,  # Shape: [batch_size, num_references]
+        position_ids: Optional[mx.array] = None,
         return_dict: Optional[bool] = True,
     ):
         # Get embeddings for input batch
         batch_outputs = super().__call__(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            position_ids=position_ids, ### ?
+            position_ids=position_ids, 
             return_dict=True
         )
-        batch_embeddings = batch_outputs["embeddings"]  # [batch_size, hidden_size]
+        embeddings = batch_outputs["embeddings"]  # [batch_size, hidden_size]
+
+        loss = None
 
         if reference_input_ids is not None:
         
@@ -452,41 +456,59 @@ class ModelForSentenceSimilarity(Model):
                 return_dict=True
             )
             reference_embeddings = ref_outputs["embeddings"]  # [num_references, hidden_size]
-            
-            # Compute similarities between batch and references
-            similarities = compute_similarity(
-                batch_embeddings,  # [batch_size, hidden_size]
-                reference_embeddings  # [num_references, hidden_size]
-            )  # Result: [batch_size, num_references]
-            
-            loss = None
-            if similarity_scores is not None:
-                # MSE loss between computed similarities and target scores
 
-                # We only care about the diagonal (Query i vs Ref i)
-                # extract diagonal: [batch_size]
-                pairwise_sims = mx.diag(similarities)
+            # MSE loss between computed similarities and target scores
+            if similarity_scores is not None:
+                assert reference_embeddings.shape[0] == input_ids.shape[0], "Number of references must match batch size for paired training"
+                assert similarity_scores.shape[0] == input_ids.shape[0], "Number of similarity scores must match batch size for paired training"
+                # No matmul here, we only care about Query i vs Ref i
+                pairwise_sims = mx.sum(embeddings * reference_embeddings, axis=-1)
                     
                 # Ensure scores match shape
                 if len(similarity_scores.shape) > 1:
                     similarity_scores = similarity_scores.flatten()
                     
                 loss = nn.losses.mse_loss(pairwise_sims, similarity_scores)
-              
-            # TODO : contrastive loss over all similarities ?
-            # else:
+                similarities = pairwise_sims
+            
+            # Cross-entropy loss [for triplet training with hard negatives]
+            else:
+                if negative_input_ids is not None:
+                    assert reference_embeddings.shape[0] == input_ids.shape[0], "Number of references must match batch size for paired training"
+                    assert negative_input_ids.shape[0] == input_ids.shape[0], "Number of negatives must match batch size for triplet training"
+                    # Embed Negative
+                    neg_outputs = super().__call__(
+                        input_ids=negative_input_ids, 
+                        attention_mask=negative_attention_mask, 
+                        return_dict=True
+                    )
+                    neg_embeddings = neg_outputs["embeddings"]
+                    
+                    # Stack Candidates: [Positives, Negatives]
+                    candidates = mx.concatenate([reference_embeddings, neg_embeddings], axis=0) # Shape: [2 * batch, hidden]
+                    similarities = compute_similarity(embeddings, candidates)
+                
+                else:
+                    similarities = compute_similarity(embeddings, reference_embeddings)
+
+                scale = 20.0
+                scores = similarities * scale
+                
+                labels = mx.arange(embeddings.shape[0])
+                
+                loss = nn.losses.cross_entropy(scores, labels)
     
         else:
             similarities = None
             loss = None
             
         if not return_dict:
-            return (loss, similarities, batch_embeddings)
+            return (loss, similarities, embeddings)
             
         return {
             "loss": loss,
             "similarities": similarities,  # [batch_size, num_references]
-            "embeddings": batch_embeddings,  # [batch_size, hidden_size]
+            "embeddings": embeddings,  # [batch_size, hidden_size]
         }
 
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
@@ -500,71 +522,6 @@ class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """
     def __init__(self, config: ModelArgs):
         super().__init__(config)
-
-    def __call__(
-        self,
-        input_ids,
-        reference_input_ids: Optional[mx.array] = None,
-        attention_mask: Optional[mx.array] = None,
-        reference_attention_mask: Optional[mx.array] = None,
-        position_ids: Optional[mx.array] = None,
-        similarity_scores: Optional[mx.array] = None,
-        return_dict: Optional[bool] = True,
-    ):
-        # SCENARIO 1: TRIPLET TRAINING (MNRL with Hard Negatives over Anchor, Positive, Negative)
-        if self.training and reference_input_ids is None and similarity_scores is None:
-            
-            # Forward pass on [Anchors, Positives, Negatives] stacked
-            outputs = super(Model, self).__call__(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                return_dict=True
-            )
-            all_embeddings = outputs["embeddings"] 
-            
-            # Split back into [Anchors, Positives, Negatives]
-            batch_size = all_embeddings.shape[0] // 3
-            
-            anchors = all_embeddings[:batch_size]
-            positives = all_embeddings[batch_size : 2 * batch_size]
-            negatives = all_embeddings[2 * batch_size :] 
-                     
-            candidates = mx.concatenate([positives, negatives], axis=0)  # Shape: [2 * batch_size, hidden_size]
-            
-            # Compute similarity scores: [batch_size, 2 * batch_size]
-            scores = mx.matmul(anchors, candidates.T)
-            
-            # Scale scores (temperature)
-            scale = 20.0 
-            scores = scores * scale
-            
-            # The target for Anchor i is Positive i.
-            labels = mx.arange(batch_size)
-            
-            # Cross Entropy Loss: softmax normalizes over all 2*N candidates.
-            # This forces A_i to be close to P_i and far from P_j and ALL N.
-            loss = nn.losses.cross_entropy(scores, labels)
-            
-            if not return_dict:
-                return (loss, scores, all_embeddings)
-                
-            return {
-                "loss": loss,
-                "logits": scores, 
-                "embeddings": all_embeddings
-            }
-
-        # SCENARIO 2: STANDARD PAIRWISE SIMILARITY
-        return super().__call__(
-            input_ids=input_ids,
-            reference_input_ids=reference_input_ids,
-            attention_mask=attention_mask,
-            reference_attention_mask=reference_attention_mask,
-            position_ids=position_ids,
-            similarity_scores=similarity_scores,
-            return_dict=return_dict
-        )
 
     def sanitize(self, weights):
         """Convert sentence transformer weights to ModernBERT format."""
@@ -658,8 +615,7 @@ class ModelForMaskedLM(nn.Module):
         logits = self.decoder(logits)
         
         loss = None
-        if labels is not None :  
-            ### TBC
+        if self.training and labels is not None :  
             if getattr(self.config, "sparse_prediction", False):
                 # Flatten labels and predictions
                 flat_labels = labels.reshape(-1)
@@ -713,7 +669,7 @@ class ModelForMaskedLM(nn.Module):
 class ModelForSequenceClassification(nn.Module):
     """
     Computes sequence classification probabilities for input sequences.
-    Sanitization alignes typical BERT weights with the ModernBERT model.
+    Sanitization aligns typical BERT weights with the ModernBERT model.
 
     NOTE : binary classification not tested.
     """
@@ -729,7 +685,6 @@ class ModelForSequenceClassification(nn.Module):
         self.classifier = nn.Linear(
             config.hidden_size, 
             config.num_labels, 
-            bias=True ### bias=config.classifier_bias removed because mismatch with HF checkpoint
         ) 
     
     def _process_outputs(self, logits: mx.array) -> mx.array:
@@ -760,7 +715,7 @@ class ModelForSequenceClassification(nn.Module):
         attention_mask: Optional[mx.array] = None,
         position_ids: Optional[mx.array] = None, ### need this?
         labels: Optional[mx.array] = None,
-        output_hidden_states: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
     ) -> Dict:
         
@@ -839,7 +794,7 @@ class ModelForTokenClassification(nn.Module):
         self.classifier = nn.Linear(
             config.hidden_size, 
             config.num_labels, 
-            bias=config.classifier_bias
+            # bias=config.classifier_bias
         ) 
 
     def __call__(
@@ -882,7 +837,7 @@ class ModelForTokenClassification(nn.Module):
             )
 
         if not return_dict:
-            return [loss,  processed_logits, outputs[1:]]
+            return [loss, processed_logits, outputs[1:]]
 
         return {
             "loss": loss,
@@ -899,133 +854,3 @@ class ModelForTokenClassification(nn.Module):
             else:
                 sanitized_weights[k] = v
         return sanitized_weights
-    
-# class ModelForZeroShotClassification(Model):
-#     """
-#     NOT USED : THIS IS A PLACEHOLDER. THE ZERO-SHOT-CLASSIFICATION PIPELINE 
-#     CURRENTLY USES THE MASKEDLM PIPELINE AS PER https://arxiv.org/html/2502.03793v2.
-
-#     Computes zero-shot classification probabilities for input sequences given labels.
-#     Other interprations of zero-shot classification, this one is closer to sentence similarity.
-#     Tokenized Labels or definitions must be provided in __call__.
-#     No hypothesis_templating in this implementation.
-
-#     # Tokenize the input
-#     tokens = tokenizer.encode(
-#         text, 
-#         return_tensors="mlx", 
-#         padding=True, 
-#         truncation=True, 
-#         max_length= max_position_embeddings
-#     )
-
-#     if type(label_candidates) is dict:
-#         label_defs = list(label_candidates.values())
-#         label_keys = list(label_candidates.keys())
-#     else:
-#         label_defs = label_keys = label_candidates
-#     encoded_labels = tokenizer._tokenizer(
-#         label_defs, 
-#         return_tensors="mlx", 
-#         padding=True, 
-#         truncation=True, 
-#         max_length= max_position_embeddings
-#     )
-
-#     # Forward pass
-#     outputs = model(
-#         input_ids=tokens,
-#         label_candidates=encoded_labels['input_ids'],
-#         label_candidates_attention_mask=encoded_labels['attention_mask'],
-#         multi_label=False, # returns probabilities if true, similarities if false
-#         return_dict=True
-#     )
-#     """
-#     def __init__(self, config):
-#         super().__init__(config)
-        
-#         # Store encoded label descriptions - can be used for caching to classify large datasets
-#         self.label_embeddings = None
-    
-#     def encode_labels(self, label_candidates, label_candidates_attention_mask):
-#         """Encodes label descriptions into embeddings."""
-        
-#         ### TODO : build option to reuse cached label embeddings
-#         # if self.label_embeddings is not None :
-#         #     return
-            
-#         # Get embeddings for each label description
-#         label_outputs = super().__call__(
-#             input_ids=label_candidates,
-#             attention_mask=label_candidates_attention_mask,
-#             return_dict=True
-#         )
-#         self.label_embeddings = label_outputs["embeddings"]  # [num_labels, hidden_size]
-    
-#     def __call__(
-#         self,
-#         input_ids,
-#         attention_mask: Optional[mx.array] = None,
-#         label_candidates: Optional[mx.array] = None,
-#         label_candidates_attention_mask: Optional[mx.array] = None,
-#         multi_label: Optional[bool] = False,
-#         position_ids: Optional[mx.array] = None,
-#         labels: Optional[mx.array] = None,
-#         return_dict: Optional[bool] = True,
-#     ):
-#         if label_candidates is None:
-#             raise ValueError("label_candidates must be provided for zero-shot classification.")
-
-#         # Ensure we have label embeddings
-#         self.encode_labels(label_candidates, label_candidates_attention_mask)
-        
-#         # Get embeddings for input batch
-#         input_outputs = super().__call__(
-#             input_ids=input_ids,
-#             attention_mask=attention_mask,
-#             position_ids=position_ids,
-#             return_dict=True
-#         )
-#         batch_embeddings = input_outputs["embeddings"]  # [batch_size, hidden_size]
-        
-#         # Compute similarities between batch and all labels
-#         # Results in [batch_size, num_labels]
-#         similarities = compute_similarity(batch_embeddings, self.label_embeddings)
-        
-#         # Convert to probabilities across labels
-#         probs = mx.softmax(similarities, axis=-1)
-
-#         loss = None
-#         if labels is not None:
-#             ### similarities range may not be wide enough for cross-entropy
-#             ### add a scaling factor?
-#             if len(labels.shape) == 1:
-#                 loss = nn.losses.cross_entropy(similarities, labels)
-#             else:
-#                 # Convert one-hot to indices
-#                 label_indices = mx.argmax(labels, axis=-1)
-#                 loss = nn.losses.cross_entropy(similarities, label_indices)
-            
-#         if not return_dict:
-#             return (loss, similarities if multi_label else probs, batch_embeddings)
-            
-#         return {
-#             "loss": loss,
-#             "output": similarities if multi_label else probs,  # [batch_size, num_labels]
-#             "embeddings": batch_embeddings,  # [batch_size, hidden_size]
-#         }
-
-#     ### using same as sentence transformers for now
-#     def sanitize(self, weights):
-#         """Convert sentence transformer weights to ModernBERT format."""
-#         sanitized_weights = {}
-        
-#         for k, v in weights.items():
-#             if "position_ids" in k:
-#                 ### used this from another model, may need to change
-#                 # Remove unused position_ids
-#                 continue
-#             else:
-#                 new_key = "model." + k
-#                 sanitized_weights[new_key] = v
-#         return sanitized_weights
