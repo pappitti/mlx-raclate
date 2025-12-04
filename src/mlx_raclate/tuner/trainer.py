@@ -14,16 +14,7 @@ from datasets import Dataset as HFDataset
 
 from mlx.utils import tree_flatten, tree_map
 
-# from .datasets import Dataset
-
-from .collators import (
-    DataCollatorForMaskedLanguageModeling, 
-    DataCollatorForSequenceClassification,
-    DataCollatorForSentenceSimilarity,
-    DataCollatorForSentenceTransformers,
-    DataCollatorForTokenClassification,
-    DataCollator
-)
+from .collators import DataCollator
 
 @dataclass
 class TrainingArgs:
@@ -60,7 +51,7 @@ class TrainingArgs:
         self.output_dir = output_dir
         self.save_total_limit = save_total_limit
         self.grad_checkpoint = grad_checkpoint ### mat not be necessary but helps anticipating hardware constraints
-        self.push_to_hub = push_to_hub ### not used here but kept for later (see push_to_hub in utils)
+        self.push_to_hub = push_to_hub 
 
 class Trainer:
     """
@@ -74,6 +65,8 @@ class Trainer:
         task_type: str,
         training_args: TrainingArgs,
         train_dataset: HFDataset,
+        use_chat_template: bool = False, # for decoder-based models, you may want to use chat templates when preparing the data
+        force_separator: Optional[str] = None, # for decoder-based models, you may want to force a specific separator when preparing the data
         eval_dataset: Optional[HFDataset] = None,
         optimizer = None
     ):
@@ -82,6 +75,8 @@ class Trainer:
         self.task_type = task_type
         self.args = training_args
         self.train_dataset = train_dataset
+        self.use_chat_template = use_chat_template
+        self.force_separator = force_separator
         self.eval_dataset = eval_dataset
         self.data_collator = self._get_collator()
         
@@ -94,6 +89,8 @@ class Trainer:
         # Setup output directory
         self.output_dir = Path(training_args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Capture state that needs updating (random state for Dropout, etc.)
+        self.state = [self.model.state, self.optimizer.state, mx.random.state]
         
         # Setup training state and output directory
         self.global_step = 0
@@ -109,18 +106,23 @@ class Trainer:
         def loss_fn(model, batch):
             outputs = model(**batch)
             return mx.mean(outputs["loss"])
-
-        self.loss_and_grad_fn = nn.value_and_grad(self.model, loss_fn)
         
-        # Compile it
-        self.step_calc = mx.compile(self.loss_and_grad_fn)
+        grad_fn = nn.value_and_grad(self.model, loss_fn)
 
-        # 2. Optimizer Update Function
+        @partial(mx.compile, inputs=self.state, outputs=self.state)
+        def step_calc(batch):
+            loss, grads = grad_fn(self.model, batch)
+            return loss, grads
+
+        self.step_calc = step_calc
+
+        # Optimizer Update Function
         # We define a function that takes the model and ACCUMULATED grads
-        def update_fn(model, optimizer, grads):
-            optimizer.update(model, grads)
+        @partial(mx.compile, inputs=self.state, outputs=self.state)
+        def update_fn(grads):
+            self.optimizer.update(self.model, grads)
         
-        self.step_update = mx.compile(update_fn)
+        self.step_update = update_fn
         self.push_to_hub = training_args.push_to_hub 
         
         print(f"Training {model.__class__.__name__}")
@@ -155,21 +157,31 @@ class Trainer:
     
     def _get_collator(self) -> DataCollator:
         if self.task_type == "masked-lm":
+            from .collators import DataCollatorForMaskedLanguageModeling
             return DataCollatorForMaskedLanguageModeling(
                 tokenizer=self.tokenizer, 
                 max_length=self.args.max_length
             )
         elif self.task_type == "text-classification":
+            from .collators import DataCollatorForSequenceClassification
+            # For decoder-based models:
+            # the collator will apply chat template in priority if specified
+            # if not, it will force the separator if specified
+            # if not, it will use the tokenizer default
             return DataCollatorForSequenceClassification(
                 tokenizer=self.tokenizer, 
-                max_length=self.args.max_length
+                max_length=self.args.max_length,
+                use_chat_template=self.use_chat_template,
+                force_separator=self.force_separator
             )
         elif self.task_type == "token-classification":
+            from .collators import DataCollatorForTokenClassification
             return DataCollatorForTokenClassification(
                 tokenizer=self.tokenizer, 
                 max_length=self.args.max_length
             )
         elif self.task_type == "sentence-similarity" or self.task_type == "sentence-transformers":
+            from .collators import DataCollatorForSentenceSimilarity
             return DataCollatorForSentenceSimilarity(
                 tokenizer=self.tokenizer, 
                 max_length=self.args.max_length
@@ -178,7 +190,7 @@ class Trainer:
         raise ValueError(f"No collator defined for {self.task_type}")
 
 
-    def _create_batches(self, dataset, batch_size, shuffle=False):
+    def _create_batches(self, dataset, batch_size, shuffle=False, seed=42):
         """
         Iterates over HF dataset, slices it, and passes to collator.
         """
@@ -186,14 +198,14 @@ class Trainer:
         
         # Use HF dataset's efficient shuffle which works with memory mapping
         if shuffle:
-            dataset = dataset.shuffle(seed=42) # ideally seed changes per epoch
+            dataset = dataset.shuffle(seed=seed) 
             
         # Standard iteration
         for start_idx in range(0, data_len, batch_size):
             end_idx = min(start_idx + batch_size, data_len)
             batch_slice = dataset[start_idx:end_idx]
             # HF Dataset slicing returns a Dict of lists: {'text': ['a', 'b'], 'label': [0, 1]}
-             # Convert HF Columnar batch (Dict[str, List]) to MLX batch (Dict[str, mx.array])
+            # Convert HF Columnar batch (Dict[str, List]) to MLX batch (Dict[str, mx.array])
             yield self.data_collator(batch_slice)
 
     def train(self):
@@ -206,13 +218,18 @@ class Trainer:
             self._train_epoch()
             
             if self.eval_dataset is not None:
+                print(f"Evaluating after epoch {self.epoch + 1}...")
                 metrics = self.evaluate()
                 self._save_checkpoint(metrics)
+            else:
+                # Save checkpoint even if no eval dataset is provided
+                print(f"Saving checkpoint after epoch {self.epoch + 1} without evaluation...")
+                self._save_checkpoint({})
 
     def _train_epoch(self):
         """Training logic for one epoch."""
         self.model.train()
-        total_loss = 0
+        running_loss = 0
         n_steps = 0
         start_time = time.time()
         
@@ -221,18 +238,22 @@ class Trainer:
         steps_to_accumulate = self.args.gradient_accumulation_steps
         scale_factor = 1.0 / steps_to_accumulate if steps_to_accumulate > 1 else 1.0
 
-        for batch in self._create_batches(self.train_dataset, self.args.batch_size, shuffle=True):
+        # ensures different shuffling each epoch
+        current_seed = 42 + self.epoch 
+
+        for batch in self._create_batches(self.train_dataset, self.args.batch_size, shuffle=True, seed=current_seed):
             
             # Calculate Grads
-            loss, grads = self.step_calc(self.model, batch)
+            loss, grads = self.step_calc(batch)
 
             if accumulated_grads is None:
                 accumulated_grads = grads
             else:
                 accumulated_grads = tree_map(lambda x, y: x + y, accumulated_grads, grads)
             
-            # Ensure evaluation to get the loss value out for logging
-            total_loss += loss.item() 
+            # depending on hardware and model size, we may want to avoid syncing here
+            # 
+            running_loss += loss.item() # running_loss += loss to avoid sync
             n_steps += 1
 
             # Update Optimizer if Accumulation Done
@@ -243,7 +264,10 @@ class Trainer:
                     accumulated_grads = tree_map(lambda g: g * scale_factor, accumulated_grads)
 
                 # Apply updates
-                self.step_update(self.model, self.optimizer, accumulated_grads)
+                self.step_update(accumulated_grads)
+
+                ## can be used for debugging/logging (expensive)
+                # grads_for_logging = accumulated_grads if (self.global_step + 1) % self.args.logging_steps == 0 else None
 
                 # Reset
                 accumulated_grads = None
@@ -254,12 +278,41 @@ class Trainer:
                 self.global_step += 1
                 
                 if self.global_step % self.args.logging_steps == 0:
+                    # if running_loss is mx.array (see comment on hardware above), convert to float
+                    if isinstance(running_loss, mx.array):
+                        running_loss = running_loss.item()
+                    avg_loss = running_loss / n_steps
+
+                    # Handle both static float and dynamic schedule
+                    current_lr = self.optimizer.learning_rate
+                    if isinstance(current_lr, mx.array):
+                        current_lr = current_lr.item()
+
+                    ## can be used for debugging/logging (expensive)
+                    # grad_norm = 0.0
+                    # if grads_for_logging is not None:
+                    #     # Flatten the tree of gradients
+                    #     flat_grads = tree_flatten(grads_for_logging)
+                    #     # Concatenate and compute norm
+                    #     # Note: This is an extra computation, but useful for debugging
+                    #     grad_vec = mx.concatenate([g.flatten() for g in flat_grads])
+                    #     grad_norm = mx.linalg.norm(grad_vec).item()
+
+                    mem_gb = mx.get_active_memory() / 1e9
+
                     elapsed = time.time() - start_time
                     steps_per_sec = n_steps / elapsed
-                    avg_loss = total_loss / n_steps # Average over steps taken so far
-                    print(f"Step {self.global_step}: loss = {avg_loss:.4f}, steps/sec = {steps_per_sec:.2f}")
+                    
+                    print(
+                        f"Step {self.global_step} | Loss: {avg_loss:.4f} | LR: {current_lr:.2e} | Mem: {mem_gb:.1f}GB | Speed: {steps_per_sec:.2f} it/s"
+                    )
+                    
+                    # Reset window counters
+                    running_loss = 0.0
+                    n_steps = 0
+                    start_time = time.time()
         
-        return total_loss / n_steps # placeholder if we want to use the average loss for anything
+        return 0.0 # placeholder if we want to use the average loss for anything
     
     def evaluate(self):
         """Evaluation loop."""
@@ -280,9 +333,7 @@ class Trainer:
     def test(self, test_dataset=None):
         """
         Evaluate the model on the test set after training is complete.
-        
-        Args:
-            test_dataset: Optional test dataset. If None, uses self.eval_dataset
+        Args: test_dataset: Optional test dataset. If None, uses self.eval_dataset
         """
         print("\nPerforming final evaluation on test set...")
         
@@ -343,6 +394,7 @@ class Trainer:
                 upload_repo=repo_id,
                 hf_path=self.model.config.model_type, # Or base model name
                 task_type=self.task_type
+                # TODO : map architecture to HF pipeline for full compatibility
             )
         
         # Manage checkpoint rotation

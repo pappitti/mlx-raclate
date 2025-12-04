@@ -250,13 +250,13 @@ class ModernBertModel(nn.Module):
         self.embeddings.tok_embeddings = value
 
     def __call__(
-            self, 
-            input_ids, 
-            attention_mask = None, # (batch_size, seq_len) see below
-            sliding_window_mask = None,
-            position_ids = None,
-            output_hidden_states: Optional[bool] = False,
-            return_dict: Optional[bool] = True,
+        self, 
+        input_ids, 
+        attention_mask = None, # (batch_size, seq_len) see below
+        sliding_window_mask = None,
+        position_ids = None,
+        output_hidden_states: Optional[bool] = False,
+        return_dict: Optional[bool] = True,
     ):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

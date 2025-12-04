@@ -3,7 +3,7 @@ import yaml
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from datasets import load_dataset as hf_load_dataset 
-from datasets import DatasetDict
+from datasets import DatasetDict, ClassLabel, Sequence, Value
 from datasets import Dataset as HFDataset
 import mlx.core as mx
 
@@ -117,8 +117,8 @@ def load_dataset(args: DatasetArgs) -> Tuple[Optional[HFDataset], Optional[HFDat
             first_file = list(data_files.values())[0]
             ext = first_file.split(".")[-1]
             ext = "json" if ext == "jsonl" else ext
-            
             raw_datasets = hf_load_dataset(ext, data_files=data_files)
+    
     else:
         # Load from Hub
         try:
@@ -153,37 +153,72 @@ def load_dataset(args: DatasetArgs) -> Tuple[Optional[HFDataset], Optional[HFDat
 
     # Standardize Columns
     for split in raw_datasets.keys():
-        raw_datasets[split] = _standardize_column_names(raw_datasets[split], args)
+        if raw_datasets[split] is not None:
+            raw_datasets[split] = _standardize_column_names(raw_datasets[split], args)
 
-    return raw_datasets.get("train"), raw_datasets.get("validation"), raw_datasets.get("test")
+    # Get label mappings if applicable
+    id2label, label2id = None, None
+    if raw_datasets.get("train") is not None:
+        id2label, label2id = get_label_mapping(raw_datasets["train"], args)
+        
+        # Optional: Print info for debugging
+        if id2label:
+            print(f"Found {len(id2label)} labels: {list(id2label.values())[:5]}...")
 
-def get_label_mapping(dataset: HFDataset) -> Tuple[Dict[int, str], Dict[str, int]]:
+    return (
+        raw_datasets.get("train"), 
+        raw_datasets.get("validation"), 
+        raw_datasets.get("test"), 
+        id2label, 
+        label2id
+    )
+
+def get_label_mapping(dataset: HFDataset, args: DatasetArgs) -> Tuple[Optional[Dict[int, str]], Optional[Dict[str, int]]]:
     """
     Derives id2label and label2id from a dataset.
-    Prioritizes dataset features, falls back to scanning unique values.
+    Prioritizes dataset features (from config), falls back to scanning unique values in data.
     """
+    if args.task_type not in ["text-classification", "token-classification"]:
+        return None, None
+
+    # Determine the target column name based on task
+    target_col = "labels" if args.task_type == "token-classification" else "label"
+    if target_col not in dataset.column_names:
+        # Fallback: sometimes text-classification uses 'labels' or vice versa
+        if "label" in dataset.column_names: target_col = "label"
+        elif "labels" in dataset.column_names: target_col = "labels"
+        else: return None, None
+
     labels = []
     
-    # Try getting from features (efficient)
-    if "label" in dataset.features:
-        f = dataset.features["label"]
-        if hasattr(f, "names"):
-            labels = f.names
-        elif hasattr(f, "int2str"): # Sequence/Translation features
-            # This path is harder to access generically without iterating
-            pass
-
-    # Fallback: scan data (slower but necessary for CSVs)
-    if not labels:
-        # Take a sample to check type is valid
-        if len(dataset) > 0:
-            sample = dataset[0]["label"]
-            if isinstance(sample, int) or isinstance(sample, str):
-                labels = sorted(list(set(dataset["label"])))
+    # --- Strategy 1: Check Features (Config/Hub Metadata) ---
+    feature = dataset.features[target_col]
     
+    # Case A: Standard ClassLabel (Text Classification)
+    if isinstance(feature, ClassLabel):
+        labels = feature.names
+    
+    # Case B: Sequence of ClassLabels (Token Classification)
+    elif isinstance(feature, Sequence) and isinstance(feature.feature, ClassLabel):
+        labels = feature.feature.names
+
+    # --- Strategy 2: Scan Data (Raw JSONL/CSV) ---
+    if not labels:
+        if len(dataset) > 0:
+            if args.task_type == "token-classification":
+                # Flatten list of lists to find unique tags
+                unique_tags = set()
+                for row in dataset[target_col]:
+                    unique_tags.update(row)
+                labels = sorted(list(unique_tags))
+            else:
+                # Standard text classification scan
+                labels = sorted(list(set(dataset[target_col])))
+
     if not labels:
         return None, None
-        
+
+    # Construct mappings
     id2label = {k: str(v) for k, v in enumerate(labels)}
     label2id = {str(v): k for k, v in enumerate(labels)}
     

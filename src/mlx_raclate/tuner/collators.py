@@ -17,11 +17,52 @@ class DataCollatorForSequenceClassification(DataCollator):
     """
     Handles tokenization and padding for classification tasks.
     """
-    label_pad_token_id: int = -100
+    use_chat_template: bool = False# Whether to use chat templates for decoder models
+    force_separator: Optional[str] = None # If set, forces this separator between text pairs
+    default_decoder_separator: str = "\n" # Used for decoder models when concatenating text pairs
 
     def __call__(self, features: Dict[str, List[Any]]) -> Dict[str, mx.array]:
         texts = features.get("text")
         text_pairs = features.get("text_pair", None)
+
+        if text_pairs is not None:
+            if getattr(self.tokenizer, "chat_template", None) and self.use_chat_template:
+                # This ensures the model sees exactly what it expects for Q&A
+                formatted_texts = []
+                for prompt, response in zip(texts, text_pairs):
+                    messages = [
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": response}
+                    ]
+                    formatted_texts.append(
+                        self.tokenizer.apply_chat_template(messages, tokenize=False)
+                    )
+                texts = formatted_texts
+                text_pairs = None # Handled by template
+
+            elif self.force_separator is not None:
+                # Use the forced separator for decoder models
+                texts = [
+                    f"{t}{self.force_separator}{p}" 
+                    for t, p in zip(texts, text_pairs)
+                ]
+                text_pairs = None
+
+            else :
+                # Check if tokenizer has a standard separator (Like [SEP] in BERT)
+                # Qwen tokenizer often has sep_token as None or same as EOS
+                has_sep_token = getattr(self.tokenizer, "sep_token", None) is not None
+                
+                if not has_sep_token or self.tokenizer.sep_token == self.tokenizer.eos_token:
+                    texts = [
+                        f"{t}{self.default_decoder_separator}{p}" 
+                        for t, p in zip(texts, text_pairs)
+                    ]
+                    # Set pairs to None so tokenizer treats it as a single string
+                    text_pairs = None 
+
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         
         batch = self.tokenizer(
             texts,

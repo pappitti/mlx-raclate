@@ -20,7 +20,7 @@ def main():
     
     # Load the model and tokenizer
     model, tokenizer = load(
-        "TerenceLau/galahad-classifier-0.6B",
+        "NousResearch/Minos-v1",
         model_config={
             "is_regression": is_regression,
         }, 
@@ -40,22 +40,30 @@ def main():
         "<|user|> Can you translate 'hello' into Spanish? <|assistant|> 'Hello' in Spanish is 'Hola'."
     ]
 
-    for i in range(len(text)):
+    # For cross-encoding models, the text should not be concatenated but there must be a separate list of texts for the two sides
+    # The tokenizer will combine them appropriately
+    text_pairs = None
 
-        # Tokenize the input
-        tokens = tokenizer.encode(
-            text[i], 
-            return_tensors="mlx", 
-            padding=True, 
-            truncation=True, 
-            max_length= max_position_embeddings
-        )
+    tokens = tokenizer._tokenizer(
+        text, 
+        text_pairs,
+        return_tensors="mlx", 
+        padding=True, 
+        truncation=True, 
+        max_length= max_position_embeddings
+    )
 
-        # Forward pass
-        outputs = model(input_ids=tokens, return_dict=True)
+    outputs = model(
+        input_ids=tokens['input_ids'], 
+        attention_mask=tokens['attention_mask'],
+        return_dict=True
+    )
 
+    for i in range(outputs["probabilities"].shape[0]): # iterate over batch size
+
+    
         # Get the processed predictions for the first (and only) item in batch
-        predictions = outputs["probabilities"][0] # Shape: (num_label,)
+        predictions = outputs["probabilities"][i] # Shape: (num_label,)
 
         top_k = 5
 

@@ -5,7 +5,7 @@ from typing import List, Optional, Any, Union
 import uvicorn
 import gc
 import mlx.core as mx
-from .utils import PIPELINES, load
+from mlx_raclate.utils.utils import PIPELINES, load
 
 app = FastAPI(title="ModernBERT Inference API", 
               description="API for using ModerBERT",
