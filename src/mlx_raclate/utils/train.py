@@ -65,13 +65,13 @@ def main():
 
     # Training arguments
     training_args = TrainingArgs(
-        batch_size=8,
-        eval_batch_size=8,
+        batch_size=4,
+        eval_batch_size=4,
         max_length= model.config.max_position_embeddings,
         num_train_epochs=1,
         learning_rate=5e-5, ### 5e-5 
         weight_decay=0.01,
-        gradient_accumulation_steps=1, 
+        gradient_accumulation_steps=2, 
         eval_steps=500,
         save_steps=1000,
         logging_steps=12, ### 100

@@ -333,9 +333,11 @@ class Trainer:
             loss = mx.mean(outputs["loss"])
             total_loss += loss.item()
             n_steps += 1
-        metrics = {"eval_loss": total_loss / n_steps}
+            mx.clear_cache()
         
+        metrics = {"eval_loss": total_loss / n_steps}
         print(f"\nEvaluation metrics: {metrics}")
+        
         return metrics
     
     def test(self, test_dataset=None):
@@ -362,6 +364,7 @@ class Trainer:
             loss = mx.mean(outputs["loss"])
             total_loss += loss.item()
             n_steps += 1
+            mx.clear_cache()
         metrics = {"eval_loss": total_loss / n_steps}
         
         # Save test results
