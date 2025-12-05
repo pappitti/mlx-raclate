@@ -35,6 +35,7 @@ PIPELINES = [
 HF_ARCH_TO_PIPELINE_MAPPING = {
     "ForSequenceClassification": "text-classification",
     "ForMaskedLM": "masked-lm",
+    "ForTokenClassification": "token-classification",
 }
 
 MODEL_REMAPPING = {
@@ -48,6 +49,7 @@ class ModelNotFoundError(Exception):
     def __init__(self, message):
         self.message = message
         super().__init__(self.message)
+
 
 def _get_pipeline_from_config(arch : str):
     """
@@ -64,6 +66,7 @@ def _get_pipeline_from_config(arch : str):
             if k in arch:
                 return v
     return None  
+
 
 def _get_classes(config: dict, pipeline: Optional[str] = 'masked-lm'):
     """
@@ -113,21 +116,75 @@ def _get_classes(config: dict, pipeline: Optional[str] = 'masked-lm'):
     ### should not reach here
     return arch.Model, arch.ModelArgs
 
-def _initialize_missing_classifier_weights(weights, model_args):
-    """Initialize weights only if they don't exist in the weights dictionary."""
-    # For sequence classification, check and initialize classifier weights if needed
-    # TODO : improve initialization method
-    if getattr(model_args,"num_labels") is not None:
-        if "classifier.weight" not in weights:
-            initializer_range = getattr(model_args,"initializer_range", 0.02)
-            weights["classifier.weight"] = mx.random.normal(
-                (model_args.num_labels, model_args.hidden_size),
-                scale=initializer_range
+
+def _initialize_head_weights(model: nn.Module, loaded_weights: dict, config: Any):
+    """
+    If we are in training mode and missing head weights, we generate them 
+    using the specific distribution required (e.g., Normal 0.02) rather 
+    than relying on default initialization.
+    """
+    # Flattens the model so we know the shape and dtype of every expected parameter
+    model_params = dict(tree_flatten(model.parameters()))
+    
+    # Keywords that identify a 'Head' or 'Classifier' layer in your architectures
+    head_keywords = ["classifier", "score", "head", "decoder"]
+    
+    initializer_range = getattr(config, "initializer_range", 0.02)
+    
+    initialized_count = 0
+    
+    for key, param in model_params.items():
+        # If the parameter is missing from the loaded checkpoint
+        if key not in loaded_weights:
+            # And it belongs to a prediction head
+            if any(x in key for x in head_keywords):
+                
+                # 1. Initialize Biases to Zero
+                if "bias" in key:
+                    print(f"[INFO] Initializing missing bias {key} to Zeros")
+                    loaded_weights[key] = mx.zeros_like(param)
+                
+                # 2. Initialize Weights to Normal (std=0.02)
+                # We skip 'norm' weights (Gamma) which should be 1.0, but usually
+                # those are covered by default init or exist in the checkpoint.
+                elif "weight" in key and "norm" not in key:
+                    print(f"[INFO] Initializing missing weight {key} with Normal(0.0, {initializer_range})")
+                    loaded_weights[key] = mx.random.normal(
+                        param.shape, 
+                        scale=initializer_range, 
+                        dtype=param.dtype
+                    )
+                    
+                initialized_count += 1
+
+    if initialized_count > 0:
+        print(f"[INFO] Explicitly initialized {initialized_count} missing parameters for transfer learning.")
+
+
+def _verify_weights(model: nn.Module, loaded_weights: dict, train_mode: bool):
+    """
+    Ensures safety. 
+    - Inference: CRASH if head weights are missing.
+    - Training: PASS (we will initialize them next).
+    """
+    model_params = dict(tree_flatten(model.parameters()))
+    missing_keys = [k for k in model_params.keys() if k not in loaded_weights]
+    extra_keys = [k for k in loaded_weights.keys() if k not in model_params]
+    
+    head_keywords = ['classifier', 'score', 'head', 'decoder']
+    missing_head_keys = [k for k in missing_keys if any(x in k for x in head_keywords)]
+
+    if missing_head_keys:
+        if not train_mode:
+            # CRASH: User wants inference but loaded a base model
+            raise ValueError(
+                f"Weights missing for pipeline head: {missing_head_keys[:3]}...\n"
+                f"You are trying to run Inference using a checkpoint that lacks the "
+                f"classifier/decoder layers (likely a base model).\n"
+                f"Set `train=True` if you intend to finetune this model."
+                f" Extra keys found in loaded weights: {extra_keys[:3]}..."
             )
-            print(f"[INFO] Initialized classifier.weight with shape {weights['classifier.weight'].shape}")
-            
-        if "classifier.bias" not in weights:
-            weights["classifier.bias"] = mx.zeros((model_args.num_labels,))
+
 
 def compute_bits_per_weight(model):
     model_bytes = tree_reduce(
@@ -138,6 +195,7 @@ def compute_bits_per_weight(model):
     )
     model_params = sum(nparams(m) for _, m in leaf_modules)
     return model_bytes * 8 / model_params
+
 
 def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
     """
@@ -195,6 +253,7 @@ def load_model(
     model_config: dict = {},
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
     pipeline: Optional[str] = None,
+    train: bool = False, 
 ) -> nn.Module:
     """
     Load and initialize the model from a given path.
@@ -209,6 +268,11 @@ def load_model(
         get_model_classes (Callable[[dict], Tuple[Type[nn.Module], Type]], optional):
             A function that returns the model class and model args class given a config.
             Defaults to the _get_classes function.
+        pipeline (str, optional): The pipeline type. If None, it will be inferred
+            from the model configuration. Defaults to None.
+        train (bool, optional): Whether the model is being loaded for training.
+            In training model, models can be loaded from a different pipeline and
+            some weights can be initialized accordingly. Defaults to False.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -240,14 +304,18 @@ def load_model(
                     f"[INFO] Using pipeline {pipeline} based on user input, ignoring model architecture {model_arch}"
                 )
 
-    if sentence_transformers and pipeline!= "sentence-transformers":
-        if pipeline is None or pipeline == "sentence-similarity" or pipeline == "embeddings":
-            pipeline = "sentence-transformers"
-            print(f"[INFO] Using pipeline {pipeline}")
+    if sentence_transformers :
+        if pipeline not in ["sentence-transformers", "embeddings", "sentence-similarity"]:
+            if not train:
+                raise ValueError(
+                    f"Pipeline '{pipeline}' cannot be used with a Sentence Transformer model in Inference mode. "
+                    f"These models only support embeddings/similarity."
+                )
+            else:
+                print(f"[INFO] Adaptation: Loading Sentence Transformer base into {pipeline} pipeline for training.")
         else:
-            raise ValueError(
-                f"Pipeline {pipeline} not supported for sentence-transformers models."
-            )
+            pipeline = "sentence-transformers"
+            print(f"[INFO] Using pipeline {pipeline} based on Sentence Transformer config file.")
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
@@ -266,15 +334,19 @@ def load_model(
     model_class, model_args_class = get_model_classes(config=config, pipeline=pipeline)
 
     model_args = model_args_class.from_dict(config)
+    
+    # Instantiate the model (random init)
     model = model_class(model_args)
-
-    # Initialize any missing weights to train a base model based on the pipeline
-    if pipeline == "text-classification":
-        _initialize_missing_classifier_weights(weights, model_args)
-    ### TODO add more pipelines
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
+    
+    _verify_weights(model, weights, train_mode=train)
+
+    if train:
+        _initialize_head_weights(model, weights, model_args)
+
+    model.load_weights(list(weights.items()))
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may not have everything quantized
@@ -288,8 +360,6 @@ def load_model(
             **quantization,
             class_predicate=class_predicate,
         )
-
-    model.load_weights(list(weights.items()))
 
     if not lazy:
         mx.eval(model.parameters())
@@ -305,6 +375,7 @@ def load(
     adapter_path: Optional[str] = None, ## for now, disabling adapter loading
     lazy: bool = False,
     pipeline: Optional[str] = None,
+    train: bool = False
 ) -> Tuple[nn.Module, TokenizerWrapper]:
     """
     Load the model and tokenizer from a given path or a huggingface repository.
@@ -320,6 +391,11 @@ def load(
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        pipeline (str, optional): The pipeline type. If None, it will be inferred
+            from the model configuration. Defaults to None.
+        train (bool, optional): Whether the model is being loaded for training.
+            In training model, models can be loaded from a different pipeline and
+            some weights can be initialized accordingly. Defaults to False.
     Returns:
         Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
 
@@ -329,7 +405,7 @@ def load(
     """
     model_path = get_model_path(path_or_hf_repo)
 
-    model, config = load_model(model_path, lazy, model_config, pipeline=pipeline)
+    model, config = load_model(model_path, lazy, model_config, pipeline=pipeline, train=train)
     ### disabling adapter for encoders
     # if adapter_path is not None:
     #     model = load_adapters(model, adapter_path)

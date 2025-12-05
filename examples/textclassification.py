@@ -20,7 +20,7 @@ def main():
     
     # Load the model and tokenizer
     model, tokenizer = load(
-        "NousResearch/Minos-v1",
+         "TerenceLau/galahad-classifier-0.6B",
         model_config={
             "is_regression": is_regression,
         }, 

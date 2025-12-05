@@ -5,12 +5,13 @@ tested_models = [
     "nomic-ai/modernbert-embed-base",
     "tasksource/ModernBERT-base-embed",
     "makiart/ft-modern-bert-emb-all-nli",
+    "Alibaba-NLP/gte-modernbert-base",
     "Qwen/Qwen3-Embedding-0.6B"
 ]
 
 def main():
     # Load the model and tokenizer
-    model_name = "Qwen/Qwen3-Embedding-0.6B"  
+    model_name =  "Alibaba-NLP/gte-modernbert-base"
     model, tokenizer = load(
         model_name, 
         pipeline="sentence-similarity" # or "sentence-transformers" if sentence-transformers model is used

@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from .base import (
     BaseModelArgs,
+    RaclateBaseModel,
     last_token_pooling,
     normalize_embeddings,
     compute_similarity,
@@ -250,19 +251,24 @@ class Qwen3PredictionHead(nn.Module):
         return self.norm(self.act(self.dense(hidden_states)))
 
 
-class Model(nn.Module):
+class Model(RaclateBaseModel):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
         self.model_type = config.model_type # not used for now (placeholder)
         self.model = Qwen3Model(config)
 
+        # transformer architecture name for compatibility
+        self.hf_transformers_arch = "Qwen3ForCausalLM"
+
     def _process_outputs(self, logits: mx.array) -> mx.array:
         """Apply the appropriate activation function to the logits for classification tasks."""
         if self.is_regression:
-            return logits  # No activation for regression
+            # No activation for regression
+            return logits  
         elif self.num_labels == 1:
-            return mx.sigmoid(logits)  # Binary classification
+            # Binary classification
+            return mx.sigmoid(logits) 
         else:
             # Using softmax for multi-class classification
             return mx.softmax(logits, axis=-1)
@@ -454,7 +460,7 @@ class ModelForSentenceTransformers(ModelForSentenceSimilarity):
                 sanitized_weights[new_key] = v
         return sanitized_weights
 
-class ModelForSequenceClassification(nn.Module):
+class ModelForSequenceClassification(RaclateBaseModel):
     """
     Computes sequence classification probabilities for input sequences.
     Sanitization aligns typical BERT weights with HF's Qwen3ForSequenceClassification architecture.
@@ -478,7 +484,10 @@ class ModelForSequenceClassification(nn.Module):
         self.score = nn.Linear(
             config.hidden_size, 
             config.num_labels, 
+            bias=False
         ) 
+
+        self.hf_transformers_arch = "Qwen3ForSequenceClassification"
     
     def _process_outputs(self, logits: mx.array) -> mx.array:
         """Apply the appropriate activation function to the logits."""
@@ -556,6 +565,7 @@ class ModelForSequenceClassification(nn.Module):
     
     def sanitize(self, weights):
         # TBC (can't be tested without checkpoints)
+        print("Sanitizing weights for ModelForSequenceClassification...")
         sanitized_weights = {}
         for k, v in weights.items():
             if "position_ids" in k:
@@ -563,26 +573,32 @@ class ModelForSequenceClassification(nn.Module):
                 continue
             elif "lm_head" in k:
                 continue
-            elif k.startswith("bert"):
-                # Handle legacy BERT naming if needed
-                new_k = k.replace("bert.", "model.")
-                sanitized_weights[new_k] = v
-            
             # elif "score" in k:
             #     continue # TBC (the only checkpoint I have access to has both classifier and score layers)
-            elif k.startswith("classifier."):
-                if "bias" in k :
-                    new_k = k.replace("classifier.", "score.")
-                    sanitized_weights[new_k] = v
-                else:
-                    continue
-                # replace classifier with score to match HF naming convention 
-                # (ensuring compatibility with Qwen3ForSequenceClassification)
-                new_k = k.replace("classifier.", "score.")
-                sanitized_weights[new_k] = v  
+
+            new_key = k
+
+            # Ensure everything maps to self.model.[transformer_parts]
+            if k.startswith("model."):
+                # Standard HF Qwen format: model.layers...
+                new_key = k 
+            elif k.startswith("transformer."):
+                # Alternative format
+                new_key = k.replace("transformer.", "model.")
+            elif not k.startswith("score") and not k.startswith("classifier"):
+                # If weights are "flat" (e.g. layers.0...), prefix with model.
+                new_key = f"model.{k}"
             
-            else:
-                sanitized_weights[k] = v
+            # elif k.startswith("classifier."):
+            #     print(f"Sanitizing classifier key: {k}")
+            #     # replace classifier with score to match HF naming convention 
+            #     # (ensuring compatibility with Qwen3ForSequenceClassification)
+            #     new_key = k.replace("classifier.", "score.")
+            #     print(f"Sanitized classifier key to: {new_key}")
+
+            
+            sanitized_weights[new_key] = v  
+            
         return sanitized_weights
 
 # TokenClassification and MaskedLM not implemented for now AR models such as Qwen3

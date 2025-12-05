@@ -1,8 +1,16 @@
 import inspect
 from dataclasses import dataclass
 import mlx.core as mx
+import mlx.nn as nn
 from typing import Optional
 
+class RaclateBaseModel(nn.Module):
+    """Base class for Raclate models."""
+    def __init__(self):
+        super().__init__()
+    
+    def get_hf_transformers_arch(self):
+        return self.hf_transformers_arch if hasattr(self, "hf_transformers_arch") else None
 
 @dataclass
 class BaseModelArgs:
@@ -51,7 +59,7 @@ def last_token_pooling(
     last_hidden_states: mx.array, attention_mask: Optional[mx.array] = None
 ) -> mx.array:
     """
-    Last token pooling implementation
+    Last token pooling, compatible with MLX compilation/grad
 
     Args:
         last_hidden_states: Hidden states from the model, shape (batch_size, seq_len, hidden_size)
@@ -63,15 +71,19 @@ def last_token_pooling(
     if attention_mask is None:
         return last_hidden_states[:, -1]
 
-    # Check if we have left padding (all sequences end with valid tokens)
-    left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
-    if left_padding:
-        return last_hidden_states[:, -1]
-    else:
-        # Find the last valid token position for each sequence
-        sequence_lengths = attention_mask.sum(axis=1) - 1
-        batch_size = last_hidden_states.shape[0]
-        return last_hidden_states[mx.arange(batch_size), sequence_lengths]
+    B, S, _ = last_hidden_states.shape
+    indices = mx.arange(S)
+
+    # Only keep the unpadded tokens
+    masked_indices = indices * attention_mask.astype(indices.dtype)
+
+    # Find the last valid index (max index) for each batch item
+    last_token_indices = masked_indices.max(axis=1)
+
+    batch_indices = mx.arange(B)
+    
+    # Select specific [batch, token] pairs
+    return last_hidden_states[batch_indices, last_token_indices]
 
 
 def normalize_embeddings(embeddings, p=2, axis=-1, keepdims=True, eps=1e-9):

@@ -4,7 +4,7 @@ from mlx_raclate.utils.utils import load, PIPELINES
 from mlx_raclate.tuner.datasets import load_dataset, DatasetArgs
 from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
 
-DEFAULT_MODEL_PATH : str = "answerdotai/ModernBERT-base"
+DEFAULT_MODEL_PATH : str = "Qwen/Qwen3-Embedding-0.6B" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base"
 DEFAULT_DATASET_ID : str = "argilla/synthetic-domain-text-classification" # can be a local path
 DEFAULT_TASK_TYPE : str = "text-classification"
 
@@ -56,7 +56,8 @@ def main():
     model, tokenizer = load(
         model_path, 
         model_config=model_config, 
-        pipeline=task_type
+        pipeline=task_type,
+        train=train,
     )
 
     # Training arguments

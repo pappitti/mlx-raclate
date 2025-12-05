@@ -5,7 +5,7 @@ from typing import Optional, Dict, Literal, Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, compute_similarity, mean_pooling, normalize_embeddings
+from .base import BaseModelArgs, RaclateBaseModel, compute_similarity, mean_pooling, normalize_embeddings
 
 """ NOTE : This implementation of ModernBERT excludes all features related to Flash Attention 2, padded/unpadded handling"""
 
@@ -350,7 +350,7 @@ class ModernBertModel(nn.Module):
 
 
 ### below are the classes for specific pipelines
-class Model(nn.Module):
+class Model(RaclateBaseModel):
     """
     Computes embeddings for input sequences using a ModernBERT model.
 
@@ -362,6 +362,9 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.model = ModernBertModel(config)
+
+        # transformer architecture name for compatibility
+        self.hf_transformers_arch = "ModernBertModel" 
 
     def __call__(
         self, 
@@ -554,7 +557,7 @@ class ModernBertPredictionHead(nn.Module):
         return self.norm(self.act(self.dense(hidden_states)))
 
 
-class ModelForMaskedLM(nn.Module):
+class ModelForMaskedLM(RaclateBaseModel):
     """
     Computes masked language modeling (MLM) loss for input sequences.
     """
@@ -566,6 +569,9 @@ class ModelForMaskedLM(nn.Module):
         self.decoder = nn.Linear(
             config.hidden_size, config.vocab_size, bias=config.decoder_bias
         )
+
+        # transformer architecture name for compatibility
+        self.hf_transformers_arch = "ModernBertForMaskedLM" 
 
         # Tie weights ### does not seem to work (sanitizing the weights to enforce weight tying)
         self.tie_weights()
@@ -666,7 +672,7 @@ class ModelForMaskedLM(nn.Module):
         return sanitized_weights
     
 
-class ModelForSequenceClassification(nn.Module):
+class ModelForSequenceClassification(RaclateBaseModel):
     """
     Computes sequence classification probabilities for input sequences.
     Sanitization aligns typical BERT weights with the ModernBERT model.
@@ -686,6 +692,9 @@ class ModelForSequenceClassification(nn.Module):
             config.hidden_size, 
             config.num_labels, 
         ) 
+
+        # transformer architecture name for compatibility
+        self.hf_transformers_arch = "ModernBertForSequenceClassification"
     
     def _process_outputs(self, logits: mx.array) -> mx.array:
         """Apply the appropriate activation function to the logits."""
@@ -782,6 +791,7 @@ class ModelForTokenClassification(nn.Module):
     Computes token classification probabilities for input sequences.
 
     NOTE: untested for now
+    TODO : https://huggingface.co/disham993/electrical-ner-ModernBERT-base
     """
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -796,6 +806,12 @@ class ModelForTokenClassification(nn.Module):
             config.num_labels, 
             # bias=config.classifier_bias
         ) 
+
+        # transformer architecture name for compatibility
+        self.hf_transformers_arch = "ModernBertForTokenClassification"
+
+    def get_hf_transformers_arch(self):
+        return self.hf_transformers_arch if hasattr(self, "hf_transformers_arch") else None
 
     def __call__(
         self,

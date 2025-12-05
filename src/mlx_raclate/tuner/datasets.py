@@ -132,12 +132,17 @@ def load_dataset(args: DatasetArgs) -> Tuple[Optional[HFDataset], Optional[HFDat
         raise ValueError("Training split not found in dataset")
     
     # Handle Splits (Standard 70/15/15) or whatever the actual splits are
-    if "validation" not in raw_datasets and "test" not in raw_datasets and args.test:
-        t_t_split = raw_datasets["train"].train_test_split(test_size=0.15, seed=42)
-        raw_datasets["test"] = t_t_split["test"]
-        t_v_split = t_t_split["train"].train_test_split(test_size=0.176, seed=42) 
-        raw_datasets["train"] = t_v_split["train"]
-        raw_datasets["validation"] = t_v_split["test"]
+    if "validation" not in raw_datasets and "test" not in raw_datasets: 
+        if args.test:
+            t_t_split = raw_datasets["train"].train_test_split(test_size=0.15, seed=42)
+            raw_datasets["test"] = t_t_split["test"]
+            t_v_split = t_t_split["train"].train_test_split(test_size=0.176, seed=42) 
+            raw_datasets["train"] = t_v_split["train"]
+            raw_datasets["validation"] = t_v_split["test"]
+        else : # create only validation split
+            t_v_split = raw_datasets["train"].train_test_split(test_size=0.176, seed=42)
+            raw_datasets["train"] = t_v_split["train"]
+            raw_datasets["validation"] = t_v_split["test"]
     elif "validation" not in raw_datasets and "test" in raw_datasets:
         if args.test:
             t_v_split = raw_datasets["train"].train_test_split(test_size=0.176, seed=42)

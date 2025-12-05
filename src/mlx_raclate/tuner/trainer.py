@@ -252,7 +252,6 @@ class Trainer:
                 accumulated_grads = tree_map(lambda x, y: x + y, accumulated_grads, grads)
             
             # depending on hardware and model size, we may want to avoid syncing here
-            # 
             running_loss += loss.item() # running_loss += loss to avoid sync
             n_steps += 1
 
@@ -371,6 +370,10 @@ class Trainer:
     def _save_checkpoint(self, metrics: Dict[str, float]):
         save_path = self.output_dir / f"checkpoint-{self.global_step}"
         save_path.mkdir(exist_ok=True)
+
+        hf_transformers_arch = self.model.get_hf_transformers_arch()
+        if hf_transformers_arch:
+            self.model.config.architectures = [hf_transformers_arch]
 
         with open(save_path / "config.json", "w") as f:
             json.dump(self.model.config.__dict__, f, indent=2)
