@@ -254,6 +254,7 @@ class Trainer:
             # depending on hardware and model size, we may want to avoid syncing here
             running_loss += loss.item() # running_loss += loss to avoid sync
             n_steps += 1
+            self.global_step += 1
 
             # Update Optimizer if Accumulation Done
             if n_steps % steps_to_accumulate == 0:
@@ -273,9 +274,7 @@ class Trainer:
                 
                 # Eval state to actually trigger the computation graph
                 mx.eval(self.model.state, self.optimizer.state)
-                
-                self.global_step += 1
-                
+            
                 if self.global_step % self.args.logging_steps == 0:
                     # if running_loss is mx.array (see comment on hardware above), convert to float
                     if isinstance(running_loss, mx.array):

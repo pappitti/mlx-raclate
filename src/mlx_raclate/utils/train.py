@@ -40,9 +40,9 @@ def main():
         data=dataset, 
         task_type=task_type, 
         train=train,
-        # text_field="question",
-        # text_pair_field="response_anonymized",
-        # label_field="classification"
+        text_field="question",
+        text_pair_field="response_anonymized",
+        label_field="classification"
     )
     
     train_dataset, valid_dataset, test_dataset, id2label, label2id = load_dataset(dataset_args)
