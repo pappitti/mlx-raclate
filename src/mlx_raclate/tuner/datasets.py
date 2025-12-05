@@ -88,6 +88,16 @@ def _standardize_column_names(dataset: HFDataset, args: DatasetArgs) -> HFDatase
         
     if mapping:
         dataset = dataset.rename_columns(mapping)
+
+    keep_columns = {"text", "text_pair", "label", "labels", "negative"}
+    existing_columns = set(dataset.column_names)
+    columns_to_select = list(keep_columns.intersection(existing_columns))
+    
+    # Check if we have at least 'text'
+    if "text" not in columns_to_select:
+        print(f"Warning: Standard 'text' column not found in dataset columns: {dataset.column_names}")
+    
+    dataset = dataset.select_columns(columns_to_select)
         
     return dataset
 
@@ -142,70 +152,6 @@ def get_label_mapping(dataset: HFDataset, args: DatasetArgs) -> Tuple[Optional[D
     label2id = {str(v): k for k, v in enumerate(labels)}
     
     return id2label, label2id
-
-
-def _encode_labels(dataset: HFDataset, label2id: Dict[str, int], task_type: str) -> HFDataset:
-    """
-    Converts string labels in the dataset to integers using the label2id mapping.
-    Also updates the dataset Features to use ClassLabel.
-    """
-    # Determine column name
-    target_col = "labels" if task_type == "token-classification" else "label"
-    if target_col not in dataset.column_names:
-        # Fallback for inconsistent naming
-        if "label" in dataset.column_names: target_col = "label"
-        elif "labels" in dataset.column_names: target_col = "labels"
-        else: return dataset
-
-    # If first item it's already an int, we skip.
-    sample_item = dataset[0][target_col]
-    needs_conversion = False
-    if task_type == "token-classification":
-        # Expecting List[str]
-        if isinstance(sample_item, list) and len(sample_item) > 0 and isinstance(sample_item[0], str):
-            needs_conversion = True
-    else:
-        # Expecting str
-        if isinstance(sample_item, str):
-            needs_conversion = True
-
-    if not needs_conversion:
-        return dataset
-
-    print(f"Encoding string labels to IDs for column '{target_col}'...")
-
-    def encode_classification(batch):
-        return {target_col: [label2id[x] for x in batch[target_col]]}
-    
-    def encode_ner(batch):
-        # Handle unknown labels safely if necessary, though get_label_mapping scans all
-        return {
-            target_col: [
-                [label2id[t] for t in seq] for seq in batch[target_col]
-            ]
-        }
-
-    # Apply mapping
-    if task_type == "token-classification":
-        dataset = dataset.map(encode_ner, batched=True, desc="Encoding labels")
-    else:
-        dataset = dataset.map(encode_classification, batched=True, desc="Encoding labels")
-
-    # Update Features Schema to ClassLabel
-    try:
-        class_names = list(label2id.keys())
-        new_features = dataset.features.copy()
-        
-        if task_type == "token-classification":
-            new_features[target_col] = Sequence(ClassLabel(names=class_names))
-        else:
-            new_features[target_col] = ClassLabel(names=class_names)
-            
-        dataset = dataset.cast(new_features)
-    except Exception as e:
-        print(f"Warning: Could not cast features to ClassLabel: {e}")
-
-    return dataset
 
 
 def load_dataset(args: DatasetArgs) -> Tuple[Optional[HFDataset], Optional[HFDataset], Optional[HFDataset]]:
@@ -294,16 +240,6 @@ def load_dataset(args: DatasetArgs) -> Tuple[Optional[HFDataset], Optional[HFDat
         
         if id2label:
             print(f"Found {len(id2label)} labels. First 5: {list(id2label.values())[:5]}")
-            
-            # Apply the encoding to ALL splits
-            # We must use the label2id derived from TRAIN to encode Val/Test to ensure consistency.
-            # for split in raw_datasets.keys():
-            #     if raw_datasets[split] is not None:
-            #         raw_datasets[split] = _encode_labels(
-            #             raw_datasets[split], 
-            #             label2id, 
-            #             args.task_type
-            #         )
 
     return (
         raw_datasets.get("train"), 

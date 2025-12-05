@@ -11,7 +11,6 @@ class DataCollator:
     def __call__(self, features: Dict[str, List[Any]]) -> Dict[str, mx.array]:
         raise NotImplementedError
 
-
 @dataclass
 class DataCollatorForSequenceClassification(DataCollator):
     """
@@ -20,6 +19,7 @@ class DataCollatorForSequenceClassification(DataCollator):
     use_chat_template: bool = False# Whether to use chat templates for decoder models
     force_separator: Optional[str] = None # If set, forces this separator between text pairs
     default_decoder_separator: str = "\n" # Used for decoder models when concatenating text pairs
+    label2id: Optional[Dict[str, int]] = None
 
     def __call__(self, features: Dict[str, List[Any]]) -> Dict[str, mx.array]:
         texts = features.get("text")
@@ -75,8 +75,16 @@ class DataCollatorForSequenceClassification(DataCollator):
         
         if "label" in features:
             labels = features["label"]
+            # On-the-fly String to ID conversion
+            if self.label2id and len(labels) > 0 and isinstance(labels[0], str):
+                labels = [self.label2id.get(l, -1) for l in labels] # Default to -1 if missing
+            
             # Detect regression (float) vs classification (int)
-            dtype = mx.float32 if isinstance(labels[0], float) else mx.int32
+            if len(labels) > 0 and isinstance(labels[0], float):
+                dtype = mx.float32
+            else:
+                dtype = mx.int32
+
             batch["labels"] = mx.array(labels, dtype=dtype)
             
         return dict(batch)
@@ -89,6 +97,7 @@ class DataCollatorForTokenClassification(DataCollator):
     label_pad_token_id: int = -100
     # Strategy: 'first' (label only first subword), 'all' (label all subwords with same tag)
     label_all_tokens: bool = False 
+    label2id: Optional[Dict[str, int]] = None
 
     def __call__(self, features: Dict[str, List[Any]]) -> Dict[str, mx.array]:
         texts = features["text"] 
@@ -116,10 +125,14 @@ class DataCollatorForTokenClassification(DataCollator):
         padded_labels = np.full((batch_size, seq_len), self.label_pad_token_id, dtype=np.int32)
 
         for i, label_seq in enumerate(labels):
-           # word_ids returns a list mapping each token to its original word index
+            # On-the-fly conversion for list of strings (to avoid memory issues with dataset.map)
+            current_labels = label_seq
+            if self.label2id and len(label_seq) > 0 and isinstance(label_seq[0], str):
+                current_labels = [self.label2id.get(l, self.label_pad_token_id) for l in label_seq]
+
+            # word_ids returns a list mapping each token to its original word index
             # e.g., [None, 0, 1, 1, 2, None] for "[CLS] My name is John [SEP]"
             word_ids = batch.word_ids(batch_index=i)
-            
             previous_word_idx = None
 
             for k, word_idx in enumerate(word_ids):
@@ -128,15 +141,15 @@ class DataCollatorForTokenClassification(DataCollator):
                     continue
                 
                 # Safety check: tokenizer truncation might leave word_ids that point to label indices larger than the label list provided.
-                if word_idx >= len(label_seq):
+                if word_idx >= len(current_labels):
                     break 
                 
                 if word_idx != previous_word_idx:
-                    padded_labels[i, k] = label_seq[word_idx]
+                    padded_labels[i, k] = current_labels[word_idx]
                 else:
                     # This is a subsequent subword of the same word
                     if self.label_all_tokens:
-                        padded_labels[i, k] = label_seq[word_idx]
+                        padded_labels[i, k] = current_labels[word_idx]
                     else:
                         # Standard BERT NER behavior: ignore subsequent subwords
                         padded_labels[i, k] = self.label_pad_token_id
@@ -210,7 +223,7 @@ class DataCollatorForSentenceSimilarity(DataCollator):
     Unlike SequenceClassification, this keeps sentences SEPARATE to produce
     independent embeddings.
     
-    Expected keys in features (from dataset.py standardization):
+    Expected keys in features (from datasets.py standardization):
     - 'text': The Anchor / Sentence A
     - 'text_pair': The Positive / Reference / Sentence B
     - 'negative' (optional): The Hard Negative / Sentence C

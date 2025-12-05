@@ -1,5 +1,6 @@
 import time
 import json
+import gc
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,7 +69,8 @@ class Trainer:
         use_chat_template: bool = False, # for decoder-based models, you may want to use chat templates when preparing the data
         force_separator: Optional[str] = None, # for decoder-based models, you may want to force a specific separator when preparing the data
         eval_dataset: Optional[HFDataset] = None,
-        optimizer = None
+        optimizer = None,
+        label2id: Optional[Dict[str, int]] = None
     ):
         self.model = model
         self.tokenizer = tokenizer._tokenizer ### tokenizer is a wrapper around the HF tokenizer (see utils/tokenizer_utils.py)
@@ -78,6 +80,7 @@ class Trainer:
         self.use_chat_template = use_chat_template
         self.force_separator = force_separator
         self.eval_dataset = eval_dataset
+        self.label2id = label2id
         self.data_collator = self._get_collator()
         
         # Initialize optimizer
@@ -119,8 +122,8 @@ class Trainer:
         # Optimizer Update Function
         # We define a function that takes the model and ACCUMULATED grads
         @partial(mx.compile, inputs=self.state, outputs=self.state)
-        def update_fn(grads):
-            self.optimizer.update(self.model, grads)
+        def update_fn(accumulated_grads):
+            self.optimizer.update(self.model, accumulated_grads)
         
         self.step_update = update_fn
         self.push_to_hub = training_args.push_to_hub 
@@ -172,13 +175,15 @@ class Trainer:
                 tokenizer=self.tokenizer, 
                 max_length=self.args.max_length,
                 use_chat_template=self.use_chat_template,
-                force_separator=self.force_separator
+                force_separator=self.force_separator,
+                label2id=self.label2id
             )
         elif self.task_type == "token-classification":
             from .collators import DataCollatorForTokenClassification
             return DataCollatorForTokenClassification(
                 tokenizer=self.tokenizer, 
-                max_length=self.args.max_length
+                max_length=self.args.max_length,
+                label2id=self.label2id
             )
         elif self.task_type == "sentence-similarity" or self.task_type == "sentence-transformers":
             from .collators import DataCollatorForSentenceSimilarity
@@ -309,6 +314,11 @@ class Trainer:
                     running_loss = 0.0
                     n_steps = 0
                     start_time = time.time()
+            
+                # May not be optimal from a speed perspective but MLX is very aggressive in terms of memory caching 
+                # Like for the server, we force garbage collection here to avoid OOMs on large models
+                gc.collect()
+                mx.clear_cache()
         
         return 0.0 # placeholder if we want to use the average loss for anything
     

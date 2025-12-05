@@ -5,7 +5,7 @@ from mlx_raclate.tuner.datasets import load_dataset, DatasetArgs
 from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
 
 DEFAULT_MODEL_PATH : str = "answerdotai/ModernBERT-base" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base"
-DEFAULT_DATASET : str = "argilla/synthetic-domain-text-classification" # can be a local path "argilla/synthetic-domain-text-classification" "data/20251205_1125"
+DEFAULT_DATASET : str = "data/20251205_1125" # can be a local path "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
 
 def init_args():
@@ -65,16 +65,16 @@ def main():
 
     # Training arguments
     training_args = TrainingArgs(
-        batch_size=1,
-        eval_batch_size=1,
+        batch_size=8,
+        eval_batch_size=8,
         max_length= model.config.max_position_embeddings,
         num_train_epochs=3,
         learning_rate=5e-5, ### 5e-5 
         weight_decay=0.01,
-        gradient_accumulation_steps=4, 
+        gradient_accumulation_steps=2, 
         eval_steps=500,
         save_steps=1000,
-        logging_steps=100, ### 100
+        logging_steps=96, ### 100
         output_dir=output_dir,
         save_total_limit=None,
         grad_checkpoint=True,
@@ -90,7 +90,8 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
         use_chat_template=use_chat_template if task_type == "text-classification" else False,
-        force_separator=force_separator if task_type == "text-classification" else None
+        force_separator=force_separator if task_type == "text-classification" else None,
+        label2id=label2id
     )
     
     # Train or evaluate
