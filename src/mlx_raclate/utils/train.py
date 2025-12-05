@@ -5,13 +5,13 @@ from mlx_raclate.tuner.datasets import load_dataset, DatasetArgs
 from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
 
 DEFAULT_MODEL_PATH : str = "answerdotai/ModernBERT-base" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base"
-DEFAULT_DATASET_ID : str = "argilla/synthetic-domain-text-classification" # can be a local path
+DEFAULT_DATASET : str = "argilla/synthetic-domain-text-classification" # can be a local path "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
 
 def init_args():
     parser = argparse.ArgumentParser(description="Train or evaluate a classification model using MLX Raclate.")
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help="Path to the pre-trained model or model identifier from a model hub.")
-    parser.add_argument("--dataset_id", type=str, default=DEFAULT_DATASET_ID, help="Identifier of the dataset to use for training/evaluation.")
+    parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET, help="Local path or HF identifier of the dataset to use for training/evaluation.")
     parser.add_argument("--task_type", type=str, default=DEFAULT_TASK_TYPE, help="Type of task (default: text-classification).")
     parser.add_argument("--is_regression", default=False, action='store_true', help="Set this flag if the task is regression.")
     parser.add_argument("--train", default=True, action='store_true', help="Set this flag to train the model; if not set, only evaluation will be performed.")
@@ -23,7 +23,7 @@ def main():
     args = init_args()
 
     model_path : str = args.model_path 
-    dataset_id : str = args.dataset_id
+    dataset : str = args.dataset
     task_type : str = args.task_type
     is_regression : bool = args.is_regression
     train : bool = args.train
@@ -37,9 +37,12 @@ def main():
 
     # Load datasets
     dataset_args = DatasetArgs(
-        data=dataset_id, 
+        data=dataset, 
         task_type=task_type, 
         train=train,
+        # text_field="question",
+        # text_pair_field="response_anonymized",
+        # label_field="classification"
     )
     
     train_dataset, valid_dataset, test_dataset, id2label, label2id = load_dataset(dataset_args)
@@ -68,7 +71,7 @@ def main():
         num_train_epochs=3,
         learning_rate=5e-5, ### 5e-5 
         weight_decay=0.01,
-        gradient_accumulation_steps=1, 
+        gradient_accumulation_steps=4, 
         eval_steps=500,
         save_steps=1000,
         logging_steps=100, ### 100
