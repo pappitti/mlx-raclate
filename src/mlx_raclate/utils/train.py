@@ -68,13 +68,13 @@ def main():
         batch_size=8,
         eval_batch_size=8,
         max_length= model.config.max_position_embeddings,
-        num_train_epochs=3,
+        num_train_epochs=1,
         learning_rate=5e-5, ### 5e-5 
         weight_decay=0.01,
-        gradient_accumulation_steps=2, 
+        gradient_accumulation_steps=1, 
         eval_steps=500,
         save_steps=1000,
-        logging_steps=96, ### 100
+        logging_steps=12, ### 100
         output_dir=output_dir,
         save_total_limit=None,
         grad_checkpoint=True,
