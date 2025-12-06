@@ -33,7 +33,6 @@ class TrainingArgs:
         warmup_steps: int = 0, # warmup steps take precedence over warmup ratio
         lr_scheduler_type: str = "constant", # "cosine_decay", "linear_schedule", https://ml-explore.github.io/mlx/build/html/python/optimizers/schedulers.html
         gradient_accumulation_steps: int = 1,
-        eval_steps: int = 500,
         save_steps: int = 1000,
         logging_steps: int = 100,
         output_dir: str = "outputs",
@@ -51,7 +50,6 @@ class TrainingArgs:
         self.warmup_steps = warmup_steps
         self.lr_scheduler_type = lr_scheduler_type
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.eval_steps = eval_steps
         self.save_steps = save_steps
         self.logging_steps = logging_steps
         self.output_dir = output_dir
@@ -156,7 +154,7 @@ class Trainer:
             )
 
         # Setup output directory
-        self.output_dir = Path.joinpath("trained_models", training_args.output_dir)
+        self.output_dir = Path("trained_models") / training_args.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Setup training state and output directory
