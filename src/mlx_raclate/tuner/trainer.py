@@ -16,6 +16,7 @@ from datasets import Dataset as HFDataset
 from mlx.utils import tree_flatten, tree_map
 
 from .collators import DataCollator
+from .utils import build_schedule
 
 @dataclass
 class TrainingArgs:
@@ -28,7 +29,9 @@ class TrainingArgs:
         num_train_epochs: int = 3,
         learning_rate: float = 5e-5,
         weight_decay: float = 0.01,
-        warmup_ratio: float = 0.1,
+        warmup_ratio: float = 0,
+        warmup_steps: int = 0, # warmup steps take precedence over warmup ratio
+        lr_scheduler_type: str = "constant", # "cosine_decay", "linear_schedule", https://ml-explore.github.io/mlx/build/html/python/optimizers/schedulers.html
         gradient_accumulation_steps: int = 1,
         eval_steps: int = 500,
         save_steps: int = 1000,
@@ -44,7 +47,9 @@ class TrainingArgs:
         self.num_train_epochs = num_train_epochs
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
-        self.warmup_ratio = warmup_ratio ### not used here but kept for later (see scheduler in utils)
+        self.warmup_ratio = warmup_ratio
+        self.warmup_steps = warmup_steps
+        self.lr_scheduler_type = lr_scheduler_type
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.eval_steps = eval_steps
         self.save_steps = save_steps
@@ -97,16 +102,62 @@ class Trainer:
         self.data_collator = self._get_collator()
         
         # Initialize optimizer
-        self.optimizer = optimizer or mlx.optimizers.AdamW(
-            learning_rate=training_args.learning_rate,
-            weight_decay=training_args.weight_decay
-        )
+        if optimizer is not None:
+            self.optimizer = optimizer
+        elif training_args.lr_scheduler_type=="constant" and not (training_args.warmup_steps or training_args.warmup_ratio):
+            self.optimizer = mlx.optimizers.AdamW(
+                learning_rate=training_args.learning_rate,
+                weight_decay=training_args.weight_decay
+            )
+        else:
+            # Build learning rate schedule
+            steps_per_epoch = len(train_dataset) // training_args.batch_size
+            if len(train_dataset) % training_args.batch_size != 0:
+                steps_per_epoch += 1
+                
+            # Effective steps considering gradient accumulation
+            num_update_steps_per_epoch = max(steps_per_epoch // training_args.gradient_accumulation_steps, 1)
+            max_steps = num_update_steps_per_epoch * training_args.num_train_epochs
+
+            if training_args.warmup_steps > 0:
+                warmup_steps = training_args.warmup_steps
+            else:
+                warmup_steps = int(max_steps * training_args.warmup_ratio)
+            
+            decay_steps = max_steps - warmup_steps
+            
+            scheduler_type = training_args.lr_scheduler_type # e.g. "constant", "cosine_decay"
+        
+            # Arguments list depends on the function signature in mlx.optimizers
+            if scheduler_type == "constant":
+                schedule_args = [training_args.learning_rate]
+            
+            elif scheduler_type == "linear_schedule":
+                schedule_args = [training_args.learning_rate, 0.0, decay_steps]
+                
+            else:
+                # This covers "cosine_decay", "step_decay", "exponential_decay" (check specific sigs)
+                schedule_args = [training_args.learning_rate, decay_steps]
+
+            print(f"Scheduler: {scheduler_type} | Warmup: {warmup_steps} | Total: {max_steps}")
+
+            schedule_config = {
+                "name": scheduler_type,
+                "arguments": schedule_args,
+                "warmup_steps": warmup_steps,
+                "warmup_init": 0.0
+            }
+
+            lr_schedule = build_schedule(schedule_config)
+
+            self.optimizer = mlx.optimizers.AdamW(
+                learning_rate=lr_schedule,
+                weight_decay=training_args.weight_decay
+            )
 
         # Setup output directory
         self.output_dir = Path.joinpath("trained_models", training_args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        # Capture state that needs updating (random state for Dropout, etc.)
-        self.state = [self.model.state, self.optimizer.state, mx.random.state]
         
         # Setup training state and output directory
         self.global_step = 0
@@ -316,7 +367,11 @@ class Trainer:
                     avg_loss = running_loss / n_steps
 
                     # Handle both static float and dynamic schedule
-                    current_lr = self.optimizer.learning_rate
+                    if callable(self.optimizer.learning_rate):
+                        # We must pass the optimizer step index
+                        current_lr = self.optimizer.learning_rate(self.optimizer.step)
+                    else:
+                        current_lr = self.optimizer.learning_rate
                     if isinstance(current_lr, mx.array):
                         current_lr = current_lr.item()
 
@@ -349,11 +404,11 @@ class Trainer:
                         self._save_checkpoint({"step": self.global_step, "step_loss": avg_loss, "learning_rate": current_lr, "memory_gb": mem_gb, "steps_per_sec": steps_per_sec})
             
                 # May not be optimal from a speed perspective but MLX is very aggressive in terms of memory caching 
-                # Like for the server, we force garbage collection here to avoid OOMs on large models
+                # Like for the utils/server, we force garbage collection here to avoid OOMs on large models
                 gc.collect()
                 mx.clear_cache()
         
-        return 0.0 # placeholder if we want to use the average loss for anything
+        return 0.0 # placeholder 
     
     def evaluate(self):
         """Evaluation loop."""
@@ -442,7 +497,6 @@ class Trainer:
                 upload_repo=repo_id,
                 hf_path=self.model.config.model_type, # Or base model name
                 task_type=self.task_type
-                # TODO : map architecture to HF pipeline for full compatibility
             )
         
         # Manage checkpoint rotation
