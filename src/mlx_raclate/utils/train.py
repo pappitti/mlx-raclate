@@ -1,5 +1,6 @@
 import argparse
-import mlx.core as mx
+import time
+
 from mlx_raclate.utils.utils import load, PIPELINES
 from mlx_raclate.tuner.datasets import load_dataset, DatasetArgs
 from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
@@ -33,7 +34,7 @@ def main():
     if task_type not in PIPELINES:
         raise ValueError(f"Task type {task_type} not supported. Choose from {PIPELINES.items()}")
     
-    output_dir = model_path.split("/")[-1] + "_" + task_type
+    output_dir = model_path.split("/")[-1] + "_" + task_type + "_" + time.strftime("%Y%m%d_%H%M%S")
 
     # Load datasets
     dataset_args = DatasetArgs(
