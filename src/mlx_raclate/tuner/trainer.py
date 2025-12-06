@@ -75,7 +75,20 @@ class Trainer:
         self.model = model
         self.tokenizer = tokenizer._tokenizer ### tokenizer is a wrapper around the HF tokenizer (see utils/tokenizer_utils.py)
         self.task_type = task_type
+
         self.args = training_args
+        # Adjust logging and saving steps based on gradient accumulation
+        if training_args.logging_steps % training_args.gradient_accumulation_steps != 0:
+            closest_multiple = (training_args.logging_steps // training_args.gradient_accumulation_steps) * training_args.gradient_accumulation_steps
+            self.logging_steps = closest_multiple if closest_multiple > 0 else training_args.gradient_accumulation_steps
+        else:
+            self.logging_steps = training_args.logging_steps
+        if training_args.save_steps % training_args.gradient_accumulation_steps != 0:
+            closest_multiple = (training_args.save_steps // training_args.gradient_accumulation_steps) * training_args.gradient_accumulation_steps
+            self.save_steps = closest_multiple if closest_multiple > 0 else training_args.gradient_accumulation_steps
+        else:
+            self.save_steps = training_args.save_steps
+
         self.train_dataset = train_dataset
         self.use_chat_template = use_chat_template
         self.force_separator = force_separator
@@ -146,8 +159,24 @@ class Trainer:
 
             module.__call__ = checkpointed_call
         
-        # Checkpoint transformer layers - these are the main memory users
-        for layer in self.model.model.layers:
+        layers = None
+        
+        # Handling various model architectures
+        if hasattr(self.model, "layers"): 
+            layers = self.model.layers
+        elif hasattr(self.model, "model"):
+            if hasattr(self.model.model, "layers"): 
+                layers = self.model.model.layers
+            elif hasattr(self.model.model, "encoder"): # T5 / Others TBC
+                if hasattr(self.model.model.encoder, "layers"):
+                    layers = self.model.model.encoder.layers
+
+        if layers is None:
+            print("WARNING: Could not find layers to checkpoint. Memory will explode.")
+            return
+
+        print(f"Checkpointing {len(layers)} layers.")
+        for layer in layers:
             checkpoint_fn(layer)
 
         ### TODO : optionally checkpoint other layers  (head, classifier) 
@@ -280,7 +309,7 @@ class Trainer:
                 # Eval state to actually trigger the computation graph
                 mx.eval(self.model.state, self.optimizer.state)
             
-                if self.global_step % self.args.logging_steps == 0:
+                if self.global_step % self.logging_steps == 0:
                     # if running_loss is mx.array (see comment on hardware above), convert to float
                     if isinstance(running_loss, mx.array):
                         running_loss = running_loss.item()
@@ -314,6 +343,10 @@ class Trainer:
                     running_loss = 0.0
                     n_steps = 0
                     start_time = time.time()
+
+                    if self.global_step % self.save_steps == 0 :
+                        print("Saving checkpoint...")
+                        self._save_checkpoint({"step": self.global_step, "step_loss": avg_loss, "learning_rate": current_lr, "memory_gb": mem_gb, "steps_per_sec": steps_per_sec})
             
                 # May not be optimal from a speed perspective but MLX is very aggressive in terms of memory caching 
                 # Like for the server, we force garbage collection here to avoid OOMs on large models
