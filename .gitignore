@@ -18,6 +18,7 @@ wheels/
 
 # Data files
 data/
+trained_models/
 
 # DEV notes
 NOTES.md

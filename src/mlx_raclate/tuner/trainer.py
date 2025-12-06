@@ -22,8 +22,8 @@ class TrainingArgs:
 
     def __init__(
         self,
-        batch_size: int = 32,
-        eval_batch_size: int = 16,
+        batch_size: int = 4,
+        eval_batch_size: int = 2,
         max_length: int = 512,
         num_train_epochs: int = 3,
         learning_rate: float = 5e-5,
@@ -83,9 +83,9 @@ class Trainer:
             self.logging_steps = closest_multiple if closest_multiple > 0 else training_args.gradient_accumulation_steps
         else:
             self.logging_steps = training_args.logging_steps
-        if training_args.save_steps % training_args.gradient_accumulation_steps != 0:
-            closest_multiple = (training_args.save_steps // training_args.gradient_accumulation_steps) * training_args.gradient_accumulation_steps
-            self.save_steps = closest_multiple if closest_multiple > 0 else training_args.gradient_accumulation_steps
+        if training_args.save_steps % self.logging_steps  != 0:
+            closest_multiple = (training_args.save_steps // self.logging_steps ) * self.logging_steps 
+            self.save_steps = closest_multiple if closest_multiple > 0 else self.logging_steps 
         else:
             self.save_steps = training_args.save_steps
 
@@ -103,7 +103,7 @@ class Trainer:
         )
 
         # Setup output directory
-        self.output_dir = Path(training_args.output_dir)
+        self.output_dir = Path.joinpath("trained_models", training_args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # Capture state that needs updating (random state for Dropout, etc.)
         self.state = [self.model.state, self.optimizer.state, mx.random.state]
