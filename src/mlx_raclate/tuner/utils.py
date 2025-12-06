@@ -7,22 +7,38 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten, tree_unflatten
 
-
+    
 def build_schedule(schedule_config: Dict):
     """
     Build a learning rate schedule from the given config.
+    Adapted for MLX Optimizers.
     """
-    schedule_fn = getattr(opt.schedulers, schedule_config["name"])
+    name = schedule_config["name"]
     arguments = schedule_config["arguments"]
     initial_lr = arguments[0]
-    bound_schedule_fn = schedule_fn(*arguments)
-    if warmup_steps := schedule_config.get("warmup", 0):
+    
+    # Create the main schedule function
+    if name == "constant":
+        # Create a callable that ignores the step and returns the LR
+        bound_schedule_fn = lambda _: initial_lr
+    else:
+        # For cosine_decay, linear_schedule, etc.
+        schedule_fn = getattr(opt, name)
+        bound_schedule_fn = schedule_fn(*arguments)
+    
+    # Check for warmup
+    warmup_steps = schedule_config.get("warmup_steps", 0)
+    
+    if warmup_steps > 0:
         warmup_init = schedule_config.get("warmup_init", 0.0)
-        warmup_fn = opt.schedulers.linear_schedule(
+        
+        # Linear warmup: 0 -> initial_lr
+        warmup_fn = opt.linear_schedule(
             warmup_init, initial_lr, warmup_steps
         )
-        return opt.schedulers.join_schedules(
-            [warmup_fn, bound_schedule_fn], [warmup_steps + 1]
+        
+        return opt.join_schedules(
+            [warmup_fn, bound_schedule_fn], [warmup_steps]
         )
     else:
         return bound_schedule_fn

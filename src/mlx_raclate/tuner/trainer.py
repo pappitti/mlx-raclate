@@ -16,21 +16,23 @@ from datasets import Dataset as HFDataset
 from mlx.utils import tree_flatten, tree_map
 
 from .collators import DataCollator
+from .utils import build_schedule
 
 @dataclass
 class TrainingArgs:
 
     def __init__(
         self,
-        batch_size: int = 32,
-        eval_batch_size: int = 16,
+        batch_size: int = 4,
+        eval_batch_size: int = 2,
         max_length: int = 512,
         num_train_epochs: int = 3,
         learning_rate: float = 5e-5,
         weight_decay: float = 0.01,
-        warmup_ratio: float = 0.1,
+        warmup_ratio: float = 0,
+        warmup_steps: int = 0, # warmup steps take precedence over warmup ratio
+        lr_scheduler_type: str = "constant", # "cosine_decay", "linear_schedule", https://ml-explore.github.io/mlx/build/html/python/optimizers/schedulers.html
         gradient_accumulation_steps: int = 1,
-        eval_steps: int = 500,
         save_steps: int = 1000,
         logging_steps: int = 100,
         output_dir: str = "outputs",
@@ -44,9 +46,10 @@ class TrainingArgs:
         self.num_train_epochs = num_train_epochs
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
-        self.warmup_ratio = warmup_ratio ### not used here but kept for later (see scheduler in utils)
+        self.warmup_ratio = warmup_ratio
+        self.warmup_steps = warmup_steps
+        self.lr_scheduler_type = lr_scheduler_type
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.eval_steps = eval_steps
         self.save_steps = save_steps
         self.logging_steps = logging_steps
         self.output_dir = output_dir
@@ -75,7 +78,20 @@ class Trainer:
         self.model = model
         self.tokenizer = tokenizer._tokenizer ### tokenizer is a wrapper around the HF tokenizer (see utils/tokenizer_utils.py)
         self.task_type = task_type
+
         self.args = training_args
+        # Adjust logging and saving steps based on gradient accumulation
+        if training_args.logging_steps % training_args.gradient_accumulation_steps != 0:
+            closest_multiple = (training_args.logging_steps // training_args.gradient_accumulation_steps) * training_args.gradient_accumulation_steps
+            self.logging_steps = closest_multiple if closest_multiple > 0 else training_args.gradient_accumulation_steps
+        else:
+            self.logging_steps = training_args.logging_steps
+        if training_args.save_steps % self.logging_steps  != 0:
+            closest_multiple = (training_args.save_steps // self.logging_steps ) * self.logging_steps 
+            self.save_steps = closest_multiple if closest_multiple > 0 else self.logging_steps 
+        else:
+            self.save_steps = training_args.save_steps
+
         self.train_dataset = train_dataset
         self.use_chat_template = use_chat_template
         self.force_separator = force_separator
@@ -84,16 +100,62 @@ class Trainer:
         self.data_collator = self._get_collator()
         
         # Initialize optimizer
-        self.optimizer = optimizer or mlx.optimizers.AdamW(
-            learning_rate=training_args.learning_rate,
-            weight_decay=training_args.weight_decay
-        )
+        if optimizer is not None:
+            self.optimizer = optimizer
+        elif training_args.lr_scheduler_type=="constant" and not (training_args.warmup_steps or training_args.warmup_ratio):
+            self.optimizer = mlx.optimizers.AdamW(
+                learning_rate=training_args.learning_rate,
+                weight_decay=training_args.weight_decay
+            )
+        else:
+            # Build learning rate schedule
+            steps_per_epoch = len(train_dataset) // training_args.batch_size
+            if len(train_dataset) % training_args.batch_size != 0:
+                steps_per_epoch += 1
+                
+            # Effective steps considering gradient accumulation
+            num_update_steps_per_epoch = max(steps_per_epoch // training_args.gradient_accumulation_steps, 1)
+            max_steps = num_update_steps_per_epoch * training_args.num_train_epochs
+
+            if training_args.warmup_steps > 0:
+                warmup_steps = training_args.warmup_steps
+            else:
+                warmup_steps = int(max_steps * training_args.warmup_ratio)
+            
+            decay_steps = max_steps - warmup_steps
+            
+            scheduler_type = training_args.lr_scheduler_type # e.g. "constant", "cosine_decay"
+        
+            # Arguments list depends on the function signature in mlx.optimizers
+            if scheduler_type == "constant":
+                schedule_args = [training_args.learning_rate]
+            
+            elif scheduler_type == "linear_schedule":
+                schedule_args = [training_args.learning_rate, 0.0, decay_steps]
+                
+            else:
+                # This covers "cosine_decay", "step_decay", "exponential_decay" (check specific sigs)
+                schedule_args = [training_args.learning_rate, decay_steps]
+
+            print(f"Scheduler: {scheduler_type} | Warmup: {warmup_steps} | Total: {max_steps}")
+
+            schedule_config = {
+                "name": scheduler_type,
+                "arguments": schedule_args,
+                "warmup_steps": warmup_steps,
+                "warmup_init": 0.0
+            }
+
+            lr_schedule = build_schedule(schedule_config)
+
+            self.optimizer = mlx.optimizers.AdamW(
+                learning_rate=lr_schedule,
+                weight_decay=training_args.weight_decay
+            )
 
         # Setup output directory
-        self.output_dir = Path(training_args.output_dir)
+        self.output_dir = Path("trained_models") / training_args.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        # Capture state that needs updating (random state for Dropout, etc.)
-        self.state = [self.model.state, self.optimizer.state, mx.random.state]
         
         # Setup training state and output directory
         self.global_step = 0
@@ -146,8 +208,24 @@ class Trainer:
 
             module.__call__ = checkpointed_call
         
-        # Checkpoint transformer layers - these are the main memory users
-        for layer in self.model.model.layers:
+        layers = None
+        
+        # Handling various model architectures
+        if hasattr(self.model, "layers"): 
+            layers = self.model.layers
+        elif hasattr(self.model, "model"):
+            if hasattr(self.model.model, "layers"): 
+                layers = self.model.model.layers
+            elif hasattr(self.model.model, "encoder"): # T5 / Others TBC
+                if hasattr(self.model.model.encoder, "layers"):
+                    layers = self.model.model.encoder.layers
+
+        if layers is None:
+            print("WARNING: Could not find layers to checkpoint. Memory will explode.")
+            return
+
+        print(f"Checkpointing {len(layers)} layers.")
+        for layer in layers:
             checkpoint_fn(layer)
 
         ### TODO : optionally checkpoint other layers  (head, classifier) 
@@ -280,14 +358,18 @@ class Trainer:
                 # Eval state to actually trigger the computation graph
                 mx.eval(self.model.state, self.optimizer.state)
             
-                if self.global_step % self.args.logging_steps == 0:
+                if self.global_step % self.logging_steps == 0:
                     # if running_loss is mx.array (see comment on hardware above), convert to float
                     if isinstance(running_loss, mx.array):
                         running_loss = running_loss.item()
                     avg_loss = running_loss / n_steps
 
                     # Handle both static float and dynamic schedule
-                    current_lr = self.optimizer.learning_rate
+                    if callable(self.optimizer.learning_rate):
+                        # We must pass the optimizer step index
+                        current_lr = self.optimizer.learning_rate(self.optimizer.step)
+                    else:
+                        current_lr = self.optimizer.learning_rate
                     if isinstance(current_lr, mx.array):
                         current_lr = current_lr.item()
 
@@ -314,13 +396,17 @@ class Trainer:
                     running_loss = 0.0
                     n_steps = 0
                     start_time = time.time()
+
+                    if self.global_step % self.save_steps == 0 :
+                        print("Saving checkpoint...")
+                        self._save_checkpoint({"step": self.global_step, "step_loss": avg_loss, "learning_rate": current_lr, "memory_gb": mem_gb, "steps_per_sec": steps_per_sec})
             
                 # May not be optimal from a speed perspective but MLX is very aggressive in terms of memory caching 
-                # Like for the server, we force garbage collection here to avoid OOMs on large models
+                # Like for the utils/server, we force garbage collection here to avoid OOMs on large models
                 gc.collect()
                 mx.clear_cache()
         
-        return 0.0 # placeholder if we want to use the average loss for anything
+        return 0.0 # placeholder 
     
     def evaluate(self):
         """Evaluation loop."""
@@ -409,7 +495,6 @@ class Trainer:
                 upload_repo=repo_id,
                 hf_path=self.model.config.model_type, # Or base model name
                 task_type=self.task_type
-                # TODO : map architecture to HF pipeline for full compatibility
             )
         
         # Manage checkpoint rotation

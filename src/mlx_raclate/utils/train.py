@@ -1,10 +1,11 @@
 import argparse
-import mlx.core as mx
+import time
+
 from mlx_raclate.utils.utils import load, PIPELINES
 from mlx_raclate.tuner.datasets import load_dataset, DatasetArgs
 from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
 
-DEFAULT_MODEL_PATH : str = "answerdotai/ModernBERT-base" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base"
+DEFAULT_MODEL_PATH : str = "Qwen/Qwen3-Embedding-0.6B"  #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base"
 DEFAULT_DATASET : str = "data/20251205_1125" # can be a local path "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
 
@@ -33,7 +34,7 @@ def main():
     if task_type not in PIPELINES:
         raise ValueError(f"Task type {task_type} not supported. Choose from {PIPELINES.items()}")
     
-    output_dir = model_path.split("/")[-1] + "_" + task_type
+    output_dir = model_path.split("/")[-1] + "_" + task_type + "_" + time.strftime("%Y%m%d_%H%M%S")
 
     # Load datasets
     dataset_args = DatasetArgs(
@@ -63,18 +64,30 @@ def main():
         train=train,
     )
 
+    # testing chat template
+    if use_chat_template:
+        if not getattr(tokenizer, "chat_template", None):
+            raise ValueError("The tokenizer does not support chat templates.")
+        messages = [
+            {"role": "user", "content": "test_prompt"},
+            {"role": "assistant", "content": "test_response"}
+        ]
+        templated = tokenizer.apply_chat_template(messages, tokenize=False)
+        print("Chat template working:", templated)
+
     # Training arguments
     training_args = TrainingArgs(
-        batch_size=4,
-        eval_batch_size=4,
+        batch_size=2,
+        eval_batch_size=2,
+        gradient_accumulation_steps=4, 
         max_length= model.config.max_position_embeddings,
         num_train_epochs=1,
-        learning_rate=5e-5, ### 5e-5 
+        learning_rate=2e-5, # 5e-5 for ModernBERT, 2e-5 for Qwen
         weight_decay=0.01,
-        gradient_accumulation_steps=2, 
-        eval_steps=500,
+        warmup_ratio=0.03, # can use warmup_steps=300 instead (both warmup_ratio and warmup_steps default to 0, steps override ratio)
+        lr_scheduler_type="cosine_decay", # would default to "constant"
         save_steps=1000,
-        logging_steps=12, ### 100
+        logging_steps=12, # will be adjusted to be multiple of logging_steps inside Trainer
         output_dir=output_dir,
         save_total_limit=None,
         grad_checkpoint=True,
