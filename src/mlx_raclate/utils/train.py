@@ -5,7 +5,7 @@ from mlx_raclate.utils.utils import load, PIPELINES
 from mlx_raclate.tuner.datasets import load_dataset, DatasetArgs
 from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
 
-DEFAULT_MODEL_PATH : str = "Qwen/Qwen3-Embedding-0.6B"  #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base"
+DEFAULT_MODEL_PATH : str = "trained_models/Qwen3-Embedding-0.6B_text-classification_20251206_222009/checkpoint-14000" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base"
 DEFAULT_DATASET : str = "data/20251205_1125" # can be a local path "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
 
@@ -79,16 +79,16 @@ def main():
 
     # Training arguments
     training_args = TrainingArgs(
-        batch_size=2,
+        batch_size=1,
         eval_batch_size=2,
-        gradient_accumulation_steps=4, 
+        gradient_accumulation_steps=8, 
         max_length= model.config.max_position_embeddings,
         resume_from_step=resume_from_step, # warmup will be ingnored if before this step and schedulers will only start after
         num_train_epochs=1,
-        learning_rate=2e-5, # 5e-5 for ModernBERT, 2e-5 for Qwen
+        learning_rate=4.4e-06, # 5e-5 for ModernBERT, 2e-5 for Qwen
         weight_decay=0.01,
-        warmup_ratio=0.03, # can use warmup_steps=300 instead (both warmup_ratio and warmup_steps default to 0, steps override ratio)
-        lr_scheduler_type="cosine_decay", # would default to "constant"
+        warmup_ratio=0.3, # can use warmup_steps=300 instead (both warmup_ratio and warmup_steps default to 0, steps override ratio)
+        lr_scheduler_type="linear_schedule", # would default to "constant"
         save_steps=1000,
         logging_steps=12, # will be adjusted to be multiple of logging_steps inside Trainer
         output_dir=output_dir,
