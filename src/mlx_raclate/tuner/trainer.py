@@ -26,11 +26,12 @@ class TrainingArgs:
         batch_size: int = 4,
         eval_batch_size: int = 2,
         max_length: int = 512,
+        resume_from_step: int = 0,
         num_train_epochs: int = 3,
         learning_rate: float = 5e-5,
         weight_decay: float = 0.01,
         warmup_ratio: float = 0,
-        warmup_steps: int = 0, # warmup steps take precedence over warmup ratio
+        warmup_steps: int = 0, # warmup steps take precedence over warmup ratio, warmup_steps are optimizer steps (dataset size / (batch_size * grad_accumulation))
         lr_scheduler_type: str = "constant", # "cosine_decay", "linear_schedule", https://ml-explore.github.io/mlx/build/html/python/optimizers/schedulers.html
         gradient_accumulation_steps: int = 1,
         save_steps: int = 1000,
@@ -43,6 +44,7 @@ class TrainingArgs:
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
         self.max_length = max_length
+        self.resume_from_step = resume_from_step
         self.num_train_epochs = num_train_epochs
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -92,6 +94,10 @@ class Trainer:
         else:
             self.save_steps = training_args.save_steps
 
+        self.resume_from_step = training_args.resume_from_step
+        # TODO : handle resuming from checkpoint (load model + optimizer state)
+        # For now, no optimizer state loading
+
         self.train_dataset = train_dataset
         self.use_chat_template = use_chat_template
         self.force_separator = force_separator
@@ -115,12 +121,17 @@ class Trainer:
                 
             # Effective steps considering gradient accumulation
             num_update_steps_per_epoch = max(steps_per_epoch // training_args.gradient_accumulation_steps, 1)
-            max_steps = num_update_steps_per_epoch * training_args.num_train_epochs
+            resumed_update_steps = self.resume_from_step // training_args.gradient_accumulation_steps
+            total_update_steps = num_update_steps_per_epoch * training_args.num_train_epochs
+            max_steps = max(total_update_steps - resumed_update_steps, 0)
 
             if training_args.warmup_steps > 0:
                 warmup_steps = training_args.warmup_steps
             else:
                 warmup_steps = int(max_steps * training_args.warmup_ratio)
+
+            if self.resume_from_step and warmup_steps <= (self.resume_from_step// training_args.gradient_accumulation_steps):
+                warmup_steps = 0
             
             decay_steps = max_steps - warmup_steps
             
@@ -286,10 +297,7 @@ class Trainer:
         # Standard iteration
         for start_idx in range(0, data_len, batch_size):
             end_idx = min(start_idx + batch_size, data_len)
-            batch_slice = dataset[start_idx:end_idx]
-            # HF Dataset slicing returns a Dict of lists: {'text': ['a', 'b'], 'label': [0, 1]}
-            # Convert HF Columnar batch (Dict[str, List]) to MLX batch (Dict[str, mx.array])
-            yield self.data_collator(batch_slice)
+            yield dataset[start_idx:end_idx]
 
     def train(self):
         """Main training loop."""
@@ -324,8 +332,19 @@ class Trainer:
         # ensures different shuffling each epoch
         current_seed = 42 + self.epoch 
 
-        for batch in self._create_batches(self.train_dataset, self.args.batch_size, shuffle=True, seed=current_seed):
+        for raw_batch in self._create_batches(self.train_dataset, self.args.batch_size, shuffle=True, seed=current_seed):
             
+            self.global_step += 1
+
+            # Skip steps if resuming from a specific step
+            if self.global_step <= self.resume_from_step:
+                continue
+
+            # HF Dataset slicing returns a Dict of lists: {'text': ['a', 'b'], 'label': [0, 1]}
+            # Convert HF Columnar batch (Dict[str, List]) to MLX batch (Dict[str, mx.array])
+            batch = self.data_collator(raw_batch)
+            n_steps += 1
+
             # Calculate Grads
             loss, grads = self.step_calc(batch)
 
@@ -336,8 +355,7 @@ class Trainer:
             
             # depending on hardware and model size, we may want to avoid syncing here
             running_loss += loss.item() # running_loss += loss to avoid sync
-            n_steps += 1
-            self.global_step += 1
+           
 
             # Update Optimizer if Accumulation Done
             if n_steps % steps_to_accumulate == 0:
@@ -349,9 +367,6 @@ class Trainer:
                 # Apply updates
                 self.step_update(accumulated_grads)
 
-                ## can be used for debugging/logging (expensive)
-                # grads_for_logging = accumulated_grads if (self.global_step + 1) % self.args.logging_steps == 0 else None
-
                 # Reset
                 accumulated_grads = None
                 
@@ -362,7 +377,7 @@ class Trainer:
                     # if running_loss is mx.array (see comment on hardware above), convert to float
                     if isinstance(running_loss, mx.array):
                         running_loss = running_loss.item()
-                    avg_loss = running_loss / n_steps
+                    avg_loss = running_loss / max(n_steps, 1)
 
                     # Handle both static float and dynamic schedule
                     if callable(self.optimizer.learning_rate):
@@ -372,16 +387,6 @@ class Trainer:
                         current_lr = self.optimizer.learning_rate
                     if isinstance(current_lr, mx.array):
                         current_lr = current_lr.item()
-
-                    ## can be used for debugging/logging (expensive)
-                    # grad_norm = 0.0
-                    # if grads_for_logging is not None:
-                    #     # Flatten the tree of gradients
-                    #     flat_grads = tree_flatten(grads_for_logging)
-                    #     # Concatenate and compute norm
-                    #     # Note: This is an extra computation, but useful for debugging
-                    #     grad_vec = mx.concatenate([g.flatten() for g in flat_grads])
-                    #     grad_norm = mx.linalg.norm(grad_vec).item()
 
                     mem_gb = mx.get_active_memory() / 1e9
 
@@ -414,7 +419,8 @@ class Trainer:
         total_loss = 0
         n_steps = 0
         
-        for batch in self._create_batches(self.eval_dataset, self.args.eval_batch_size):
+        for raw_batch in self._create_batches(self.eval_dataset, self.args.eval_batch_size):
+            batch = self.data_collator(raw_batch)
             outputs = self.model(**batch)
             loss = mx.mean(outputs["loss"])
             total_loss += loss.item()
@@ -445,7 +451,8 @@ class Trainer:
             raise ValueError("No test dataset provided")
         
         # Perform evaluation
-        for batch in self._create_batches(dataset_to_test, self.args.eval_batch_size):
+        for raw_batch in self._create_batches(dataset_to_test, self.args.eval_batch_size):
+            batch = self.data_collator(raw_batch)
             outputs = self.model(**batch)
             loss = mx.mean(outputs["loss"])
             total_loss += loss.item()

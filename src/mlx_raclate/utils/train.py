@@ -18,6 +18,7 @@ def init_args():
     parser.add_argument("--train", default=True, action='store_true', help="Set this flag to train the model; if not set, only evaluation will be performed.")
     parser.add_argument("--use_chat_template", action='store_true', help="Use chat template for decoder models when there are text pairs.")
     parser.add_argument("--force_separator", type=str, default=None, help="Force a specific separator between text pairs for decoder models, if not using chat template.")
+    parser.add_argument("--resume_from_step", type=int, default=0, help="Step number to resume training from (if applicable).")
     return parser.parse_args()
 
 def main():
@@ -30,6 +31,7 @@ def main():
     train : bool = args.train
     use_chat_template : bool = args.use_chat_template
     force_separator : str = args.force_separator
+    resume_from_step : int = args.resume_from_step
 
     if task_type not in PIPELINES:
         raise ValueError(f"Task type {task_type} not supported. Choose from {PIPELINES.items()}")
@@ -81,6 +83,7 @@ def main():
         eval_batch_size=2,
         gradient_accumulation_steps=4, 
         max_length= model.config.max_position_embeddings,
+        resume_from_step=resume_from_step, # warmup will be ingnored if before this step and schedulers will only start after
         num_train_epochs=1,
         learning_rate=2e-5, # 5e-5 for ModernBERT, 2e-5 for Qwen
         weight_decay=0.01,
