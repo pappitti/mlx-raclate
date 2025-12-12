@@ -192,11 +192,11 @@ class Qwen3Model(nn.Module):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    def _update_attention_mask(self, attention_mask: Optional[mx.array] = None):
+    def _update_attention_mask(self, attention_mask: Optional[mx.array] = None, dtype=None):
         """
         Creates a causal mask and combines it with the padding mask.
         """
-        dtype = attention_mask.dtype
+        
         B, L = attention_mask.shape
 
         causal_mask = mx.triu(mx.full((L, L), -1e9, dtype), k=1)
@@ -218,11 +218,14 @@ class Qwen3Model(nn.Module):
             position_ids: Optional[mx.array] = None,
             return_dict: Optional[bool] = True
         ):
-        attention_mask = self._update_attention_mask(
-            attention_mask,
-        )
 
         hidden_states = self.embed_tokens(input_ids)
+        model_dtype = hidden_states.dtype
+
+        attention_mask = self._update_attention_mask(
+            attention_mask=attention_mask,
+            dtype=model_dtype
+        )
 
         for layer in self.layers:
             layer_outputs = layer(hidden_states, attention_mask)
@@ -261,18 +264,6 @@ class Model(RaclateBaseModel):
         # transformer architecture name for compatibility
         self.hf_transformers_arch = "Qwen3ForCausalLM"
 
-    def _process_outputs(self, logits: mx.array) -> mx.array:
-        """Apply the appropriate activation function to the logits for classification tasks."""
-        if self.is_regression:
-            # No activation for regression
-            return logits  
-        elif self.num_labels == 1:
-            # Binary classification
-            return mx.sigmoid(logits) 
-        else:
-            # Using softmax for multi-class classification
-            return mx.softmax(logits, axis=-1)
-
     def __call__(
             self, 
             input_ids: mx.array, 
@@ -280,7 +271,7 @@ class Model(RaclateBaseModel):
             attention_mask: Optional[mx.array] = None, 
             output_hidden_states: Optional[bool] = False,
             return_dict: Optional[bool] = True,
-        ) -> Dict:
+    ) -> Dict:
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape
             attention_mask = mx.ones(
@@ -295,7 +286,6 @@ class Model(RaclateBaseModel):
 
         # pooling for AR models such as Qwen3 leverages the last token
         pooled_embeddings = last_token_pooling(last_hidden_state, attention_mask)
-
         text_embeds = normalize_embeddings(pooled_embeddings)
 
         if not return_dict:

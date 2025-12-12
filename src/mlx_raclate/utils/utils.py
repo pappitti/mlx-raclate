@@ -283,10 +283,7 @@ def load_model(
     """
 
     # check if model_path/config_sentence_transformers.json exists
-    if (model_path / "config_sentence_transformers.json").exists():
-        sentence_transformers= True
-    else:
-        sentence_transformers = False
+    is_sentence_transformer= (model_path / "config_sentence_transformers.json").exists()
 
     config = load_config(model_path)
     config.update(model_config)
@@ -304,7 +301,7 @@ def load_model(
                     f"[INFO] Using pipeline {pipeline} based on user input, ignoring model architecture {model_arch}"
                 )
 
-    if sentence_transformers :
+    if is_sentence_transformer :
         if pipeline not in ["sentence-transformers", "embeddings", "sentence-similarity"]:
             if not train:
                 raise ValueError(
@@ -317,20 +314,49 @@ def load_model(
             pipeline = "sentence-transformers"
             print(f"[INFO] Using pipeline {pipeline} based on Sentence Transformer config file.")
 
-    weight_files = glob.glob(str(model_path / "model*.safetensors"))
-
-    if not weight_files:
-        # Try weight for back-compat
-        weight_files = glob.glob(str(model_path / "weight*.safetensors"))
-
-    if not weight_files:
-        logging.error(f"No safetensors found in {model_path}")
-        raise FileNotFoundError(f"No safetensors found in {model_path}")
-
     weights = {}
-    for wf in weight_files:
-        weights.update(mx.load(wf))
+    modules_file = model_path / "modules.json"
 
+    # Sentence Transformer weights may be loaded from subfolders 
+    # prefix keys added so sanitize() can identify them
+    if is_sentence_transformer and modules_file.exists():
+        with open(modules_file, "r") as f:
+            modules = json.load(f)
+        
+        for module in modules:
+            sub_path = module.get("path", "")
+            module_dir = model_path / sub_path
+            
+            module_weights = glob.glob(str(module_dir / "model*.safetensors"))
+            if not module_weights:
+                # Fallback for older naming conventions
+                module_weights = glob.glob(str(module_dir / "weight*.safetensors"))
+            
+            for wf in module_weights:
+                sub_weights = mx.load(wf)
+                for k, v in sub_weights.items():
+                    # prefix the key 'linear.weight' -> '1_Dense.linear.weight'
+                    # This allows the regex in sanitize() (r"\d+_Dense\.linear").
+                    if sub_path:
+                        weights[f"{sub_path}.{k}"] = v
+                    else:
+                        # Root module (Transformer), load keys as is
+                        weights[k] = v
+
+    # Load weights from safetensors at the root of model_path
+    # Typically for non-Sentence Transformer models
+    if not weights:
+        weight_files = glob.glob(str(model_path / "model*.safetensors"))
+        if not weight_files:
+            # Try weight for back-compat
+            weight_files = glob.glob(str(model_path / "weight*.safetensors"))
+
+        if not weight_files:
+            logging.error(f"No safetensors found in {model_path}")
+            raise FileNotFoundError(f"No safetensors found in {model_path}")
+
+        for wf in weight_files:
+            weights.update(mx.load(wf))
     model_class, model_args_class = get_model_classes(config=config, pipeline=pipeline)
 
     model_args = model_args_class.from_dict(config)

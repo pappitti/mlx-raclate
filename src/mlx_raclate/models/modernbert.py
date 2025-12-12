@@ -786,7 +786,7 @@ class ModelForSequenceClassification(RaclateBaseModel):
                 sanitized_weights[k] = v
         return sanitized_weights
     
-class ModelForTokenClassification(nn.Module):
+class ModelForTokenClassification(RaclateBaseModel):
     """
     Computes token classification probabilities for input sequences.
 
@@ -810,8 +810,6 @@ class ModelForTokenClassification(nn.Module):
         # transformer architecture name for compatibility
         self.hf_transformers_arch = "ModernBertForTokenClassification"
 
-    def get_hf_transformers_arch(self):
-        return self.hf_transformers_arch if hasattr(self, "hf_transformers_arch") else None
 
     def __call__(
         self,

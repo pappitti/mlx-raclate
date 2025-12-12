@@ -10,13 +10,16 @@ USE THE SENTENCE-TRANSFORMERS PIPELINE (SEE README)
 tested_models = [
     "nomic-ai/modernbert-embed-base",
     "answerdotai/ModernBERT-base",
-    "Qwen/Qwen3-Embedding-0.6B"
+    "Qwen/Qwen3-Embedding-0.6B",
+    "google/embeddinggemma-300m",
+    "google/t5gemma-s-s-ul2", # Fail
+    "jhu-clsp/ettin-decoder-150m" # Fail
 ]
 
 def main():
     # Load the model and tokenizer
     model, tokenizer = load(
-        "Qwen/Qwen3-Embedding-0.6B", 
+        "google/embeddinggemma-300m", 
         pipeline="embeddings", # models trained for sentence similarity will automatically use the "sentence-transformers" pipeline
     ) 
     max_position_embeddings = getattr(model.config,"max_position_embeddings",512)
