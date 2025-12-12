@@ -123,6 +123,8 @@ class Trainer:
             num_update_steps_per_epoch = max(steps_per_epoch // training_args.gradient_accumulation_steps, 1)
             resumed_update_steps = self.resume_from_step // training_args.gradient_accumulation_steps
             total_update_steps = num_update_steps_per_epoch * training_args.num_train_epochs
+            if resumed_update_steps >= total_update_steps:
+                raise ValueError("resume_from_step is greater than total training steps. Steps = dataset_size / batch_size * num_epochs")
             max_steps = max(total_update_steps - resumed_update_steps, 0)
 
             if training_args.warmup_steps > 0:
