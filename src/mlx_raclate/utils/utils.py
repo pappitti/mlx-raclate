@@ -40,7 +40,7 @@ HF_ARCH_TO_PIPELINE_MAPPING = {
 
 MODEL_REMAPPING = {
     "mistral": "llama",  # mistral is compatible with llama
-    "phi-msft": "phixtral",
+    "phi-msft": "phixtral"
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -111,7 +111,7 @@ def _get_classes(config: dict, pipeline: Optional[str] = 'masked-lm'):
         # return arch.ModelForZeroShotClassification, arch.ModelArgs
     
     if pipeline == "sentence-similarity":
-        return arch.ModelForSentenceSimilarity, arch.Model
+        return arch.ModelForSentenceSimilarity, arch.ModelArgs
 
     ### should not reach here
     return arch.Model, arch.ModelArgs
@@ -286,6 +286,14 @@ def load_model(
     is_sentence_transformer= (model_path / "config_sentence_transformers.json").exists()
 
     config = load_config(model_path)
+    if 'is_encoder_decoder' in config and config.get('encoder', None):
+        model_type = config['model_type']
+        print(f"[INFO] Detected {model_type} model, merging encoder config.")
+        # merge encoder config for main models
+        encoder_config = config.get('encoder', {})
+        encoder_config['model_type'] = model_type + '_encoder'
+        config.update(encoder_config)
+    
     config.update(model_config)
 
     arch = config.get("architectures", None)

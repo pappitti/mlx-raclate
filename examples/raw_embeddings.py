@@ -11,15 +11,15 @@ tested_models = [
     "nomic-ai/modernbert-embed-base",
     "answerdotai/ModernBERT-base",
     "Qwen/Qwen3-Embedding-0.6B",
-    "google/embeddinggemma-300m",
-    "google/t5gemma-s-s-ul2", # Fail
+    "google/embeddinggemma-300m",# this model is extremely sensitive to input formatting
+    "google/t5gemma-s-s-ul2", 
     "jhu-clsp/ettin-decoder-150m" # Fail
 ]
 
 def main():
     # Load the model and tokenizer
     model, tokenizer = load(
-        "google/embeddinggemma-300m", 
+        "google/t5gemma-s-s-ul2", 
         pipeline="embeddings", # models trained for sentence similarity will automatically use the "sentence-transformers" pipeline
     ) 
     max_position_embeddings = getattr(model.config,"max_position_embeddings",512)

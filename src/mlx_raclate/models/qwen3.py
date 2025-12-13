@@ -432,13 +432,13 @@ class ModelForSentenceSimilarity(Model):
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """
     Extends ModelForSentenceSimilarity to provide embeddings for input sequences.
-    This class sanitizes typical sentence transformers weights to align with the ModernBERT model.
+    This class sanitizes typical sentence transformers weights to align with the Qwen3 model.
     """
     def __init__(self, config: ModelArgs):
         super().__init__(config)
 
     def sanitize(self, weights):
-        """Convert sentence transformer weights to ModernBERT format."""
+        """Convert sentence transformer weights to Qwen3 format."""
         sanitized_weights = {}
         
         for k, v in weights.items():

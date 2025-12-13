@@ -8,11 +8,12 @@ tested_models = [
     "Alibaba-NLP/gte-modernbert-base",
     "Qwen/Qwen3-Embedding-0.6B",
     "google/embeddinggemma-300m", # this model is extremely sensitive to input formatting
+    "google/t5gemma-b-b-ul2"
 ]
 
 def main():
     # Load the model and tokenizer
-    model_name = "google/embeddinggemma-300m"
+    model_name =  "google/t5gemma-b-b-ul2"
     model, tokenizer = load(
         model_name, 
         pipeline="sentence-similarity" # or "sentence-transformers" if sentence-transformers model is used
@@ -27,12 +28,12 @@ def main():
         "Grandma's cat got bored last winter."
     ]
 
-    texts = [
-        "task: search result | query: What is TSNE?",
-        "task: search result | query: Who is Laurens van der Maaten?",
-        "task: search result | query: I like grapes",
-        "task: search result | query: Grandma's cat got bored last winter."
-    ]
+    # texts = [
+    #     "task: search result | query: What is TSNE?",
+    #     "task: search result | query: Who is Laurens van der Maaten?",
+    #     "task: search result | query: I like grapes",
+    #     "task: search result | query: Grandma's cat got bored last winter."
+    # ]
 
     reference_texts = [
         "I like fruits",
@@ -44,15 +45,15 @@ def main():
         "The aggregate of people living together in a more or less ordered community.",
     ]
 
-    reference_texts = [
-        "title: none | text: I like fruits",
-        "title: none | text: The slow green turtle crawls under the busy ant.",
-        "title: none | text: Sand!",
-        "title: none | text: TSNE is a dimensionality reduction algorithm created by Laurens van Der Maaten",
-        "title: none | text: The study of computer science that focuses on the creation of intelligent machines that work and react like humans.",
-        "title: none | text: The study of matter, energy, and the fundamental forces of nature.",
-        "The aggregate of people living together in a more or less ordered community.",
-    ]
+    # reference_texts = [
+    #     "title: none | text: I like fruits",
+    #     "title: none | text: The slow green turtle crawls under the busy ant.",
+    #     "title: none | text: Sand!",
+    #     "title: none | text: TSNE is a dimensionality reduction algorithm created by Laurens van Der Maaten",
+    #     "title: none | text: The study of computer science that focuses on the creation of intelligent machines that work and react like humans.",
+    #     "title: none | text: The study of matter, energy, and the fundamental forces of nature.",
+    #     "The aggregate of people living together in a more or less ordered community.",
+    # ]
 
 
     # _tokenizer is used for batch processing. 

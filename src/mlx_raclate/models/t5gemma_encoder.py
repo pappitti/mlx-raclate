@@ -9,7 +9,6 @@ import mlx.nn as nn
 from .base import (
     BaseModelArgs,
     mean_pooling,
-    last_token_pooling,
     normalize_embeddings,
     compute_similarity,
     RaclateBaseModel,
@@ -18,46 +17,37 @@ from .base import (
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str
-    hidden_size: int = 1152
-    num_hidden_layers: int = 26
-    intermediate_size: int = 6912
-    num_attention_heads: int = 4
-    head_dim: int = 256
+    hidden_size: int = 768
+    num_hidden_layers: int = 12
+    intermediate_size: int = 2048
+    num_attention_heads: int = 12
+    head_dim: int = 64
+    dropout_rate: float = 0.0
     rms_norm_eps: float = 1.0e-6
-    vocab_size: int = 262144
-    num_key_value_heads: int = 1
+    vocab_size: int = 256000
+    num_key_value_heads: int = 12
     rope_traditional: bool = False
-    rope_global_base_freq: Optional[float] = None
-    rope_theta: Optional[float] = None
-    rope_local_base_freq: float = 10000.0
-    query_pre_attn_scalar: float = 256
-    sliding_window: int = 512
-    _sliding_window_pattern: Optional[int] = None
-    sliding_window_pattern: Optional[int] = None
-    max_position_embeddings: int = 2048
+    rope_theta: float = 10000.0
+    query_pre_attn_scalar: float = 64
+    sliding_window: int = 4096
+    max_position_embeddings: int = 8192
     layer_types: List[str] = field(default_factory=list) 
-    use_bidirectional_attn: bool = False
-    use_bidirectional_attention: bool = False
+    is_causal: bool = False
     attention_bias: Optional[bool] = False
     attention_dropout: Optional[float] = 0.0
     bos_token_id: Optional[int] = None
-    eos_token_id: Optional[int] = None
+    eos_token_id: Optional[List[int]] = None
     hidden_activation: Optional[str] = "gelu_pytorch_tanh"
     attn_logit_softcapping: Optional[float] = None # Not supported with sdpa
     final_logit_softcapping: Optional[float] = None # Not supported with sdpa
-    architectures: List[str] = field(default_factory=lambda: ["Gemma3TextModel"])
+    architectures: List[str] = field(default_factory=lambda: ["T5GemmaForConditionalGeneration"])
 
-    initializer_range: Optional[float] = (
-        0.02  # Only needed in case of initializing weights
-    )
-
-    default_sliding_pattern: int = 6
-    default_global_rope_freq: float = 1000000.0
+    initializer_range: Optional[float] = 0.02  # Only needed in case of initializing weights
 
     ### pipeline args
     decoder_bias=True,
-    classifier_pooling: Literal["cls", "mean"] = "mean"
-    classifier_dropout=0.0 
+    classifier_pooling: Literal["cls", "mean"] = "cls"
+    classifier_dropout_rate: float = 0.0 
     classifier_bias=False
     sparse_prediction=True ### True seems a more appropriate value for MLM
     sparse_pred_ignore_index=-100 
@@ -65,26 +55,6 @@ class ModelArgs(BaseModelArgs):
     label2id: Optional[Dict[str, int]] = None
     id2label: Optional[Dict[int, str]] = None
     pipeline_config: Optional[Dict[str, Any]] = None  # for Sequence Classification
-
-    @property
-    def sliding_pattern(self) -> int:
-        if self.sliding_window_pattern is not None:
-            return self.sliding_window_pattern
-        if self._sliding_window_pattern is not None:
-            return self._sliding_window_pattern
-        return self.default_sliding_pattern
-    
-    @property
-    def rope_global_freq(self) -> float:
-        if self.rope_global_base_freq is not None:
-            return self.rope_global_base_freq
-        if self.rope_theta is not None:
-            return self.rope_theta
-        return self.default_global_rope_freq
-    
-    @property
-    def is_causal(self) -> bool:
-        return not self.use_bidirectional_attn and not self.use_bidirectional_attention
 
     @property
     def num_labels(self) -> int:
@@ -112,24 +82,37 @@ class ModelArgs(BaseModelArgs):
     
 def _sanitize_backbone(weights: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Standardizes keys for the Gemma3 Backbone. 
-    Prefixes generic keys with 'model.' and handles basic mapping.
+    Standardizes keys for the T5Gemma Encoder Backbone. 
+    Drops Decoder weights and handles basic mapping.
     """
-    sanitized = {}
+    sanitized_weights = {}
     for k, v in weights.items():
-        # Skip unrelated heads that might be in the checkpoint
-        if any(x in k for x in ["lm_head", "classifier"]):
-            # We don't automatically map these; specific models handle them if needed
+        # Skip unused buffers or position IDs if present
+        if "position_ids" in k or "rotary_emb.inv_freq" in k:
             continue
-            
-        # Map generic 'layers' to 'model.layers' if not already present
-        if not k.startswith("model."):
-            new_key = f"model.{k}"
+
+        # Skip decoder weights
+        if k.startswith("model.decoder."):
+            continue
+
+        # if the model uses shared embeddings, map them correctly
+        if k == "shared.weight":
+            if "encoder.embed_tokens.weight" not in weights:
+                sanitized_weights["model.embed_tokens.weight"] = v
+            continue
+
+        # Process Encoder weights
+        if k.startswith("model.encoder."):
+            new_k =  k.replace("model.encoder.", "model.")
+        # Handle potential non-prefixed weights
+        elif not k.startswith("model."):
+            new_k = f"model.{k}"
         else:
-            new_key = k
-            
-        sanitized[new_key] = v
-    return sanitized
+            new_k = k
+
+        sanitized_weights[new_k] = v
+
+    return sanitized_weights
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
@@ -149,21 +132,11 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.q_norm = RMSNorm(dims=head_dim, eps=args.rms_norm_eps)
-        self.k_norm = RMSNorm(dims=head_dim, eps=args.rms_norm_eps)
-
         layer_type = args.layer_types[layer_idx] if args.layer_types else None
-        if not layer_type:
-            if (layer_idx + 1) % args.sliding_pattern == 0:
-                layer_type = "full_attention"
-            else:
-                layer_type = "sliding_window"
         self.is_sliding = layer_type == "sliding_window"
 
         base = (
-            args.rope_local_base_freq 
-            if self.is_sliding 
-            else args.rope_global_freq
+            args.rope_theta
         )
 
         self.rope = nn.RoPE(
@@ -172,7 +145,7 @@ class Attention(nn.Module):
             base=base,
         )
         
-        # Add softcapping support
+        # softcapping support
         self.attn_logit_softcapping = args.attn_logit_softcapping
 
 
@@ -184,12 +157,8 @@ class Attention(nn.Module):
         B, L, _ = x.shape
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-
-        queries = self.q_norm(queries)
-        keys = self.k_norm(keys)
 
         queries = self.rope(queries)
         keys = self.rope(keys)
@@ -199,7 +168,18 @@ class Attention(nn.Module):
                 queries, keys, values, scale=self.scale, mask=mask
             )
         else:
-            raise NotImplementedError("Softcapping attention not supported with sdpa.")
+            queries = queries * self.scale
+            
+            attn_weights = mx.matmul(queries, keys.transpose(0, 1, 3, 2))
+            cap = self.attn_logit_softcapping
+            attn_weights = mx.tanh(attn_weights / cap) * cap
+            
+            if mask is not None:
+                attn_weights = attn_weights + mask
+
+            attn_weights = mx.softmax(attn_weights, axis=-1)
+            output = mx.matmul(attn_weights, values)
+
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -222,15 +202,6 @@ class MLP(nn.Module):
     def __call__(self, x) -> mx.array:
         return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
     
-@partial(mx.compile, shapeless=True)
-def clip_residual(x, y):
-    if x.dtype != mx.float16:
-        return x + y
-    bound = mx.finfo(mx.float16).max
-    return mx.clip(x.astype(mx.float32) + y.astype(mx.float32), -bound, bound).astype(
-        mx.float16
-    )
-    
 class TransformerBlock(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -238,28 +209,30 @@ class TransformerBlock(nn.Module):
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args, layer_idx)
         self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_self_attn_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_self_attn_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.pre_feedforward_layernorm = RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
         self.post_feedforward_layernorm = RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
+        self.dropout = nn.Dropout(args.dropout_rate)
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask)
-        h = clip_residual(x, self.post_attention_layernorm(r))
+        r = self.self_attn(self.pre_self_attn_layernorm(x), mask)
+        h = self.post_self_attn_layernorm(r)
+        h = r + self.dropout(h)
         r = self.mlp(self.pre_feedforward_layernorm(h))
-        out = clip_residual(h, self.post_feedforward_layernorm(r))
+        out = self.post_feedforward_layernorm(r)
+        out = h + self.dropout(out)
         return (out,)
 
-
-class Gemma3Model(nn.Module):
+class T5GemmaEncoder(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
@@ -272,6 +245,7 @@ class Gemma3Model(nn.Module):
             for i in range(config.num_hidden_layers)
         ]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.dropout = nn.Dropout(config.dropout_rate)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -299,6 +273,8 @@ class Gemma3Model(nn.Module):
             dist = mx.abs(row - col)
             mask_window_violator = dist >= window_size
         
+        # In practice, T5Gemma Encoder is always non-causal but we keep the code 
+        # from other models for consistency
         else:
             # Causal: Standard triangular mask
             mask_future = col > row
@@ -339,26 +315,42 @@ class Gemma3Model(nn.Module):
         # normalizer
         hidden_states *= mx.array(self.config.hidden_size**0.5, model_dtype)
 
+        hidden_states = self.dropout(hidden_states)
+
         global_mask, sliding_window_mask = self._update_attention_mask(
             attention_mask,
             dtype=model_dtype
         )
 
         for i, layer in enumerate(self.layers):
-            if self.config.layer_types:
-                is_global = self.config.layer_types[i] == "full_attention"
-            else:
-                # Fallback to pattern
-                is_global = (i + 1) % self.config.sliding_pattern == 0
+            is_global = self.config.layer_types[i] == "full_attention"
             layer_mask = global_mask if is_global else sliding_window_mask
             layer_outputs = layer(hidden_states, layer_mask)
             hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
+        hidden_states = self.dropout(hidden_states)
 
         return {
             "last_hidden_state": hidden_states,
         }
+    
+
+class T5GemmaClassificationHead(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.dropout = nn.Dropout(p=config.classifier_dropout_rate)
+        self.out_proj = nn.Linear(
+            config.hidden_size, config.num_labels
+        )
+        self.soft_cap = config.final_logit_softcapping
+
+    def __call__(self, hidden_states: mx.array) -> mx.array:
+        logits = self.out_proj(self.dropout(hidden_states))
+        if self.soft_cap is not None:
+            logits = mx.tanh(logits / self.soft_cap) * self.soft_cap
+        return logits
 
 
 class Model(RaclateBaseModel):
@@ -366,11 +358,10 @@ class Model(RaclateBaseModel):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        self.model = Gemma3Model(config)
-        self.dense = [
-            nn.Linear(config.hidden_size, config.hidden_size * 4, bias=False),
-            nn.Linear(config.hidden_size * 4, config.hidden_size, bias=False),
-        ]
+        self.model = T5GemmaEncoder(config)
+
+         # transformer architecture name for compatibility
+        self.hf_transformers_arch = ""
 
     def __call__(
         self,
@@ -394,14 +385,7 @@ class Model(RaclateBaseModel):
         )
 
         # normalized features
-        if not self.config.is_causal:
-            text_embeds = mean_pooling(last_hidden_state, attention_mask)
-        else:
-            text_embeds = last_token_pooling(last_hidden_state, attention_mask)
-
-        for layer in self.dense:
-            last_hidden_state = layer(last_hidden_state)
-
+        text_embeds = mean_pooling(last_hidden_state, attention_mask)
         text_embeds = normalize_embeddings(text_embeds)
 
         if not return_dict:
@@ -413,27 +397,14 @@ class Model(RaclateBaseModel):
         }
 
     def sanitize(self, weights):
-        sanitized_weights = {}
-        for k, v in weights.items():
-            if "linear" not in k and "dense" not in k:
-                new_key = f"model.{k}" if not k.startswith("model") else k
-                sanitized_weights[new_key] = v
-            elif "dense" not in k:
-                # hacky but works for now
-                # TODO : improve this
-                key_id = "0" if v.shape[0] > v.shape[1] else "1"
-                new_key = re.sub(r"\d+_Dense\.linear", f"dense.{key_id}", k)
-                sanitized_weights[new_key] = v
-            else:
-                sanitized_weights[k] = v
 
-        return sanitized_weights
+        return _sanitize_backbone(weights)
 
     @property
     def layers(self):
         return self.model.layers
-
-
+   
+    
 class ModelForSentenceSimilarity(Model):
     """
     Computes similarity scores between input sequences and reference sentences.
@@ -463,7 +434,6 @@ class ModelForSentenceSimilarity(Model):
         embeddings = batch_outputs["embeddings"]  # [batch_size, hidden_size]
 
         loss = None
-        similarities = None
 
         if reference_input_ids is not None:
         
@@ -516,6 +486,10 @@ class ModelForSentenceSimilarity(Model):
                 labels = mx.arange(embeddings.shape[0])
                 
                 loss = nn.losses.cross_entropy(scores, labels)
+    
+        else:
+            similarities = None
+            loss = None
             
         if not return_dict:
             return (loss, similarities, embeddings)
@@ -529,26 +503,24 @@ class ModelForSentenceSimilarity(Model):
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """
     Extends ModelForSentenceSimilarity to provide embeddings for input sequences.
-    This class sanitizes typical sentence transformers weights to align with the Gemma3 model.
+    This class sanitizes typical sentence transformers weights to align with the T5Gemma model.
     """
     def __init__(self, config: ModelArgs):
         super().__init__(config)
 
-class Gemma3PredictionHead(nn.Module):
-    def __init__(self, config: ModelArgs):
-        super().__init__()
-        self.config = config
-        self.dense = nn.Linear(
-            config.hidden_size, config.hidden_size, config.classifier_bias
-        )
-        self.act = nn.GELU(approx="precise")
-        self.norm = nn.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
-    def __call__(self, hidden_states: mx.array) -> mx.array:
-        return self.norm(self.act(self.dense(hidden_states)))
-
+    def sanitize(self, weights):
+        """Convert sentence transformer weights to T5Gemma format."""
+        sanitized_weights = {}
+        
+        for k, v in weights.items():
+            if "position_ids" in k:
+                # Remove unused position_ids
+                continue
+            else:
+                new_key = "model." + k
+                sanitized_weights[new_key] = v
+        return sanitized_weights
+    
 class ModelForSequenceClassification(RaclateBaseModel):
     """
     Computes sequence classification probabilities for input sequences.
@@ -562,7 +534,7 @@ class ModelForSequenceClassification(RaclateBaseModel):
         self.num_labels = config.num_labels
         self.is_regression = config.is_regression
         
-        self.model = Gemma3Model(config)
+        self.model = T5GemmaEncoder(config)
 
         ### The HF architecture Gemma3ForSequenceClassification 
         ### does not have head and drop
@@ -570,13 +542,9 @@ class ModelForSequenceClassification(RaclateBaseModel):
         # self.head = Gemma3PredictionHead(config)
         # self.drop = nn.Dropout(p=config.classifier_dropout)
 
-        self.score = nn.Linear(
-            config.hidden_size, 
-            config.num_labels, 
-            bias=False
-        ) 
+        self.score = T5GemmaClassificationHead(config)
 
-        self.hf_transformers_arch = "Gemma3ForSequenceClassification"
+        self.hf_transformers_arch = "T5GemmaForSequenceClassification"
     
     def _process_outputs(self, logits: mx.array) -> mx.array:
         """Apply the appropriate activation function to the logits."""
@@ -629,13 +597,10 @@ class ModelForSequenceClassification(RaclateBaseModel):
         )
 
         # normalized features
-        if not self.config.is_causal:
-            text_embeds = mean_pooling(last_hidden_state, attention_mask)
-        else:
-            text_embeds = last_token_pooling(last_hidden_state, attention_mask)
+        text_embeds = mean_pooling(last_hidden_state, attention_mask)
         text_embeds = normalize_embeddings(text_embeds)
 
-        ### The HF architecture Gemma3ForSequenceClassification 
+        ### The HF architecture T5GemmaForSequenceClassification 
         logits = self.score(text_embeds)
 
         processed_logits = self._process_outputs(logits)
@@ -653,18 +618,9 @@ class ModelForSequenceClassification(RaclateBaseModel):
             "hidden_states": outputs.get("hidden_states", None),
         }
     
-    def sanitize(self, weights):
-
-        sanitized_weights = _sanitize_backbone(weights)
-        
-        # Filter out keys from 'embeddingsgemma3' that we don't want (dense projections)
-        final_weights = {}
-        for k, v in sanitized_weights.items():
-            if "dense" in k or re.search(r"\d+_Dense", k):
-                continue
-            final_weights[k] = v
+    def sanitize(self, weights):   
             
-        return final_weights
+        return _sanitize_backbone(weights)
     
 class ModelForMaskedLM(RaclateBaseModel):
     """
@@ -675,13 +631,13 @@ class ModelForMaskedLM(RaclateBaseModel):
         self.config = config
         if not config.is_causal:
             raise ValueError("ModelForMaskedLM requires bidirectional attention.")
-        self.model = Gemma3Model(config)
-        self.head = Gemma3PredictionHead(config) 
+        self.model = T5GemmaEncoder(config)
+        self.head = T5GemmaClassificationHead(config) 
         self.decoder = nn.Linear(
             config.hidden_size, config.vocab_size, bias=config.decoder_bias
         )
 
-        # transformers has no MaskedLM class for Gemma3
+        # transformers has no MaskedLM class for T5Gemma
 
         # We explicitly call tie_weights to ensure logic is set up, 
         # though standard loading overwrites this unless sanitized correctly.
@@ -774,9 +730,6 @@ class ModelForMaskedLM(RaclateBaseModel):
         # Specific adjustments for MLM
         final_weights = {}
         for k, v in sanitized_weights.items():
-            # Filter unwanted Dense layers from embedding checkpoints
-            if "dense" in k or re.search(r"\d+_Dense", k):
-                continue
                 
             # Handle Weight Tying for loading:
             if k == "model.embed_tokens.weight" and "decoder.weight" not in weights:
@@ -798,11 +751,10 @@ class ModelForTokenClassification(RaclateBaseModel):
         self.config = config       
         self.num_labels = config.num_labels
 
-        self.model = Gemma3Model(config)
-        self.drop = nn.Dropout(p=config.classifier_dropout)
-        self.score = Gemma3PredictionHead(config)
+        self.model = T5GemmaEncoder(config)
+        self.score = T5GemmaClassificationHead(config)
 
-        # transformers does not have TokenClassification class for Gemma3
+        self.hf_transformers_arch = "T5GemmaForTokenClassification"
     
     def __call__(
         self,
@@ -828,6 +780,7 @@ class ModelForTokenClassification(RaclateBaseModel):
         last_hidden_state = outputs["last_hidden_state"] if return_dict else outputs[0]
         
         # Apply prediction head, dropout, and classification layer to each token
+
         logits = self.score(last_hidden_state)
 
         # Process logits for inference
@@ -851,12 +804,5 @@ class ModelForTokenClassification(RaclateBaseModel):
         }
     
     def sanitize(self, weights):
-        sanitized_weights = _sanitize_backbone(weights)
-        
-        final_weights = {}
-        for k, v in sanitized_weights.items():
-            if "dense" in k or re.search(r"\d+_Dense", k):
-                continue
-            final_weights[k] = v
             
-        return final_weights
+        return  _sanitize_backbone(weights)
