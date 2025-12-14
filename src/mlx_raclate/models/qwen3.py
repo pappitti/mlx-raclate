@@ -18,31 +18,29 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    rms_norm_eps: float
-    vocab_size: int
-    num_key_value_heads: int
-    max_position_embeddings: int
-    rope_theta: float
-    head_dim: int
-    tie_word_embeddings: bool
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-
+    architectures: List[str] = field(default_factory=lambda: ["Qwen3Model"])
     attention_bias: Optional[bool] = False
     attention_dropout: Optional[float] = 0.0
     bos_token_id: Optional[int] = None
     eos_token_id: Optional[int] = None
+    head_dim: int = 128
     hidden_act: Optional[str] = "silu"
-    max_window_layers: Optional[int] = 28
-    architectures: List[str] = field(default_factory=lambda: ["Qwen3Model"])
-
+    hidden_size: int = 1024
     initializer_range: Optional[float] = (
         0.02  # Only needed in case of initializing weights
     )
+    intermediate_size: int = 3072
+    max_position_embeddings: int = 32768
+    max_window_layers: Optional[int] = 28
+    model_type: str = "qwen3"
+    num_attention_heads: int = 16
+    num_hidden_layers: int = 28
+    num_key_value_heads: int = 8
+    rms_norm_eps: float = 1.0e-6
+    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    rope_theta: float = 1000000.0
+    tie_word_embeddings: bool = True
+    vocab_size: int = 151669
 
     ### pipeline args
     decoder_bias=True,

@@ -1,3 +1,4 @@
+# Copyright © 2023-2024 Apple Inc.
 import json
 from functools import partial
 

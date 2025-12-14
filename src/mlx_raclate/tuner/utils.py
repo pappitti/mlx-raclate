@@ -43,7 +43,8 @@ def build_schedule(schedule_config: Dict):
     else:
         return bound_schedule_fn
 
-
+### We don't currently use LoRA or DoRA in MLX Raclate tuner
+### Kept here for reference, and if we need to re-implement it later
 # def linear_to_lora_layers(
 #     model: nn.Module,
 #     num_layers: int,

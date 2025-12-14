@@ -6,8 +6,6 @@ import glob
 import importlib
 import json
 import logging
-import shutil
-import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Type, Union
 
@@ -509,6 +507,8 @@ def quantize_model(
     return quantized_weights, quantized_config
 
 ### Conversion should not be needed if we work with safetensors
+### Kept here for reference, and if we need to re-implement it later
+
 # def convert(
 #     hf_path: str,
 #     mlx_path: str = "mlx_model",

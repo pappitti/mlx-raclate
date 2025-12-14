@@ -1,6 +1,5 @@
-import math
-from dataclasses import dataclass
-from typing import Optional, Dict, Literal, Any
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Literal, Any, List
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,33 +10,34 @@ from .base import BaseModelArgs, RaclateBaseModel, compute_similarity, mean_pool
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str
-    vocab_size: int
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    max_position_embeddings: Optional[int] = None
-    norm_eps: float = 1e-05
-    norm_bias : bool = False
-    global_rope_theta : float = 160000.0
+    architectures: List[str] = field(default_factory=lambda: ["ModernBertModel"])
     attention_bias: bool = False
     attention_dropout : float =0.0
-    global_attn_every_n_layers : int =3
+    bos_token_id: int = 50281
+    cls_token_id: int = 50281
+    embedding_dropout : float = 0.0
+    eos_token_id : int = 50282
+    global_attn_every_n_layers : int = 3
+    global_rope_theta : float = 160000.0
+    hidden_size: int = 768
+    initializer_range : float = 0.02 
+    initializer_cutoff_factor: float = 2.0 # relevant for MLX?
+    intermediate_size: int = 1152
     local_attention : int =128
     local_rope_theta: float = 10000
-    embedding_dropout : float =0.0
+    max_position_embeddings: int = 8192
     mlp_bias: bool = False
     mlp_dropout : float = 0.0
-    initializer_range=0.02 
-    initializer_cutoff_factor=2.0 # relevant for MLX?
-    pad_token_id=50283
-    eos_token_id=50282
-    bos_token_id=50281
-    cls_token_id=50281
-    sep_token_id=50282
+    model_type: str = "modernbert"
+    norm_bias : bool = False
+    norm_eps: float = 1e-05
+    num_attention_heads: int = 12
+    num_hidden_layers: int = 22
     output_hidden_states: bool = False 
+    pad_token_id: int = 50283
+    sep_token_id: int = 50282
     use_return_dict: bool = True 
+    vocab_size: int = 50368
 
     ### pipeline args
     decoder_bias=True,
@@ -181,7 +181,7 @@ class ModernBertAttention(nn.Module):
             attention_mask = sliding_window_mask
 
         # Computing attention using MLX's SDPA
-        scale = 1.0 / math.sqrt(query.shape[-1])
+        scale = query.shape[-1] ** -0.5
         attn_output = mx.fast.scaled_dot_product_attention(
             query, key, value,
             scale=scale,
@@ -363,8 +363,7 @@ class Model(RaclateBaseModel):
         self.config = config
         self.model = ModernBertModel(config)
 
-        # transformer architecture name for compatibility
-        self.hf_transformers_arch = "ModernBertModel" 
+        # no transformer architecture for embedding model
 
     def __call__(
         self, 

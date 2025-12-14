@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Any, Literal
+from typing import Dict, List, Optional, Any, Literal
 import re
 from functools import partial
 
@@ -17,40 +17,40 @@ from .base import (
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str
-    hidden_size: int = 1152
-    num_hidden_layers: int = 26
-    intermediate_size: int = 6912
-    num_attention_heads: int = 4
-    head_dim: int = 256
-    rms_norm_eps: float = 1.0e-6
-    vocab_size: int = 262144
-    num_key_value_heads: int = 1
-    rope_traditional: bool = False
-    rope_global_base_freq: Optional[float] = None
-    rope_theta: Optional[float] = None
-    rope_local_base_freq: float = 10000.0
-    query_pre_attn_scalar: float = 256
-    sliding_window: int = 512
-    _sliding_window_pattern: Optional[int] = None
-    sliding_window_pattern: Optional[int] = None
-    max_position_embeddings: int = 2048
-    layer_types: List[str] = field(default_factory=list) 
-    use_bidirectional_attn: bool = False
-    use_bidirectional_attention: bool = False
+    architectures: List[str] = field(default_factory=lambda: ["Gemma3TextModel"])
     attention_bias: Optional[bool] = False
     attention_dropout: Optional[float] = 0.0
+    attn_logit_softcapping: Optional[float] = None # Not supported with sdpa
     bos_token_id: Optional[int] = None
     eos_token_id: Optional[int] = None
-    hidden_activation: Optional[str] = "gelu_pytorch_tanh"
-    attn_logit_softcapping: Optional[float] = None # Not supported with sdpa
     final_logit_softcapping: Optional[float] = None # Not supported with sdpa
-    architectures: List[str] = field(default_factory=lambda: ["Gemma3TextModel"])
-
+    hidden_activation: Optional[str] = "gelu_pytorch_tanh"
+    hidden_size: int = 1152
+    intermediate_size: int = 6912
     initializer_range: Optional[float] = (
         0.02  # Only needed in case of initializing weights
     )
-
+    head_dim: int = 256
+    layer_types: List[str] = field(default_factory=list) 
+    max_position_embeddings: int = 2048
+    model_type: str = "gemma3_text"
+    num_attention_heads: int = 4
+    num_hidden_layers: int = 26
+    num_key_value_heads: int = 1
+    query_pre_attn_scalar: float = 256
+    rms_norm_eps: float = 1.0e-6
+    rope_global_base_freq: Optional[float] = None
+    rope_local_base_freq: float = 10000.0
+    rope_theta: Optional[float] = None
+    rope_traditional: bool = False
+    sliding_window: int = 512
+    _sliding_window_pattern: Optional[int] = None
+    sliding_window_pattern: Optional[int] = None
+    use_bidirectional_attn: bool = False
+    use_bidirectional_attention: bool = False
+    vocab_size: int = 262144
+    
+    ### Defaults
     default_sliding_pattern: int = 6
     default_global_rope_freq: float = 1000000.0
 
@@ -546,8 +546,13 @@ class Gemma3PredictionHead(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        self.soft_cap = config.final_logit_softcapping
+
     def __call__(self, hidden_states: mx.array) -> mx.array:
-        return self.norm(self.act(self.dense(hidden_states)))
+        logits = self.norm(self.act(self.dense(hidden_states)))
+        if self.soft_cap is not None:
+            logits = mx.tanh(logits / self.soft_cap) * self.soft_cap
+        return logits
 
 class ModelForSequenceClassification(RaclateBaseModel):
     """

@@ -272,7 +272,7 @@ class DataCollatorForSentenceSimilarity(DataCollator):
             batch["negative_input_ids"] = out_n["input_ids"]
             batch["negative_attention_mask"] = out_n["attention_mask"]
 
-        # 4. Handle Scores (for Regression)
+        # Handle Scores (for Regression)
         if "label" in features:
             # Ensure float32 for regression targets
             batch["similarity_scores"] = mx.array(features["label"], dtype=mx.float32)

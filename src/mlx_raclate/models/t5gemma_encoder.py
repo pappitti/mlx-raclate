@@ -16,33 +16,34 @@ from .base import (
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str
-    hidden_size: int = 768
-    num_hidden_layers: int = 12
-    intermediate_size: int = 2048
-    num_attention_heads: int = 12
-    head_dim: int = 64
-    dropout_rate: float = 0.0
-    rms_norm_eps: float = 1.0e-6
-    vocab_size: int = 256000
-    num_key_value_heads: int = 12
-    rope_traditional: bool = False
-    rope_theta: float = 10000.0
-    query_pre_attn_scalar: float = 64
-    sliding_window: int = 4096
-    max_position_embeddings: int = 8192
-    layer_types: List[str] = field(default_factory=list) 
-    is_causal: bool = False
+    architectures: List[str] = field(default_factory=lambda: ["T5GemmaForConditionalGeneration"])
     attention_bias: Optional[bool] = False
     attention_dropout: Optional[float] = 0.0
-    bos_token_id: Optional[int] = None
-    eos_token_id: Optional[List[int]] = None
-    hidden_activation: Optional[str] = "gelu_pytorch_tanh"
     attn_logit_softcapping: Optional[float] = None # Not supported with sdpa
+    bos_token_id: Optional[int] = None
+    dropout_rate: float = 0.0
+    eos_token_id: Optional[List[int]] = None
     final_logit_softcapping: Optional[float] = None # Not supported with sdpa
-    architectures: List[str] = field(default_factory=lambda: ["T5GemmaForConditionalGeneration"])
-
+    head_dim: int = 64
+    hidden_activation: Optional[str] = "gelu_pytorch_tanh"
+    hidden_size: int = 768
     initializer_range: Optional[float] = 0.02  # Only needed in case of initializing weights
+    intermediate_size: int = 2048
+    is_causal: bool = False
+    is_encoder_decoder: bool = False
+    layer_types: List[str] = field(default_factory=list) 
+    max_position_embeddings: int = 8192
+    model_type: str = "t5gemma"
+    num_attention_heads: int = 12
+    num_hidden_layers: int = 12
+    num_key_value_heads: int = 12
+    query_pre_attn_scalar: float = 64
+    rms_norm_eps: float = 1.0e-6
+    rope_theta: float = 10000.0
+    rope_traditional: bool = False
+    sliding_window: int = 4096
+    vocab_size: int = 256000
+   
 
     ### pipeline args
     decoder_bias=True,
