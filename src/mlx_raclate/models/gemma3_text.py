@@ -123,12 +123,18 @@ def _sanitize_backbone(weights: Dict[str, Any]) -> Dict[str, Any]:
             continue
             
         # Map generic 'layers' to 'model.layers' if not already present
-        if not k.startswith("model."):
-            new_key = f"model.{k}"
+        if "linear" not in k and "dense" not in k:
+            new_key = f"model.{k}" if not k.startswith("model") else k
+            sanitized[new_key] = v
+        elif "dense" not in k:
+            # hacky but works for now
+            # TODO : improve this
+            key_id = "0" if v.shape[0] > v.shape[1] else "1"
+            new_key = re.sub(r"\d+_Dense\.linear", f"dense.{key_id}", k)
+            sanitized[new_key] = v
         else:
-            new_key = k
+            sanitized[k] = v
             
-        sanitized[new_key] = v
     return sanitized
 
 class Attention(nn.Module):
@@ -413,25 +419,8 @@ class Model(RaclateBaseModel):
         }
 
     def sanitize(self, weights):
-        sanitized_weights = {}
-        for k, v in weights.items():
-            if "linear" not in k and "dense" not in k:
-                new_key = f"model.{k}" if not k.startswith("model") else k
-                sanitized_weights[new_key] = v
-            elif "dense" not in k:
-                # hacky but works for now
-                # TODO : improve this
-                key_id = "0" if v.shape[0] > v.shape[1] else "1"
-                new_key = re.sub(r"\d+_Dense\.linear", f"dense.{key_id}", k)
-                sanitized_weights[new_key] = v
-            else:
-                sanitized_weights[k] = v
 
-        return sanitized_weights
-
-    @property
-    def layers(self):
-        return self.model.layers
+        return _sanitize_backbone(weights)
 
 
 class ModelForSentenceSimilarity(Model):

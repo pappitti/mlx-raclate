@@ -19,7 +19,7 @@ tested_models = [
 def main():
     # Load the model and tokenizer
     model, tokenizer = load(
-        "google/t5gemma-s-s-ul2", 
+        "google/embeddinggemma-300m", 
         pipeline="embeddings", # models trained for sentence similarity will automatically use the "sentence-transformers" pipeline
     ) 
     max_position_embeddings = getattr(model.config,"max_position_embeddings",512)

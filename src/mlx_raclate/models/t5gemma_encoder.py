@@ -400,10 +400,6 @@ class Model(RaclateBaseModel):
     def sanitize(self, weights):
 
         return _sanitize_backbone(weights)
-
-    @property
-    def layers(self):
-        return self.model.layers
    
     
 class ModelForSentenceSimilarity(Model):
@@ -435,7 +431,7 @@ class ModelForSentenceSimilarity(Model):
         embeddings = batch_outputs["embeddings"]  # [batch_size, hidden_size]
 
         loss = None
-
+        similarities = None
         if reference_input_ids is not None:
         
             # Get embeddings for reference sentences
@@ -488,9 +484,6 @@ class ModelForSentenceSimilarity(Model):
                 
                 loss = nn.losses.cross_entropy(scores, labels)
     
-        else:
-            similarities = None
-            loss = None
             
         if not return_dict:
             return (loss, similarities, embeddings)

@@ -361,7 +361,8 @@ class ModelForSentenceSimilarity(Model):
         embeddings = batch_outputs["embeddings"]  # [batch_size, hidden_size]
 
         loss = None
-
+        similarities = None
+        
         if reference_input_ids is not None:
         
             # Get embeddings for reference sentences
@@ -413,10 +414,6 @@ class ModelForSentenceSimilarity(Model):
                 labels = mx.arange(embeddings.shape[0])
                 
                 loss = nn.losses.cross_entropy(scores, labels)
-    
-        else:
-            similarities = None
-            loss = None
             
         if not return_dict:
             return (loss, similarities, embeddings)

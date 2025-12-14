@@ -10,10 +10,6 @@ wheels/
 .venv
 
 # temp files
-*gemma3.py
-*lfm2.py
-*modernbert-decoder.py
-*t5gemma.py
 *neobert.py
 
 # Data files

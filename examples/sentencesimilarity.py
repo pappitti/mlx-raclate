@@ -13,7 +13,7 @@ tested_models = [
 
 def main():
     # Load the model and tokenizer
-    model_name =  "google/t5gemma-b-b-ul2"
+    model_name =  "google/embeddinggemma-300m"
     model, tokenizer = load(
         model_name, 
         pipeline="sentence-similarity" # or "sentence-transformers" if sentence-transformers model is used
