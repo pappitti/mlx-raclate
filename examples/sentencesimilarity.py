@@ -8,18 +8,23 @@ tested_models = [
     "Alibaba-NLP/gte-modernbert-base",
     "Qwen/Qwen3-Embedding-0.6B",
     "google/embeddinggemma-300m", # this model is extremely sensitive to input formatting
-    "google/t5gemma-b-b-ul2"
+    "google/t5gemma-b-b-ul2",
+    "LiquidAI/LFM2-ColBERT-350M"
 ]
 
 def main():
     # Load the model and tokenizer
     model_name =  "google/embeddinggemma-300m"
+    use_late_interaction = "ColBERT" in model_name
+
     model, tokenizer = load(
         model_name, 
+        model_config={
+            "use_late_interaction": use_late_interaction
+        },
         pipeline="sentence-similarity" # or "sentence-transformers" if sentence-transformers model is used
     ) # if the model_path file includes "config_sentence_transformers.json", the "sentence-transformers" pipeline will be identified automatically so no need to specify it
     max_position_embeddings = getattr(model.config,"max_position_embeddings",512)
-    print(max_position_embeddings)
 
     texts = [
         "What is TSNE?",
@@ -91,7 +96,7 @@ def main():
     print(reference_texts)
 
     # Print the similarity matrix as a table
-    print(f"\nCosine Similarity Matrix: {model_name}")
+    print(f"\n{"MaxSim" if use_late_interaction else "Cosine Similarity"} Matrix: {model_name}")
     print("-" * 50)
     for i, row in enumerate(similarities):
         # Format each number to 4 decimal places

@@ -13,6 +13,7 @@ tested_models = [
     "Qwen/Qwen3-Embedding-0.6B",
     "google/embeddinggemma-300m",# this model is extremely sensitive to input formatting
     "google/t5gemma-s-s-ul2", 
+    "LiquidAI/LFM2-350M",
     "jhu-clsp/ettin-decoder-150m" # Fail
 ]
 

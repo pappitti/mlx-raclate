@@ -50,6 +50,7 @@ class ModelArgs(BaseModelArgs):
     label2id: Optional[Dict[str, int]] = None
     id2label: Optional[Dict[int, str]] = None
     pipeline_config: Optional[Dict[str, Any]] = None  # for Sequence Classification
+    use_late_interaction: bool = False 
 
     @property
     def num_labels(self) -> int:
@@ -249,61 +250,6 @@ class ModernBertModel(nn.Module):
     def set_input_embeddings(self, value):
         self.embeddings.tok_embeddings = value
 
-    def __call__(
-        self, 
-        input_ids, 
-        attention_mask = None, # (batch_size, seq_len) see below
-        sliding_window_mask = None,
-        position_ids = None,
-        output_hidden_states: Optional[bool] = False,
-        return_dict: Optional[bool] = True,
-    ):
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        batch_size, seq_len = input_ids.shape[:2]
-
-        if attention_mask is None:
-            attention_mask = mx.ones((batch_size, seq_len)) ### updated with _update_attention_mask() below
-
-        if position_ids is None:
-            position_ids = mx.arange(seq_len, dtype=mx.int32)[None, :]
-
-        hidden_states = self.embeddings(input_ids)
-        model_dtype = hidden_states.dtype
-
-        # get attention mask and sliding window mask
-        attention_mask, sliding_window_mask = self._update_attention_mask(
-            attention_mask=attention_mask,
-            model_dtype=model_dtype
-        )
-
-        all_hidden_states = () if output_hidden_states else None
-
-        for encoder_layer in self.layers:
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-
-            layer_outputs = encoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                sliding_window_mask=sliding_window_mask,
-                position_ids=position_ids,
-            )
-            
-            hidden_states = layer_outputs[0]
-        
-        hidden_states = self.final_norm(hidden_states)
-
-        if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states] if v is not None)
-        return {
-            "last_hidden_state": hidden_states,
-            "hidden_states": all_hidden_states,
-        }
-    
     def _update_attention_mask(self, attention_mask, model_dtype): #TODO: move to base.py ??
 
         batch_size, seq_len = attention_mask.shape
@@ -348,6 +294,58 @@ class ModernBertModel(nn.Module):
     
         return global_attention_mask, sliding_window_mask
 
+    def __call__(
+        self, 
+        input_ids, 
+        attention_mask = None, # (batch_size, seq_len) see below
+        sliding_window_mask = None,
+        position_ids = None,
+        output_hidden_states: Optional[bool] = False,
+        return_dict: Optional[bool] = True,
+    ):
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        batch_size, seq_len = input_ids.shape[:2]
+
+        if attention_mask is None:
+            attention_mask = mx.ones((batch_size, seq_len)) ### updated with _update_attention_mask() below
+
+        hidden_states = self.embeddings(input_ids)
+        model_dtype = hidden_states.dtype
+
+        # get attention mask and sliding window mask
+        attention_mask, sliding_window_mask = self._update_attention_mask(
+            attention_mask=attention_mask,
+            model_dtype=model_dtype
+        )
+
+        all_hidden_states = () if output_hidden_states else None
+
+        for encoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            layer_outputs = encoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                sliding_window_mask=sliding_window_mask,
+                position_ids=position_ids,
+            )
+            
+            hidden_states = layer_outputs[0]
+        
+        hidden_states = self.final_norm(hidden_states)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, all_hidden_states] if v is not None)
+        return {
+            "last_hidden_state": hidden_states,
+            "hidden_states": all_hidden_states,
+        }
+
 
 ### below are the classes for specific pipelines
 class Model(RaclateBaseModel):
@@ -356,7 +354,6 @@ class Model(RaclateBaseModel):
 
     Note : sanitization is a hack to align with other models here while downloading weights 
     with the maskedlm config from HF (original modelBert model).
-    The decoder.bias is ignored here
     """ 
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -376,7 +373,9 @@ class Model(RaclateBaseModel):
         
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape 
-            attention_mask = mx.ones((batch_size, seq_len)) ### updated via _update_attention_mask() in the model
+            attention_mask = mx.ones(
+                (batch_size, seq_len),
+                dtype=self.model.embeddings.tok_embeddings.weight.dtype) ### updated via _update_attention_mask() in the model
 
         # Get embeddings and encoder outputs as before
         encoder_outputs = self.model(
@@ -411,19 +410,73 @@ class Model(RaclateBaseModel):
                 # Remove unused position_ids
                 continue
             if k in ["head.norm.weight", "head.dense.weight", "decoder.bias"]:
-                ### this is the hack
                 continue
             else:
                 sanitized_weights[k] = v
         return sanitized_weights
 
 
-class ModelForSentenceSimilarity(Model):
+class ModelForSentenceSimilarity(RaclateBaseModel):
     """
-    Computes similarity scores between input sequences and reference sentences.
+    Handles:
+    1. Inference: Generates embeddings and similarity scores (cosine similarity or MaxSim if late interaction is used).
+    2. Training (Standard): (Sentence1, Sentence2, Score) -> MSE/Cosine Loss.
+    3. Training (Triplets): (Anchor, Positive, Negative) -> MNRL with Hard Negatives (Cross-entropy Loss).
     """
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config : ModelArgs):
+        super().__init__()
+        self.config = config
+        self.model = ModernBertModel(config)
+
+    def _call_model(
+        self,
+        input_ids: mx.array, 
+        position_ids: Optional[mx.array] = None,
+        attention_mask: Optional[mx.array] = None, 
+        output_hidden_states: Optional[bool] = False,
+        return_dict: Optional[bool] = True,
+    ):
+        out = self.model(input_ids, attention_mask)
+        last_hidden_state = (
+            out["last_hidden_state"] if isinstance(out, dict) else out[0]
+        )
+
+        # text_embeds = normalize_embeddings(last_hidden_state)
+        if self.config.use_late_interaction:
+            text_embeds = normalize_embeddings(last_hidden_state)
+            # Keep unpooled for ColBERT style
+            # Mask padding tokens to avoid them affecting MaxSim
+            if attention_mask is not None:
+                text_embeds = text_embeds * attention_mask[..., None]
+        else:
+            # Pooling based on config
+            if self.config.classifier_pooling == "cls":
+                pooled = last_hidden_state[:, 0]
+            elif self.config.classifier_pooling == "mean":                
+                pooled = mean_pooling(last_hidden_state, attention_mask)
+            text_embeds = normalize_embeddings(pooled)
+
+        if not return_dict:
+            return (text_embeds, last_hidden_state) 
+
+        return {
+            "embeddings": text_embeds, # normalized embeddings
+            "last_hidden_state": last_hidden_state,
+        }
+    
+    def _compute_late_interaction_scores(self, Q, D):
+        """
+        MaxSim: sum_i(max_j(Q_i . D_j))
+        Args:
+            Q: Query embeddings [B_q, L_q, Dim]
+            D: Doc embeddings [B_d, L_d, Dim] 
+        Note: If calculating loss with in-batch negatives, shapes might vary.
+        """
+        # (B, L_q, Dim) @ (B, Dim, L_d) -> (B, L_q, L_d)
+        # This assumes pairwise (Query[i] vs Doc[i]).
+        sim_matrix = Q @ D.transpose(0, 2, 1)
+        max_scores = mx.max(sim_matrix, axis=-1) # (B, L_q)
+        return mx.sum(max_scores, axis=-1) # (B,)
     
     def __call__(
         self,
@@ -437,8 +490,15 @@ class ModelForSentenceSimilarity(Model):
         position_ids: Optional[mx.array] = None,
         return_dict: Optional[bool] = True,
     ):
+        
+        if attention_mask is None:
+            batch_size, seq_len = input_ids.shape 
+            attention_mask = mx.ones(
+                (batch_size, seq_len),
+                dtype=self.model.embeddings.tok_embeddings.weight.dtype) ### updated via _update_attention_mask() in the model
+            
         # Get embeddings for input batch
-        batch_outputs = super().__call__(
+        batch_outputs = self._call_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids, 
@@ -451,7 +511,7 @@ class ModelForSentenceSimilarity(Model):
         if reference_input_ids is not None:
         
             # Get embeddings for reference sentences
-            ref_outputs = super().__call__(
+            ref_outputs = self._call_model(
                 input_ids=reference_input_ids,
                 attention_mask=reference_attention_mask,
                 position_ids=position_ids, ### ?
@@ -463,8 +523,11 @@ class ModelForSentenceSimilarity(Model):
             if similarity_scores is not None:
                 assert reference_embeddings.shape[0] == input_ids.shape[0], "Number of references must match batch size for paired training"
                 assert similarity_scores.shape[0] == input_ids.shape[0], "Number of similarity scores must match batch size for paired training"
-                # No matmul here, we only care about Query i vs Ref i
-                pairwise_sims = mx.sum(embeddings * reference_embeddings, axis=-1)
+                if self.config.use_late_interaction:
+                    pairwise_sims = self._compute_late_interaction_scores(embeddings, reference_embeddings)
+                else:
+                    # No matmul here, we only care about Query i vs Ref i
+                    pairwise_sims = mx.sum(embeddings * reference_embeddings, axis=-1)
                     
                 # Ensure scores match shape
                 if len(similarity_scores.shape) > 1:
@@ -475,23 +538,44 @@ class ModelForSentenceSimilarity(Model):
             
             # Cross-entropy loss [for triplet training with hard negatives]
             else:
-                if negative_input_ids is not None:
-                    assert reference_embeddings.shape[0] == input_ids.shape[0], "Number of references must match batch size for paired training"
-                    assert negative_input_ids.shape[0] == input_ids.shape[0], "Number of negatives must match batch size for triplet training"
-                    # Embed Negative
-                    neg_outputs = super().__call__(
-                        input_ids=negative_input_ids, 
-                        attention_mask=negative_attention_mask, 
-                        return_dict=True
-                    )
-                    neg_embeddings = neg_outputs["embeddings"]
+                if self.config.use_late_interaction:
+                    # Q: [B, L, D], C: [2B, L, D] (if negatives exist)
+                    if negative_input_ids is not None:
+                        neg_outputs = self._call_model(negative_input_ids, negative_attention_mask)
+                        neg_embeddings = neg_outputs["embeddings"]
+                        candidates = mx.concatenate([reference_embeddings, neg_embeddings], axis=0)
+                    else:
+                        candidates = reference_embeddings
+
+                    # Manual Broadcasting for Late Interaction cross-batch
+                    Q_broad = embeddings[:, None, :, :]
+                    C_broad = candidates[None, :, :, :].transpose(0, 1, 3, 2)
                     
-                    # Stack Candidates: [Positives, Negatives]
-                    candidates = mx.concatenate([reference_embeddings, neg_embeddings], axis=0) # Shape: [2 * batch, hidden]
-                    similarities = compute_similarity(embeddings, candidates)
-                
+                    sim_matrix = Q_broad @ C_broad
+                    
+                    # Max over Doc length, Sum over Query length
+                    scores = mx.sum(mx.max(sim_matrix, axis=-1), axis=-1)
+                    similarities = scores # [B, C]
+
                 else:
-                    similarities = compute_similarity(embeddings, reference_embeddings)
+                    if negative_input_ids is not None:
+                        assert reference_embeddings.shape[0] == input_ids.shape[0], "Number of references must match batch size for paired training"
+                        assert negative_input_ids.shape[0] == input_ids.shape[0], "Number of negatives must match batch size for triplet training"
+                        # Embed Negative
+                        neg_outputs = self._call_model(
+                            input_ids=negative_input_ids, 
+                            attention_mask=negative_attention_mask, 
+                            return_dict=True
+                        )
+                        neg_embeddings = neg_outputs["embeddings"]
+                        
+                        # Stack Candidates: [Positives, Negatives]
+                        candidates = mx.concatenate([reference_embeddings, neg_embeddings], axis=0) # Shape: [2 * batch, hidden]
+
+                    else:
+                        candidates = reference_embeddings 
+                        
+                    similarities = compute_similarity(embeddings, candidates)
 
                 scale = 20.0
                 scores = similarities * scale
@@ -513,7 +597,7 @@ class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """
     Extends ModelForSentenceSimilarity.
     Handles:
-    1. Inference: Generates embeddings.
+    1. Inference: Generates embeddings and similarity scores (cosine similarity or MaxSim if late interaction is used).
     2. Training (Standard): (Sentence1, Sentence2, Score) -> MSE/Cosine Loss.
     3. Training (Triplets): (Anchor, Positive, Negative) -> MNRL with Hard Negatives (Cross-entropy Loss).
     This class sanitizes typical sentence transformers weights to align with the ModernBERT model.

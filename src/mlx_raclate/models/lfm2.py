@@ -150,7 +150,8 @@ class Attention(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -199,6 +200,7 @@ class ShortConv(nn.Module):
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None
     ):
         BCx = self.in_proj(x)
         B, C, x = mx.split(BCx, 3, axis=-1)
@@ -327,7 +329,7 @@ class Lfm2Model(nn.Module):
         """
         Creates a causal mask and combines it with the padding mask.
         """
-        
+ 
         B, L = attention_mask.shape
 
         causal_mask = mx.triu(mx.full((L, L), -1e9, dtype), k=1)
@@ -341,7 +343,7 @@ class Lfm2Model(nn.Module):
 
         return causal_mask.astype(dtype)
     
-    def create_ssm_mask(h, cache=None):
+    def _create_ssm_mask(self, h, cache=None):
         if cache and hasattr(cache, "make_mask"):
             return cache.make_mask(h.shape[1])
         return None
@@ -355,16 +357,10 @@ class Lfm2Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         model_dtype = hidden_states.dtype
 
-        attention_mask = self._update_attention_mask(
-            attention_mask=attention_mask,
-            dtype=model_dtype
-        )
-
-        if cache is None:
-            cache = [None] * len(self.layers)
+        cache = [None] * len(self.layers)
 
         attn_mask = self._update_attention_mask(attention_mask, dtype=model_dtype)
-        conv_mask = self.create_ssm_mask(hidden_states, cache[self.conv_idx])
+        conv_mask = self._create_ssm_mask(hidden_states, cache[self.conv_idx])
 
         for layer, c in zip(self.layers, cache):
             mask = attn_mask if layer.is_attention_layer else conv_mask
@@ -384,7 +380,6 @@ class Model(RaclateBaseModel):
         self.config = config
         self.model_type = config.model_type
         self.model = Lfm2Model(config)
-        
 
     def __call__(
         self,
@@ -431,7 +426,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
     Computes similarity scores between input sequences and reference sentences.
     """
     def __init__(self, config: ModelArgs):
-        super().__init__(config)
+        super().__init__()
         self.config = config
         self.model_type = config.model_type
         self.model = Lfm2Model(config)
@@ -469,7 +464,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             "last_hidden_state": last_hidden_state,
         }
     
-    def compute_late_interaction_scores(self, Q, D):
+    def _compute_late_interaction_scores(self, Q, D):
         """
         MaxSim: sum_i(max_j(Q_i . D_j))
         Args:
@@ -501,6 +496,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
                 (batch_size, seq_len),
                 dtype=self.model.embed_tokens.weight.dtype,
             )
+
         # Get embeddings for input batch
         batch_outputs = self._call_model(
             input_ids=input_ids,
@@ -526,7 +522,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
                 assert reference_embeddings.shape[0] == input_ids.shape[0], "Number of references must match batch size for paired training"
                 assert similarity_scores.shape[0] == input_ids.shape[0], "Number of similarity scores must match batch size for paired training"
                 if self.config.use_late_interaction:
-                    pairwise_sims = self.compute_late_interaction_scores(embeddings, reference_embeddings)
+                    pairwise_sims = self._compute_late_interaction_scores(embeddings, reference_embeddings)
                 else:
                     # No matmul here, we only care about Query i vs Ref i
                     pairwise_sims = mx.sum(embeddings * reference_embeddings, axis=-1)
