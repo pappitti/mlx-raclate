@@ -407,7 +407,7 @@ class Model(RaclateBaseModel):
             text_embeds = last_token_pooling(last_hidden_state, attention_mask)
 
         for layer in self.dense:
-            last_hidden_state = layer(last_hidden_state)
+            text_embeds = layer(text_embeds)
 
         text_embeds = normalize_embeddings(text_embeds)
 
@@ -444,11 +444,11 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             out["last_hidden_state"] if isinstance(out, dict) else out[0]
         )
 
-        for dense in self.dense:
-            last_hidden_state = dense(last_hidden_state)
-
         # text_embeds = normalize_embeddings(last_hidden_state)
         if self.config.use_late_interaction:
+            for dense in self.dense:
+                last_hidden_state = dense(last_hidden_state)
+
             text_embeds = normalize_embeddings(last_hidden_state)
             # Keep unpooled for ColBERT style
             # Mask padding tokens to avoid them affecting MaxSim
@@ -456,7 +456,14 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
                 text_embeds = text_embeds * attention_mask[..., None]
         else:
             # Standard dense retrieval: Mean Pooling
-            text_embeds = mean_pooling(last_hidden_state, attention_mask)
+            if not self.config.is_causal:
+                text_embeds = mean_pooling(last_hidden_state, attention_mask)
+            else:
+                text_embeds = last_token_pooling(last_hidden_state, attention_mask)
+
+            for layer in self.dense:
+                text_embeds = layer(text_embeds)
+
             text_embeds = normalize_embeddings(text_embeds)
 
 
