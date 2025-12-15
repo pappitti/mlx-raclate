@@ -10,7 +10,7 @@ from .base import (
     BaseModelArgs,
     mean_pooling,
     normalize_embeddings,
-    compute_similarity,
+    compute_similarity_and_loss,
     RaclateBaseModel,
 )
 
@@ -446,20 +446,6 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             "last_hidden_state": last_hidden_state,
         }
     
-    def _compute_late_interaction_scores(self, Q, D):
-        """
-        MaxSim: sum_i(max_j(Q_i . D_j))
-        Args:
-            Q: Query embeddings [B_q, L_q, Dim]
-            D: Doc embeddings [B_d, L_d, Dim] 
-        Note: If calculating loss with in-batch negatives, shapes might vary.
-        """
-        # (B, L_q, Dim) @ (B, Dim, L_d) -> (B, L_q, L_d)
-        # This assumes pairwise (Query[i] vs Doc[i]).
-        sim_matrix = Q @ D.transpose(0, 2, 1)
-        max_scores = mx.max(sim_matrix, axis=-1) # (B, L_q)
-        return mx.sum(max_scores, axis=-1) # (B,)
-    
     def __call__(
         self,
         input_ids,
@@ -500,70 +486,16 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             )
             reference_embeddings = ref_outputs["embeddings"]  # [num_references, hidden_size]
 
-            # MSE loss between computed similarities and target scores
-            if similarity_scores is not None:
-                assert reference_embeddings.shape[0] == input_ids.shape[0], "Number of references must match batch size for paired training"
-                assert similarity_scores.shape[0] == input_ids.shape[0], "Number of similarity scores must match batch size for paired training"
-                if self.config.use_late_interaction:
-                    pairwise_sims = self._compute_late_interaction_scores(embeddings, reference_embeddings)
-                else:
-                    # No matmul here, we only care about Query i vs Ref i
-                    pairwise_sims = mx.sum(embeddings * reference_embeddings, axis=-1)
-                    
-                # Ensure scores match shape
-                if len(similarity_scores.shape) > 1:
-                    similarity_scores = similarity_scores.flatten()
-                    
-                loss = nn.losses.mse_loss(pairwise_sims, similarity_scores)
-                similarities = pairwise_sims
-            
-            # Cross-entropy loss [for triplet training with hard negatives]
-            else:
-                if self.config.use_late_interaction:
-                    # Q: [B, L, D], C: [2B, L, D] (if negatives exist)
-                    if negative_input_ids is not None:
-                        neg_outputs = self._call_model(negative_input_ids, negative_attention_mask)
-                        neg_embeddings = neg_outputs["embeddings"]
-                        candidates = mx.concatenate([reference_embeddings, neg_embeddings], axis=0)
-                    else:
-                        candidates = reference_embeddings
-
-                    # Manual Broadcasting for Late Interaction cross-batch
-                    Q_broad = embeddings[:, None, :, :]
-                    C_broad = candidates[None, :, :, :].transpose(0, 1, 3, 2)
-                    
-                    sim_matrix = Q_broad @ C_broad
-                    
-                    # Max over Doc length, Sum over Query length
-                    scores = mx.sum(mx.max(sim_matrix, axis=-1), axis=-1)
-                    similarities = scores # [B, C]
-
-                else:
-                    if negative_input_ids is not None:
-                        assert reference_embeddings.shape[0] == input_ids.shape[0], "Number of references must match batch size for paired training"
-                        assert negative_input_ids.shape[0] == input_ids.shape[0], "Number of negatives must match batch size for triplet training"
-                        # Embed Negative
-                        neg_outputs = self._call_model(
-                            input_ids=negative_input_ids, 
-                            attention_mask=negative_attention_mask, 
-                            return_dict=True
-                        )
-                        neg_embeddings = neg_outputs["embeddings"]
-                        
-                        # Stack Candidates: [Positives, Negatives]
-                        candidates = mx.concatenate([reference_embeddings, neg_embeddings], axis=0) # Shape: [2 * batch, hidden]
-
-                    else:
-                        candidates = reference_embeddings 
-                        
-                    similarities = compute_similarity(embeddings, candidates)
-
-                scale = 20.0
-                scores = similarities * scale
-                
-                labels = mx.arange(embeddings.shape[0])
-                
-                loss = nn.losses.cross_entropy(scores, labels)
+            similarities, loss = compute_similarity_and_loss(
+                self.config,
+                input_ids,
+                embeddings,
+                reference_embeddings,
+                self._call_model,
+                similarity_scores,
+                negative_input_ids,
+                negative_attention_mask,
+            )
          
         if not return_dict:
             return (loss, similarities, embeddings)
