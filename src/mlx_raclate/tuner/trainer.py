@@ -35,7 +35,7 @@ class TrainingArgs:
         warmup_steps: int = 0, # warmup steps take precedence over warmup ratio, warmup_steps are optimizer steps (dataset size / (batch_size * grad_accumulation))
         lr_scheduler_type: str = "constant", # "cosine_decay", "linear_schedule", https://ml-explore.github.io/mlx/build/html/python/optimizers/schedulers.html
         gradient_accumulation_steps: int = 2,
-        max_grad_norm: Optional[float] = None,
+        max_grad_norm: float = 1,
         save_steps: int = 1000,
         logging_steps: int = 100,
         output_dir: str = "outputs",
@@ -211,7 +211,7 @@ class Trainer:
         @partial(mx.compile, inputs=self.state, outputs=self.state)
         def update_fn(accumulated_grads):
             # Flatten gradients to compute norm
-            flattened_grads, _ = tree_flatten(accumulated_grads)
+            flattened_grads = tree_flatten(accumulated_grads)
 
             squares = [mx.sum(mx.square(g)) for g in flattened_grads]
             total_norm = mx.sqrt(mx.sum(mx.array(squares)))
