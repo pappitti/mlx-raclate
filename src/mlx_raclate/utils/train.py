@@ -5,7 +5,16 @@ from mlx_raclate.utils.utils import load, PIPELINES
 from mlx_raclate.tuner.datasets import load_dataset, DatasetArgs
 from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
 
-DEFAULT_MODEL_PATH : str = "trained_models/Qwen3-Embedding-0.6B_text-classification_20251206_222009/checkpoint-14000" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base"
+train_tested = {
+    "text-classification": [
+        {"model": "Qwen/Qwen3-Embedding-0.6B", "special_model_config" : {}, "special_trainer_config" : {"use_chat_template": True}, "special_training_args" : {"max_position_embeddings":16384}},
+        {"model": "answerdotai/ModernBERT-base", "special_model_config" : {}, "special_training_args" : {}},
+        {"model": "LiquidAI/LFM2-350M", "special_model_config" : {}, "special_training_args" : {}},
+        # {"model": "google/t5gemma-l-l-ul2", "special_model_config" : {}, "special_training_args" : {}}
+    ],
+}
+
+DEFAULT_MODEL_PATH : str = "trained_models/Qwen3-Embedding-0.6B_text-classification_20251206_222009/checkpoint-14000" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-l-l-ul2"
 DEFAULT_DATASET : str = "data/20251205_1125" # can be a local path "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
 
@@ -19,6 +28,8 @@ def init_args():
     parser.add_argument("--use_chat_template", action='store_true', help="Use chat template for decoder models when there are text pairs.")
     parser.add_argument("--force_separator", type=str, default=None, help="Force a specific separator between text pairs for decoder models, if not using chat template.")
     parser.add_argument("--resume_from_step", type=int, default=0, help="Step number to resume training from (if applicable).")
+    parser.add_argument("--max_length", type=int, default=None, help="Maximum sequence length for the model inputs. If not specified, the model's default max length will be used.")
+    parser.add_argument("--freeze_embeddings", default=False, action='store_true', help="Set this flag to freeze embedding layers during training.")
     return parser.parse_args()
 
 def main():
@@ -32,6 +43,8 @@ def main():
     use_chat_template : bool = args.use_chat_template
     force_separator : str = args.force_separator
     resume_from_step : int = args.resume_from_step
+    max_length : int = args.max_length
+    freeze_embeddings : bool = args.freeze_embeddings
 
     if task_type not in PIPELINES:
         raise ValueError(f"Task type {task_type} not supported. Choose from {PIPELINES.items()}")
@@ -80,17 +93,18 @@ def main():
     # Training arguments
     training_args = TrainingArgs(
         batch_size=1,
-        eval_batch_size=2,
         gradient_accumulation_steps=8, 
-        max_length= model.config.max_position_embeddings,
+        max_length= max_length if max_length else model.config.max_position_embeddings,
         resume_from_step=resume_from_step, # warmup will be ingnored if before this step and schedulers will only start after
         num_train_epochs=1,
-        learning_rate=4.4e-06, # 5e-5 for ModernBERT, 2e-5 for Qwen
+        learning_rate=2e-5, # 5e-5 for ModernBERT, 2e-5 for Qwen
         weight_decay=0.01,
+        freeze_embeddings=freeze_embeddings,
         warmup_ratio=0.3, # can use warmup_steps=300 instead (both warmup_ratio and warmup_steps default to 0, steps override ratio)
-        lr_scheduler_type="linear_schedule", # would default to "constant"
+        lr_scheduler_type="cosine_decay", # would default to "constant", can also use "cosine_decay" or "linear_schedule"
         save_steps=1000,
-        logging_steps=12, # will be adjusted to be multiple of logging_steps inside Trainer
+        logging_steps=12, # will be adjusted to be multiple of gradient_accumulation_steps inside Trainer
+        eval_batch_size=2,
         output_dir=output_dir,
         save_total_limit=None,
         grad_checkpoint=True,

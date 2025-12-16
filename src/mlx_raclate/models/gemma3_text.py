@@ -56,7 +56,6 @@ class ModelArgs(BaseModelArgs):
 
     ### pipeline args
     decoder_bias=True,
-    classifier_pooling: Literal["cls", "mean"] = "mean"
     classifier_dropout=0.0 
     classifier_bias=False
     sparse_prediction=True ### True seems a more appropriate value for MLM

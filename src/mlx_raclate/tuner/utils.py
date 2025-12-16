@@ -7,6 +7,13 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten, tree_unflatten
 
+EMBEDDING_LAYER_NAMES = {
+    "gemma3_text": ["embed_tokens"],
+    "lfm2": ["embed_tokens"],
+    "qwen3": ["embed_tokens"],
+    "t5gemma_encoder": ["embed_tokens"],
+    "modernbert": ["embeddings"]
+}
     
 def build_schedule(schedule_config: Dict):
     """

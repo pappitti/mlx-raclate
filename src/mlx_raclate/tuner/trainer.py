@@ -16,7 +16,7 @@ from datasets import Dataset as HFDataset
 from mlx.utils import tree_flatten, tree_map
 
 from .collators import DataCollator
-from .utils import build_schedule
+from .utils import EMBEDDING_LAYER_NAMES, build_schedule
 
 @dataclass
 class TrainingArgs:
@@ -30,10 +30,12 @@ class TrainingArgs:
         num_train_epochs: int = 3,
         learning_rate: float = 5e-5,
         weight_decay: float = 0.01,
+        freeze_embeddings: bool = False,
         warmup_ratio: float = 0,
         warmup_steps: int = 0, # warmup steps take precedence over warmup ratio, warmup_steps are optimizer steps (dataset size / (batch_size * grad_accumulation))
         lr_scheduler_type: str = "constant", # "cosine_decay", "linear_schedule", https://ml-explore.github.io/mlx/build/html/python/optimizers/schedulers.html
-        gradient_accumulation_steps: int = 1,
+        gradient_accumulation_steps: int = 2,
+        max_grad_norm: Optional[float] = None,
         save_steps: int = 1000,
         logging_steps: int = 100,
         output_dir: str = "outputs",
@@ -48,10 +50,12 @@ class TrainingArgs:
         self.num_train_epochs = num_train_epochs
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.freeze_embeddings = freeze_embeddings
         self.warmup_ratio = warmup_ratio
         self.warmup_steps = warmup_steps
         self.lr_scheduler_type = lr_scheduler_type
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.max_grad_norm = max_grad_norm
         self.save_steps = save_steps
         self.logging_steps = logging_steps
         self.output_dir = output_dir
@@ -104,6 +108,14 @@ class Trainer:
         self.eval_dataset = eval_dataset
         self.label2id = label2id
         self.data_collator = self._get_collator()
+
+        if training_args.freeze_embeddings:
+            print("Freezing embedding layers.")
+            if model.config.model_type in EMBEDDING_LAYER_NAMES:
+                model.model.freeze(keys=EMBEDDING_LAYER_NAMES[model.config.model_type])
+            else:
+                print(f"Warning: No embedding layer names defined for model type {model.config.model_type}. Using common names (embed_tokens, embeddings).")
+                model.model.freeze(keys=["embed_tokens", "embeddings"])
         
         # Initialize optimizer
         if optimizer is not None:
@@ -198,7 +210,22 @@ class Trainer:
         # We define a function that takes the model and ACCUMULATED grads
         @partial(mx.compile, inputs=self.state, outputs=self.state)
         def update_fn(accumulated_grads):
+            # Flatten gradients to compute norm
+            flattened_grads, _ = tree_flatten(accumulated_grads)
+
+            squares = [mx.sum(mx.square(g)) for g in flattened_grads]
+            total_norm = mx.sqrt(mx.sum(mx.array(squares)))
+
+            # Conputing clipping coeff
+            clip_coeff = training_args.max_grad_norm / (total_norm + 1e-6)
+            scale = mx.minimum(1.0, clip_coeff)
+
+            # Gradient clipping
+            accumulated_grads = tree_map(lambda g: g * scale, accumulated_grads)
+
             self.optimizer.update(self.model, accumulated_grads)
+
+            return total_norm
         
         self.step_update = update_fn
         self.push_to_hub = training_args.push_to_hub 
@@ -229,7 +256,7 @@ class Trainer:
         elif hasattr(self.model, "model"):
             if hasattr(self.model.model, "layers"): 
                 layers = self.model.model.layers
-            elif hasattr(self.model.model, "encoder"): # T5 / Others TBC
+            elif hasattr(self.model.model, "encoder"): # Others TBC
                 if hasattr(self.model.model.encoder, "layers"):
                     layers = self.model.model.encoder.layers
 
@@ -323,6 +350,7 @@ class Trainer:
         """Training logic for one epoch."""
         self.model.train()
         running_loss = 0
+        running_grad_norm = 0.0
         n_steps = 0
         start_time = time.time()
         
@@ -357,7 +385,6 @@ class Trainer:
             
             # depending on hardware and model size, we may want to avoid syncing here
             running_loss += loss.item() # running_loss += loss to avoid sync
-           
 
             # Update Optimizer if Accumulation Done
             if n_steps % steps_to_accumulate == 0:
@@ -367,7 +394,8 @@ class Trainer:
                     accumulated_grads = tree_map(lambda g: g * scale_factor, accumulated_grads)
 
                 # Apply updates
-                self.step_update(accumulated_grads)
+                grad_norm = self.step_update(accumulated_grads)
+                running_grad_norm += grad_norm.item()
 
                 # Reset
                 accumulated_grads = None
@@ -379,7 +407,9 @@ class Trainer:
                     # if running_loss is mx.array (see comment on hardware above), convert to float
                     if isinstance(running_loss, mx.array):
                         running_loss = running_loss.item()
+
                     avg_loss = running_loss / max(n_steps, 1)
+                    avg_grad_norm = running_grad_norm / (max(n_steps, 1) / steps_to_accumulate)
 
                     # Handle both static float and dynamic schedule
                     if callable(self.optimizer.learning_rate):
@@ -391,22 +421,22 @@ class Trainer:
                         current_lr = current_lr.item()
 
                     mem_gb = mx.get_active_memory() / 1e9
-
                     elapsed = time.time() - start_time
                     steps_per_sec = n_steps / elapsed
                     
                     print(
-                        f"Step {self.global_step} | Loss: {avg_loss:.4f} | LR: {current_lr:.2e} | Mem: {mem_gb:.1f}GB | Speed: {steps_per_sec:.2f} it/s"
+                        f"Step {self.global_step} | Loss: {avg_loss:.4f} | LR: {current_lr:.2e} | GradNorm: {avg_grad_norm:.2f} | Mem: {mem_gb:.1f}GB | Speed: {steps_per_sec:.2f} steps/s"
                     )
                     
                     # Reset window counters
                     running_loss = 0.0
+                    running_grad_norm = 0.0
                     n_steps = 0
                     start_time = time.time()
 
                     if self.global_step % self.save_steps == 0 :
                         print("Saving checkpoint...")
-                        self._save_checkpoint({"step": self.global_step, "step_loss": avg_loss, "learning_rate": current_lr, "memory_gb": mem_gb, "steps_per_sec": steps_per_sec})
+                        self._save_checkpoint({"step": self.global_step, "step_loss": avg_loss, "grad_norm": avg_grad_norm, "learning_rate": current_lr, "memory_gb": mem_gb, "steps_per_sec": steps_per_sec})
             
                 # May not be optimal from a speed perspective but MLX is very aggressive in terms of memory caching 
                 # Like for the utils/server, we force garbage collection here to avoid OOMs on large models

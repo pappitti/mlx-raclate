@@ -47,7 +47,6 @@ class ModelArgs(BaseModelArgs):
 
     ### pipeline args
     decoder_bias=True,
-    classifier_pooling: Literal["cls", "mean"] = "cls"
     classifier_dropout_rate: float = 0.0 
     classifier_bias=False
     sparse_prediction=True ### True seems a more appropriate value for MLM
@@ -226,12 +225,14 @@ class TransformerBlock(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None
     ) -> mx.array:
-        r = self.self_attn(self.pre_self_attn_layernorm(x), mask)
-        h = self.post_self_attn_layernorm(r)
+        r = x
+        h = self.self_attn(self.pre_self_attn_layernorm(x), mask)
+        h = self.post_self_attn_layernorm(h)
         h = r + self.dropout(h)
-        r = self.mlp(self.pre_feedforward_layernorm(h))
-        out = self.post_feedforward_layernorm(r)
-        out = h + self.dropout(out)
+        r = h
+        h= self.mlp(self.pre_feedforward_layernorm(h))
+        out = self.post_feedforward_layernorm(h)
+        out = r + self.dropout(out)
         return (out,)
 
 class T5GemmaEncoder(nn.Module):
