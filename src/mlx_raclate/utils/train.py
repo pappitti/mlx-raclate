@@ -14,7 +14,7 @@ train_tested = {
     ],
 }
 
-DEFAULT_MODEL_PATH : str = "Qwen/Qwen3-Embedding-0.6B" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
+DEFAULT_MODEL_PATH : str = "LiquidAI/LFM2-350M" #"./trained_models/Qwen3-Embedding-0.6B_text-classification_20251216_174716/checkpoint-14940" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
 DEFAULT_DATASET : str = "data/20251205_1125" # can be a local path "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
 
@@ -94,15 +94,15 @@ def main():
 
     # Training arguments
     training_args = TrainingArgs(
-        batch_size=1,
+        batch_size=2,
         gradient_accumulation_steps=4, 
         max_length= max_length if max_length else model.config.max_position_embeddings,
         resume_from_step=resume_from_step, # warmup will be ingnored if before this step and schedulers will only start after
         num_train_epochs=2,
-        learning_rate=1e-5, # 3e-5 for ModernBERT, 5e-5 for T5Gemma, 1e-5 for Qwen
+        learning_rate=2e-5, # 3e-5 for ModernBERT, 5e-5 for T5Gemma, 1e-5 for Qwen
         weight_decay=0.01,
         freeze_embeddings=freeze_embeddings,
-        warmup_ratio=0.05, # can use warmup_steps=300 instead (both warmup_ratio and warmup_steps default to 0, steps override ratio)
+        warmup_ratio=0.03, # can use warmup_steps=300 instead (both warmup_ratio and warmup_steps default to 0, steps override ratio)
         lr_scheduler_type="cosine_decay", # would default to "constant", can also use "cosine_decay" or "linear_schedule"
         max_grad_norm=max_grad_norm,
         save_steps=1000,

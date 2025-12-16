@@ -521,6 +521,9 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             "similarities": similarities,  # [batch_size, num_references]
             "embeddings": embeddings,  # [batch_size, hidden_size]
         }
+    
+    def sanitize(self, weights):
+        return _sanitize_backbone(weights)
 
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """
@@ -635,6 +638,9 @@ class ModelForSequenceClassification(RaclateBaseModel):
             "probabilities": processed_logits,
             "hidden_states": outputs.get("hidden_states", None),
         }
+    
+    def sanitize(self, weights):
+        return _sanitize_backbone(weights)
     
 
 # TokenClassification and MaskedLM not implemented for now AR models such as LFM2

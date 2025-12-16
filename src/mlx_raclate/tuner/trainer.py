@@ -521,7 +521,7 @@ class Trainer:
 
         self.tokenizer.save_pretrained(save_path)
         
-        weights = dict(tree_flatten(self.model.trainable_parameters()))
+        weights = dict(tree_flatten(self.model.parameters()))
         mx.save_safetensors(str(save_path / "model.safetensors"), weights)
         
         with open(save_path / "metrics.json", "w") as f:
