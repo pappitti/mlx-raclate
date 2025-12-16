@@ -185,6 +185,8 @@ class Trainer:
         # Setup training state and output directory
         self.global_step = 0
         self.epoch = 0
+        self.next_save_step = self.save_steps
+        self.next_log_step = self.logging_steps
 
         # Capture state that needs updating (random state for Dropout, etc.)
         self.state = [self.model.state, self.optimizer.state, mx.random.state]
@@ -213,7 +215,7 @@ class Trainer:
             # Flatten gradients to compute norm
             flattened_grads = tree_flatten(accumulated_grads)
 
-            squares = [mx.sum(mx.square(g)) for g in flattened_grads]
+            squares = [mx.sum(mx.square(g[1])) for g in flattened_grads]
             total_norm = mx.sqrt(mx.sum(mx.array(squares)))
 
             # Conputing clipping coeff
@@ -403,7 +405,7 @@ class Trainer:
                 # Eval state to actually trigger the computation graph
                 mx.eval(self.model.state, self.optimizer.state)
             
-                if self.global_step % self.logging_steps == 0:
+                if self.global_step >= self.next_log_step:
                     # if running_loss is mx.array (see comment on hardware above), convert to float
                     if isinstance(running_loss, mx.array):
                         running_loss = running_loss.item()
@@ -429,14 +431,16 @@ class Trainer:
                     )
                     
                     # Reset window counters
+                    self.next_log_step += self.logging_steps
                     running_loss = 0.0
                     running_grad_norm = 0.0
                     n_steps = 0
                     start_time = time.time()
 
-                    if self.global_step % self.save_steps == 0 :
+                    if self.global_step >= self.next_save_step:
                         print("Saving checkpoint...")
                         self._save_checkpoint({"step": self.global_step, "step_loss": avg_loss, "grad_norm": avg_grad_norm, "learning_rate": current_lr, "memory_gb": mem_gb, "steps_per_sec": steps_per_sec})
+                        self.next_save_step += self.save_steps
             
                 # May not be optimal from a speed perspective but MLX is very aggressive in terms of memory caching 
                 # Like for the utils/server, we force garbage collection here to avoid OOMs on large models

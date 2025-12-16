@@ -17,8 +17,9 @@ class DatasetArgs:
     negative example (optional for triplet loss) : negative_field
     """
     def __init__(self, data: str, task_type: str, train : bool, 
-                 text_field: Optional[str] = "text", label_field: Optional[str] = "label",
-                 text_pair_field: Optional[str] = None, negative_field: Optional[str] = None, test: Optional[bool]=False):
+        text_field: Optional[str] = "text", label_field: Optional[str] = "label",
+        text_pair_field: Optional[str] = None, negative_field: Optional[str] = None, test: Optional[bool]=False
+    ):
         self.data = data
         self.task_type = task_type
         self.train = train

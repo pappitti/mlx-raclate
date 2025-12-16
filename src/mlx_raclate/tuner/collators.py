@@ -67,7 +67,7 @@ class DataCollatorForSequenceClassification(DataCollator):
         batch = self.tokenizer(
             texts,
             text_pairs,
-            padding=True,
+            padding="longest",
             truncation=True,
             max_length=self.max_length,
             return_tensors="mlx"
