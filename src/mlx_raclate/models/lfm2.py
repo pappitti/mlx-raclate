@@ -609,10 +609,7 @@ class ModelForSequenceClassification(RaclateBaseModel):
 
         outputs = self.model(
             input_ids, 
-            attention_mask,
-            position_ids=position_ids,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict
+            attention_mask
         )
         last_hidden_state = (
             outputs["last_hidden_state"] if isinstance(outputs, dict) else outputs[0]

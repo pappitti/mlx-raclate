@@ -14,6 +14,46 @@ train_tested = {
     ],
 }
 
+force_chat_template = """
+{- bos_token -}}
+{%- set system_prompt = "" -%}
+{%- set ns = namespace(system_prompt="") -%}
+{%- if messages[0]["role"] == "system" -%}
+	{%- set ns.system_prompt = messages[0]["content"] -%}
+	{%- set messages = messages[1:] -%}
+{%- endif -%}
+{%- if tools -%}
+	{%- set ns.system_prompt = ns.system_prompt + ("\n" if ns.system_prompt else "") + "List of tools: <|tool_list_start|>[" -%}
+	{%- for tool in tools -%}
+		{%- if tool is not string -%}
+            {%- set tool = tool | tojson -%}
+		{%- endif -%}
+		{%- set ns.system_prompt = ns.system_prompt + tool -%}
+        {%- if not loop.last -%}
+            {%- set ns.system_prompt = ns.system_prompt + ", " -%}
+        {%- endif -%}
+	{%- endfor -%}
+	{%- set ns.system_prompt = ns.system_prompt + "]<|tool_list_end|>" -%}
+{%- endif -%}
+{%- if ns.system_prompt -%}
+	{{- "<|im_start|>system\n" + ns.system_prompt + "<|im_end|>\n" -}}
+{%- endif -%}
+{%- for message in messages -%}
+	{{- "<|im_start|>" + message["role"] + "\n" -}}
+	{%- set content = message["content"] -%}
+	{%- if content is not string -%}
+		{%- set content = content | tojson -%}
+	{%- endif -%}
+	{%- if message["role"] == "tool" -%}
+		{%- set content = "<|tool_response_start|>" + content + "<|tool_response_end|>" -%}
+	{%- endif -%}
+	{{- content + "<|im_end|>\n" -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+	{{- "<|im_start|>assistant\n" -}}
+{%- endif -%}
+"""
+
 DEFAULT_MODEL_PATH : str = "LiquidAI/LFM2-350M" #"./trained_models/Qwen3-Embedding-0.6B_text-classification_20251216_174716/checkpoint-14940" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
 DEFAULT_DATASET : str = "data/20251205_1125" # can be a local path "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
@@ -83,23 +123,24 @@ def main():
 
     # testing chat template
     if use_chat_template:
-        if not getattr(tokenizer, "chat_template", None):
-            raise ValueError("The tokenizer does not support chat templates.")
         messages = [
             {"role": "user", "content": "test_prompt"},
             {"role": "assistant", "content": "test_response"}
         ]
+        if not getattr(tokenizer, "chat_template", None) and force_chat_template:
+            tokenizer.chat_template = force_chat_template
+        
         templated = tokenizer.apply_chat_template(messages, tokenize=False)
         print("Chat template working:", templated)
 
     # Training arguments
     training_args = TrainingArgs(
-        batch_size=2,
-        gradient_accumulation_steps=4, 
+        batch_size=1,
+        gradient_accumulation_steps=8, 
         max_length= max_length if max_length else model.config.max_position_embeddings,
         resume_from_step=resume_from_step, # warmup will be ingnored if before this step and schedulers will only start after
         num_train_epochs=2,
-        learning_rate=2e-5, # 3e-5 for ModernBERT, 5e-5 for T5Gemma, 1e-5 for Qwen
+        learning_rate=1e-5, # 3e-5 for ModernBERT, 5e-5 for T5Gemma, 1e-5 for Qwen
         weight_decay=0.01,
         freeze_embeddings=freeze_embeddings,
         warmup_ratio=0.03, # can use warmup_steps=300 instead (both warmup_ratio and warmup_steps default to 0, steps override ratio)
