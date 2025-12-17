@@ -105,8 +105,9 @@ def _sanitize_backbone(weights: Dict[str, Any]) -> Dict[str, Any]:
         # Process Encoder weights
         if k.startswith("model.encoder."):
             new_k =  k.replace("model.encoder.", "model.")
-        # Handle potential non-prefixed weights
-        elif not k.startswith("model."):
+        # handle non-prefix keys but must keep 
+        # "score" for classification and "head" and "decoder" for masked lm
+        elif not k.startswith("model.") and not k.startswith("score.") and not k.startswith("head.") and not k.startswith("decoder."):
             new_k = f"model.{k}"
         else:
             new_k = k
@@ -400,8 +401,15 @@ class Model(RaclateBaseModel):
         }
 
     def sanitize(self, weights):
+        sanitized = _sanitize_backbone(weights)
 
-        return _sanitize_backbone(weights)
+        sanitized_weights = {}
+        for k, v in sanitized.items():
+            if not k.startswith("model."):
+                continue
+            sanitized_weights[k] = v
+
+        return sanitized_weights
    
     
 class ModelForSentenceSimilarity(RaclateBaseModel):
@@ -507,9 +515,16 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             "embeddings": embeddings,  # [batch_size, hidden_size]
         }
     
-    def sanitize(self, weights):   
-            
-        return _sanitize_backbone(weights)
+    def sanitize(self, weights):
+        sanitized = _sanitize_backbone(weights)
+
+        sanitized_weights = {}
+        for k, v in sanitized.items():
+            if not k.startswith("model."):
+                continue
+            sanitized_weights[k] = v
+
+        return sanitized_weights
 
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """
@@ -519,18 +534,6 @@ class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     def __init__(self, config: ModelArgs):
         super().__init__(config)
 
-    def sanitize(self, weights):
-        """Convert sentence transformer weights to T5Gemma format."""
-        sanitized_weights = {}
-        
-        for k, v in weights.items():
-            if "position_ids" in k:
-                # Remove unused position_ids
-                continue
-            else:
-                new_key = "model." + k
-                sanitized_weights[new_key] = v
-        return sanitized_weights
     
 class ModelForSequenceClassification(RaclateBaseModel):
     """
@@ -609,7 +612,6 @@ class ModelForSequenceClassification(RaclateBaseModel):
 
         # normalized features
         text_embeds = mean_pooling(last_hidden_state, attention_mask)
-        text_embeds = normalize_embeddings(text_embeds)
 
         ### The HF architecture T5GemmaForSequenceClassification 
         logits = self.score(text_embeds)
@@ -630,8 +632,16 @@ class ModelForSequenceClassification(RaclateBaseModel):
         }
     
     def sanitize(self, weights):   
-            
-        return _sanitize_backbone(weights)
+
+        sanitized = _sanitize_backbone(weights)
+
+        sanitized_weights = {}
+        for k, v in sanitized.items():
+            if not k.startswith("model.") and not k.startswith("score."):
+                continue
+            sanitized_weights[k] = v
+
+        return sanitized_weights
     
 class ModelForMaskedLM(RaclateBaseModel):
     """
@@ -741,6 +751,8 @@ class ModelForMaskedLM(RaclateBaseModel):
         # Specific adjustments for MLM
         final_weights = {}
         for k, v in sanitized_weights.items():
+            if not k.startswith("model.") and not k.startswith("head.") and not k.startswith("decoder."):
+                continue
                 
             # Handle Weight Tying for loading:
             if k == "model.embed_tokens.weight" and "decoder.weight" not in weights:
@@ -815,5 +827,13 @@ class ModelForTokenClassification(RaclateBaseModel):
         }
     
     def sanitize(self, weights):
-            
-        return  _sanitize_backbone(weights)
+
+        sanitized = _sanitize_backbone(weights)
+
+        sanitized_weights = {}
+        for k, v in sanitized.items():
+            if not k.startswith("model.") and not k.startswith("score."):
+                continue
+            sanitized_weights[k] = v
+
+        return sanitized_weights

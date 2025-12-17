@@ -77,6 +77,37 @@ class ModelArgs(BaseModelArgs):
             )
             
         return len(self.id2label)
+    
+def _sanitize_backbone(weights: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Standardizes keys for the Qwen3 embedding Backbone. 
+    """
+    # no need for lm_head.weight in Qwen3 for embedding models
+    sanitized_weights = {}
+
+    for key, value in weights.items():
+        # Skip language model head weights (not used for embeddings)
+        if "lm_head.weight" in key or "classifier.weight" in key:
+            continue
+
+        # Handle different checkpoint formats
+        new_key = key
+
+        # Map common parameter naming patterns
+        if key.startswith("transformer."):
+            # Some checkpoints use "transformer." prefix
+            new_key = key.replace("transformer.", "model.")
+        # Handle weights without any prefix
+        elif not key.startswith("model.") and not key.startswith("score.") :
+            # Add model prefix for transformer parameters
+            new_key = f"model.{key}"
+        else:
+            # Keep as is for other parameters
+            new_key = key
+
+        sanitized_weights[new_key] = value
+
+    return sanitized_weights
 
 
 class Attention(nn.Module):
@@ -294,41 +325,18 @@ class Model(RaclateBaseModel):
         }
 
     def sanitize(self, weights):
-        # no need for lm_head.weight in Qwen3 for embedding models
-        sanitized_weights = {}
-        for k, v in weights.items():
-            # Filter out the language model head, which is not used for embeddings.
-            if "lm_head.weight" in k:
+
+        sanitized_weights = _sanitize_backbone(weights)
+        
+        # Handle SentenceTransformer specific keys
+        final_weights = {}
+        for k, v in sanitized_weights.items():
+
+            if not k.startswith("model."):
                 continue
-
-            new_key = f"model.{k}"
-            sanitized_weights = {}
-
-        for key, value in weights.items():
-            # Skip language model head weights (not used for embeddings)
-            if "lm_head.weight" in key:
-                continue
-
-            # Handle different checkpoint formats
-            new_key = key
-
-            # Map common parameter naming patterns
-            if key.startswith("transformer."):
-                # Some checkpoints use "transformer." prefix
-                new_key = key.replace("transformer.", "model.")
-            elif key.startswith("model."):
-                # Already has correct prefix
-                new_key = key
-            elif not key.startswith("model.") and "." in key:
-                # Add model prefix for transformer parameters
-                new_key = f"model.{key}"
-            else:
-                # Keep as is for other parameters
-                new_key = key
-
-            sanitized_weights[new_key] = value
-
-        return sanitized_weights
+            final_weights[k] = v
+                
+        return final_weights
 
 
 class ModelForSentenceSimilarity(RaclateBaseModel):
@@ -427,6 +435,20 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             "similarities": similarities,  # [batch_size, num_references]
             "embeddings": embeddings,  # [batch_size, hidden_size]
         }
+    
+    def sanitize(self, weights):
+
+        sanitized_weights = _sanitize_backbone(weights)
+        
+        # Handle SentenceTransformer specific keys
+        final_weights = {}
+        for k, v in sanitized_weights.items():
+
+            if not k.startswith("model."):
+                continue
+            final_weights[k] = v
+                
+        return final_weights
 
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """
@@ -553,42 +575,8 @@ class ModelForSequenceClassification(RaclateBaseModel):
         }
     
     def sanitize(self, weights):
-        # TBC (can't be tested without checkpoints)
-        print("Sanitizing weights for ModelForSequenceClassification...")
-        sanitized_weights = {}
-        for k, v in weights.items():
-            if "position_ids" in k:
-                # Remove unused position_ids
-                continue
-            elif "lm_head" in k:
-                continue
-            # elif "score" in k:
-            #     continue # TBC (the only checkpoint I have access to has both classifier and score layers)
-
-            new_key = k
-
-            # Ensure everything maps to self.model.[transformer_parts]
-            if k.startswith("model."):
-                # Standard HF Qwen format: model.layers...
-                new_key = k 
-            elif k.startswith("transformer."):
-                # Alternative format
-                new_key = k.replace("transformer.", "model.")
-            elif not k.startswith("score") and not k.startswith("classifier"):
-                # If weights are "flat" (e.g. layers.0...), prefix with model.
-                new_key = f"model.{k}"
-            
-            # elif k.startswith("classifier."):
-            #     print(f"Sanitizing classifier key: {k}")
-            #     # replace classifier with score to match HF naming convention 
-            #     # (ensuring compatibility with Qwen3ForSequenceClassification)
-            #     new_key = k.replace("classifier.", "score.")
-            #     print(f"Sanitized classifier key to: {new_key}")
-
-            
-            sanitized_weights[new_key] = v  
-            
-        return sanitized_weights
+        
+        return _sanitize_backbone(weights)
 
 # TokenClassification and MaskedLM not implemented for now AR models such as Qwen3
 # Attempting to train pretrained weights would be catastrophic 

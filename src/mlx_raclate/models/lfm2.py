@@ -109,11 +109,19 @@ def _sanitize_backbone(weights: Dict[str, Any]) -> Dict[str, Any]:
             # Remove unused position_ids
             continue
 
-        if "linear" not in k and "dense" not in k:
-            new_key = f"model.{k}" if not k.startswith("model") else k
-            if "conv.weight" in new_key:
-                if v.shape[-1] > v.shape[1]:
-                    v = v.transpose(0, 2, 1)
+        if "conv.weight" in k:
+            if v.shape[-1] > v.shape[1]:
+                v = v.transpose(0, 2, 1)
+
+        # Handle potential non-prefixed weights
+        # not prefixing "\d+_Dense\.linear" enables futher processing in ModelForSentenceTransformer
+        if "Dense.linear" not in k and \
+            not k.startswith("model.") and \
+            not k.startswith("dense.") and \
+            not k.startswith("score.") :
+
+            new_key = f"model.{k}"
+            
             sanitized[new_key] = v
         else:
             sanitized[k] = v
@@ -416,8 +424,13 @@ class Model(RaclateBaseModel):
 
 
     def sanitize(self, weights):
-
-        return _sanitize_backbone(weights)
+        sanitized_weights = _sanitize_backbone(weights)
+        sanitized = {}
+        for k, v in sanitized_weights.items():
+            if not k.startswith("model."):
+                continue
+            sanitized[k] = v
+        return sanitized
 
 
 class ModelForSentenceSimilarity(RaclateBaseModel):
@@ -523,7 +536,13 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
         }
     
     def sanitize(self, weights):
-        return _sanitize_backbone(weights)
+        sanitized_weights = _sanitize_backbone(weights)
+        sanitized = {}
+        for k, v in sanitized_weights.items():
+            if not k.startswith("model.") and not k.startswith("dense."):
+                continue
+            sanitized[k] = v
+        return sanitized
 
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """
@@ -542,8 +561,10 @@ class ModelForSentenceTransformers(ModelForSentenceSimilarity):
             if "1_Dense.linear" in k:
                 new_key = k.replace("1_Dense.linear", "dense.0")
                 sanitized_weights[new_key] = v
-            else:
+            elif k.startswith("model.") or k.startswith("dense."):
                 sanitized_weights[k] = v
+            else:
+                continue
         return sanitized_weights
     
 class ModelForSequenceClassification(RaclateBaseModel):
@@ -637,7 +658,13 @@ class ModelForSequenceClassification(RaclateBaseModel):
         }
     
     def sanitize(self, weights):
-        return _sanitize_backbone(weights)
+        sanitized_weights = _sanitize_backbone(weights)
+        sanitized = {}
+        for k, v in sanitized_weights.items():
+            if not k.startswith("model.") and not k.startswith("score."):
+                continue
+            sanitized[k] = v
+        return sanitized
     
 
 # TokenClassification and MaskedLM not implemented for now AR models such as LFM2

@@ -123,14 +123,15 @@ def _sanitize_backbone(weights: Dict[str, Any]) -> Dict[str, Any]:
             continue
             
         # Map generic 'layers' to 'model.layers' if not already present
-        if "linear" not in k and "dense" not in k:
-            new_key = f"model.{k}" if not k.startswith("model") else k
-            sanitized[new_key] = v
-        elif "dense" not in k:
-            # hacky but works for now
-            # TODO : improve this
-            key_id = "0" if v.shape[0] > v.shape[1] else "1"
-            new_key = re.sub(r"\d+_Dense\.linear", f"dense.{key_id}", k)
+        if "Dense.linear" not in k and \
+            not k.startswith("model.") and \
+            not k.startswith("dense.") and \
+            not k.startswith("score.") and \
+            not k.startswith("head.") and \
+            not k.startswith("decoder."):
+
+            new_key = f"model.{k}"
+            
             sanitized[new_key] = v
         else:
             sanitized[k] = v
@@ -420,7 +421,17 @@ class Model(RaclateBaseModel):
 
     def sanitize(self, weights):
 
-        return _sanitize_backbone(weights)
+        sanitized_weights = _sanitize_backbone(weights)
+        
+        # Handle SentenceTransformer specific keys
+        final_weights = {}
+        for k, v in sanitized_weights.items():
+
+            if not k.startswith("model."):
+                continue
+            final_weights[k] = v
+                
+        return final_weights
 
 
 class ModelForSentenceSimilarity(RaclateBaseModel):
@@ -537,7 +548,22 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
     
     def sanitize(self, weights):
 
-        return _sanitize_backbone(weights)
+        sanitized_weights = _sanitize_backbone(weights)
+        
+        # Handle SentenceTransformer specific keys
+        final_weights = {}
+        for k, v in sanitized_weights.items():
+
+            if k.startswith("dense.") or k.startswith("model."):
+                final_weights[k] = v
+            elif re.search(r"\d+_Dense", k):
+                key_id = "0" if v.shape[0] > v.shape[1] else "1"
+                new_key = re.sub(r"\d+_Dense\.linear", f"dense.{key_id}", k)
+                final_weights[new_key] = v
+            else:
+                continue
+                
+        return final_weights
 
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """
@@ -546,6 +572,8 @@ class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """
     def __init__(self, config: ModelArgs):
         super().__init__(config)
+
+    
 
 class Gemma3PredictionHead(nn.Module):
     def __init__(self, config: ModelArgs):
@@ -651,7 +679,6 @@ class ModelForSequenceClassification(RaclateBaseModel):
             text_embeds = mean_pooling(last_hidden_state, attention_mask)
         else:
             text_embeds = last_token_pooling(last_hidden_state, attention_mask)
-        text_embeds = normalize_embeddings(text_embeds)
 
         ### The HF architecture Gemma3ForSequenceClassification 
         logits = self.score(text_embeds)
@@ -678,7 +705,7 @@ class ModelForSequenceClassification(RaclateBaseModel):
         # Filter out keys from 'embeddingsgemma3' that we don't want (dense projections)
         final_weights = {}
         for k, v in sanitized_weights.items():
-            if "dense" in k or re.search(r"\d+_Dense", k):
+            if not k.startswith("model.") and not k.startswith("score."):
                 continue
             final_weights[k] = v
             
@@ -793,7 +820,11 @@ class ModelForMaskedLM(RaclateBaseModel):
         final_weights = {}
         for k, v in sanitized_weights.items():
             # Filter unwanted Dense layers from embedding checkpoints
-            if "dense" in k or re.search(r"\d+_Dense", k):
+            # and/or score layers from classification checkpoints
+
+            if not k.startswith("model.") and \
+               not k.startswith("head.") and \
+               not k.startswith("decoder."):
                 continue
                 
             # Handle Weight Tying for loading:
@@ -873,7 +904,7 @@ class ModelForTokenClassification(RaclateBaseModel):
         
         final_weights = {}
         for k, v in sanitized_weights.items():
-            if "dense" in k or re.search(r"\d+_Dense", k):
+            if not k.startswith("model.") and not k.startswith("score."):
                 continue
             final_weights[k] = v
             

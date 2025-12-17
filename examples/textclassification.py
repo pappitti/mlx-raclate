@@ -11,8 +11,12 @@ tested_models = {
     ],
     "regression":[
         "Forecast-ing/modernBERT-content-regression" # Used it to confirm that regression works but I don't recommend this specific checkpoint
-    ]
-}
+    ],
+    "local":[
+        "./trained_models/ModernBERT-base_text-classification_20251216_191254/checkpoint-10018", # multilabel
+        "./trained_models/LFM2-350M_text-classification_20251216_234824/LFM2-350M_text-classification_20251216_234824_E1", # multilabel
+        ]
+}   
 
 def main():
     
@@ -20,7 +24,7 @@ def main():
     
     # Load the model and tokenizer
     model, tokenizer = load(
-         "TerenceLau/galahad-classifier-0.6B",
+         "./trained_models/ModernBERT-base_text-classification_20251216_191254/checkpoint-10018",
         model_config={
             "is_regression": is_regression,
         }, 
@@ -40,8 +44,7 @@ def main():
         "<|user|> Can you translate 'hello' into Spanish? <|assistant|> 'Hello' in Spanish is 'Hola'."
     ]
 
-    # For cross-encoding models, the text should not be concatenated but there must be a separate list of texts for the two sides
-    # The tokenizer will combine them appropriately
+    # For bi-encoders, responses must be in a separate list ;the tokenizer will combine them appropriately
     text_pairs = None
 
     tokens = tokenizer._tokenizer(
