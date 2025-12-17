@@ -185,8 +185,8 @@ class Trainer:
         # Setup training state and output directory
         self.global_step = 0
         self.epoch = 0
-        self.next_save_step = self.save_steps
-        self.next_log_step = self.logging_steps
+        self.next_save_step = self.resume_from_step + self.save_steps
+        self.next_log_step = self.resume_from_step + self.logging_steps
 
         # Capture state that needs updating (random state for Dropout, etc.)
         self.state = [self.model.state, self.optimizer.state, mx.random.state]
