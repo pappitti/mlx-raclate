@@ -7,10 +7,11 @@ from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
 
 train_tested = {
     "text-classification": [
-        {"model": "Qwen/Qwen3-Embedding-0.6B", "special_model_config" : {}, "special_trainer_config" : {"use_chat_template": True}, "special_training_args" : {"max_length":16384}},
+        {"model": "Qwen/Qwen3-Embedding-0.6B", "special_model_config" : {}, "special_trainer_config" : {"use_chat_template": True}, "special_training_args" : {"max_length":8192}},
         {"model": "answerdotai/ModernBERT-base", "special_model_config" : {}, "special_training_args" : {}},
-        {"model": "LiquidAI/LFM2-350M", "special_model_config" : {}, "special_training_args" : {}},
-        {"model": "google/t5gemma-b-b-ul2", "special_model_config" : {}, "special_training_args" : {"max_length":16384}} # failed
+        {"model": "LiquidAI/LFM2-350M", "special_model_config" : {"use_chat_template": True}, "special_training_args" : {}},
+        {"model": "google/t5gemma-b-b-ul2", "special_model_config" : {}, "special_training_args" : {"max_length":8192}}, # failed
+        {"model": "google/embeddinggemma-300m", "special_model_config" : {}, "special_training_args" : {}} # failed
     ],
 }
 
@@ -54,8 +55,8 @@ forced_chat_template = """
 {%- endif -%}
 """
 
-DEFAULT_MODEL_PATH : str = "./trained_models/t5gemma-b-b-ul2_text-classification_20251217_092043/checkpoint-14880" #"./trained_models/Qwen3-Embedding-0.6B_text-classification_20251216_174716/checkpoint-14940" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
-DEFAULT_DATASET : str = "data/20251205_1125" # can be a local path "argilla/synthetic-domain-text-classification" "data/20251205_1125"
+DEFAULT_MODEL_PATH : str = "google/t5gemma-b-b-ul2" #"./trained_models/Qwen3-Embedding-0.6B_text-classification_20251216_174716/checkpoint-14940" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
+DEFAULT_DATASET : str = "data/wines" # can be a local path "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
 
 def init_args():
@@ -98,9 +99,9 @@ def main():
         data=dataset, 
         task_type=task_type, 
         train=train,
-        text_field="question",
-        text_pair_field="response_anonymized",
-        label_field="classification"
+        # text_field="question",
+        # text_pair_field="response_anonymized",
+        # label_field="classification"
     )
     
     train_dataset, valid_dataset, test_dataset, id2label, label2id = load_dataset(dataset_args)
@@ -135,20 +136,20 @@ def main():
 
     # Training arguments
     training_args = TrainingArgs(
-        batch_size=1,
-        gradient_accumulation_steps=16, 
+        batch_size=2,
+        gradient_accumulation_steps=8, 
         max_length= max_length if max_length else model.config.max_position_embeddings,
         resume_from_step=resume_from_step, # warmup will be ingnored if before this step and schedulers will only start after
-        num_train_epochs=2,
-        learning_rate=2.2e-05, # 3e-5 for ModernBERT, 5e-5 for T5Gemma, 1e-5 for Qwen
+        num_train_epochs=1,
+        learning_rate=2e-5, # 3e-5 for ModernBERT, 5e-5 for T5Gemma, 1e-5 for Qwen
         weight_decay=0.01,
         freeze_embeddings=freeze_embeddings,
         warmup_ratio=0.03, # can use warmup_steps=300 instead (both warmup_ratio and warmup_steps default to 0, steps override ratio)
-        lr_scheduler_type="linear_schedule", # would default to "constant", can also use "cosine_decay" or "linear_schedule"
+        lr_scheduler_type="cosine_decay", # would default to "constant", can also use "cosine_decay" or "linear_schedule"
         max_grad_norm=max_grad_norm,
         save_steps=1000,
         logging_steps=12, # will be adjusted to be multiple of gradient_accumulation_steps inside Trainer
-        eval_batch_size=2,
+        eval_batch_size=4,
         output_dir=output_dir,
         save_total_limit=None,
         grad_checkpoint=True,
