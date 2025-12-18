@@ -7,7 +7,7 @@ This trainer supports standard dense retrieval, classification, and masked langu
 ## Key Features
 
 *   **Apple Silicon Native:** Fully optimized for M-series chips using MLX.
-*   **Full Training:**  Pretraining (not recommended) and full fine-tuning of pretrained models (_see supported architectures below_). LORA fine-tuning is not supported (yet). 
+*   **Full Training:**  Full fine-tuning of pretrained models (_see supported architectures below_). LORA fine-tuning is not supported (yet). The library allows transfer learning, meaning that existing heads can be stripped out of pretrained models (and new heads can be added to base models for specific tasks)
 *   **Memory Efficiency:** Built-in support for **Gradient Accumulation** and **Gradient Checkpointing** to train larger batches/models on limited Unified Memory.
 *   **Flexible Schedulers:** Linear, Cosine, and Constant learning rate schedules with warmup.
 *   **Smart Collators:** Task-specific data collators that handle padding, masking, and chat templates automatically.
@@ -22,8 +22,7 @@ The trainer supports a variety of modern architectures supporting long context (
 *   **Qwen 3**: MLX implementation of `Qwen/Qwen3-Embedding-0.6B` (32k context window) which leverages the qwen3 
 *   **Gemma 3**: MLX implementation of `google/embeddinggemma-300m` (2k context window) which leverages the gemma3 text variant architecture with a few tweaks. As per the official embeddingggemma3 architecture, the attention mask is set to causal or bi-directional based on a config parameter (`use_bidirectional_attn` or `use_bidirectional_attention`). Therefore, it is possible to switch between encoder and decoder mode, and standard gemma3_text models (32k context window) are also supported. 
 *   **T5Gemma-Encoder**: MLX implementation of `google/t5gemma-b-b-ul2`, but only keeping the encoder weights at initialization (the encoder config is merged into the main model config)
-*   **LFM2**: MLX implementation of `LiquidAI/LFM2-350M` (Causal/AR) which also supports `LiquidAI/LFM2-ColBERT-350M` when model config file includes `use_late_interaction=True`. These models have a context window of 128k tokens. In training mode, 128k tokens exceeds the RAM capacity of most Apple hardware. _See 
-
+*   **LFM2**: MLX implementation of `LiquidAI/LFM2-350M` (Causal/AR) which also supports `LiquidAI/LFM2-ColBERT-350M` when model config file includes `use_late_interaction=True`. These models have a context window of 128k tokens. In training mode, 128k tokens exceeds the RAM capacity of most Apple hardware. _See parameters below to cap sequences to a more reasonable length during training_
 
 
 ## 🛠 Supported Tasks & Pipelines
@@ -58,10 +57,10 @@ Named Entity Recognition and Part-of-Speech tagging.
 
 ## 📊 Data Preparation
 
-The `datasets.py` module handles loading (JSONL, Parquet, CSV, HF Hub) and column standardization.
+The `datasets.py` module handles loading (JSONL, Parquet, CSV, HF Hub) and column standardization. If is built on top of HuggingFace's datasets.
 
 ### Column Mapping
-The trainer looks for specific column names. You can map your custom dataset fields via `DatasetArgs`.
+The trainer looks for specific column names. 
 
 | Task | Required Columns | Description |
 | :--- | :--- | :--- |
@@ -72,6 +71,71 @@ The trainer looks for specific column names. You can map your custom dataset fie
 | **NER** | `tokens`, `labels` | Pre-tokenized words and aligned tags. |
 
 *Note: For Sentence Similarity, if a `label` column is present with floats, the trainer switches to Regression/MSE loss (e.g., for Cross-Encoders or scored Bi-Encoders).*
+
+You can map your custom dataset fields via `DatasetArgs`.
+```
+# Load datasets
+dataset_args = DatasetArgs(
+    data=dataset, # dataset path
+    task_type=task_type, 
+    text_field="question", # maps column 'question' to 'text'
+    text_pair_field="response", # maps column 'response' to 'text_pair'
+    negative_field="semantically_different_response" # maps column 'semantically_different_response' to 'negative'
+    label_field="classification" # maps column 'classification to 'label'
+    test=True # creates a test split, if not already present in the dataset, out of the training set (validation set not affected).
+)
+```  
+See _standardize_column_names() in `datasets.py` for more information on column mapping.
+
+### Text Pairs and Chat Template
+
+For certain tasks like text-classification, you may want to classify how two token sequences (text and text_pair) relate to each other.  
+
+For bi-encoders, it is highly recommended to let the tokenizer combine the text and the text_pair rather than aggregating them manually. This ensures that the correct separation token is used.
+
+```
+batch = self.tokenizer(
+    texts,
+    text_pairs,
+    padding="longest",
+    truncation=True,
+    max_length=self.max_length,
+    return_tensors="mlx"
+)
+```
+
+For some models, you may want to use the chat template that was used to train the model you intend to finetune. For example, LFM2-350M recommends using a chat template.  
+If `use_chat_template` is set to True when initializing the training (default False) and if a chat template is available in the tokenizer (do check!), the text and the text_pair values will be combined and text_pair will be set to None.  
+
+You can also force a specific string as separator
+
+```
+if text_pairs is not None:
+    if getattr(self.tokenizer, "chat_template", None) and self.use_chat_template:
+        # This ensures the model sees exactly what it expects for Q&A
+        formatted_texts = []
+        for prompt, response in zip(texts, text_pairs):
+            messages = [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": response}
+            ]
+            formatted_texts.append(
+                self.tokenizer.apply_chat_template(messages, tokenize=False)
+            )
+        texts = formatted_texts
+        text_pairs = None # Handled by template
+
+    elif self.force_separator is not None:
+        # Use the forced separator for decoder models
+        texts = [
+            f"{t}{self.force_separator}{p}" 
+            for t, p in zip(texts, text_pairs)
+        ]
+        text_pairs = None
+
+```
+
+See DataCollatorForSequenceClassification in `collators.py` for more information on text_pair handling for text-classification.
 
 ## 🚀 Usage Example
 
@@ -87,7 +151,6 @@ from transformers import AutoTokenizer
 data_args = DatasetArgs(
     data="my_org/my_dataset",
     task_type="sentence-similarity",
-    train=True,
     test=True
 )
 train_ds, val_ds, test_ds, _, _ = load_dataset(data_args)

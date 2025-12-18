@@ -101,7 +101,6 @@ def main():
     dataset_args = DatasetArgs(
         data=dataset, 
         task_type=task_type, 
-        train=train,
         # text_field="question",
         # text_pair_field="response_anonymized",
         # label_field="classification"

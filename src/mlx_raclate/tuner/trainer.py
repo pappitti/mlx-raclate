@@ -522,6 +522,9 @@ class Trainer:
         self.tokenizer.save_pretrained(save_path)
         
         weights = dict(tree_flatten(self.model.parameters()))
+        if hasattr(self.model, "decoder") :
+            print("Removing tied decoder weights from checkpoint...")
+            weights.pop("decoder.weight", None)
         mx.save_safetensors(str(save_path / "model.safetensors"), weights)
         
         with open(save_path / "metrics.json", "w") as f:
