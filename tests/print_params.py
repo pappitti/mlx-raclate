@@ -1,6 +1,7 @@
 import mlx.core as mx
 from mlx.utils import tree_flatten
 from mlx_raclate.utils.utils import load
+from mlx_raclate.tuner.utils import nparams
 
 def main():
     
@@ -8,9 +9,13 @@ def main():
     
     # Load the model and tokenizer
     model, tokenizer = load(
-         "./trained_models/LFM2-350M_text-classification_20251216_234824/LFM2-350M_text-classification_20251216_234824_E1",
+         "./trained_models/ModernBERT-base_text-classification_20251216_191254/checkpoint-20036",
         pipeline='text-classification' # if the config file includes the architecture "ModernBertForSequenceClassification", the pipeline will be identified automatically so no need to specify it
     ) 
+
+    print(f"Number of model parameters: {nparams(model)}")
+    # print(f"Embedding dtype: {model.model.embeddings.tok_embeddings.weight.dtype}")
+    # print(f"Linear dtype: {model.model.layers[0].attn.Wqkv.weight.dtype}")
 
     params_keys = [k for k,_ in dict(tree_flatten(model.parameters())).items()]
 

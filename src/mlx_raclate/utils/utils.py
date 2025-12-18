@@ -30,6 +30,20 @@ PIPELINES = [
     "sentence-similarity"
 ]
 
+# Map common string representations to MLX dtypes
+STR_TO_DTYPE = {
+    "float32": mx.float32,
+    "fp32": mx.float32,
+    "float16": mx.float16,
+    "fp16": mx.float16,
+    "half": mx.float16,
+    "bfloat16": mx.bfloat16,
+    "bf16": mx.bfloat16,
+    # Less common but possible
+    "float64": mx.float32, # Map double to single precision (usually sufficient)
+    "double": mx.float32,
+}
+
 HF_ARCH_TO_PIPELINE_MAPPING = {
     "ForSequenceClassification": "text-classification",
     "ForMaskedLM": "masked-lm",
@@ -48,6 +62,36 @@ class ModelNotFoundError(Exception):
         self.message = message
         super().__init__(self.message)
 
+def _determine_model_dtype(config: dict, loaded_weights: dict) -> mx.Dtype:
+    """
+    Robustly determine the target dtype for the model.
+    1. If 'quantization' is in config -> Default to float16 (Standard MLX format).
+    2. Else check config['torch_dtype']. 
+    3. Else 'auto' -> infer from loaded weights.
+    """
+    # MLX Quantized Models
+    # If the model is quantized, the non-quantized layers (norms, etc.) 
+    # should usually be float16. We ignore torch_dtype here because 
+    # converted configs often retain the original model's 'float32' tag.
+    if config.get("quantization", None) is not None:
+        return mx.float16
+
+    # Check Torch Config
+    dtype_entry = config.get("torch_dtype", "auto")
+    
+    if isinstance(dtype_entry, str):
+        dtype_entry = dtype_entry.lower()
+        if dtype_entry in STR_TO_DTYPE:
+            return STR_TO_DTYPE[dtype_entry]
+            
+        if dtype_entry == "auto":
+            # Infer from the first float-like weight we found
+            for v in loaded_weights.values():
+                if v.dtype in [mx.float16, mx.bfloat16]:
+                    return v.dtype
+            return mx.float32
+
+    return mx.float32
 
 def _get_pipeline_from_config(arch : str):
     """
@@ -115,7 +159,7 @@ def _get_classes(config: dict, pipeline: Optional[str] = 'masked-lm'):
     return arch.Model, arch.ModelArgs
 
 
-def _initialize_head_weights(model: nn.Module, loaded_weights: dict, config: Any):
+def _initialize_head_weights(model: nn.Module, loaded_weights: dict, config: Any, target_dtype: mx.Dtype = mx.float32):
     """
     If we are in training mode and missing head weights, we generate them 
     using the specific distribution required (e.g., Normal 0.02) rather 
@@ -137,20 +181,20 @@ def _initialize_head_weights(model: nn.Module, loaded_weights: dict, config: Any
             # And it belongs to a prediction head
             if any(x in key for x in head_keywords):
                 
-                # 1. Initialize Biases to Zero
+                # Initialize Biases to Zero
                 if "bias" in key:
-                    print(f"[INFO] Initializing missing bias {key} to Zeros")
-                    loaded_weights[key] = mx.zeros_like(param)
+                    print(f"[INFO] Initializing missing bias {key} to Zeros ({target_dtype})")
+                    loaded_weights[key] = mx.zeros(param.shape, dtype=target_dtype)
                 
                 # 2. Initialize Weights to Normal (std=0.02)
                 # We skip 'norm' weights (Gamma) which should be 1.0, but usually
                 # those are covered by default init or exist in the checkpoint.
                 elif "weight" in key and "norm" not in key:
-                    print(f"[INFO] Initializing missing weight {key} with Normal(0.0, {initializer_range})")
+                    print(f"[INFO] Initializing missing weight {key} with Normal(0.0, {initializer_range})  ({target_dtype})")
                     loaded_weights[key] = mx.random.normal(
                         param.shape, 
                         scale=initializer_range, 
-                        dtype=param.dtype
+                        dtype=target_dtype
                     )
                     
                 initialized_count += 1
@@ -363,12 +407,18 @@ def load_model(
 
         for wf in weight_files:
             weights.update(mx.load(wf))
-    model_class, model_args_class = get_model_classes(config=config, pipeline=pipeline)
 
+    target_dtype = _determine_model_dtype(config, weights)
+    print(f"[INFO] Model initialized with precision: {target_dtype}")
+
+    model_class, model_args_class = get_model_classes(config=config, pipeline=pipeline)
     model_args = model_args_class.from_dict(config)
     
     # Instantiate the model (random init)
     model = model_class(model_args)
+    # Use set_dtype to update all floating-point parameters recursively.
+    # The default predicate ensures we don't accidentally cast integer params.
+    model.set_dtype(target_dtype)
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
@@ -376,7 +426,7 @@ def load_model(
     _verify_weights(model, weights, train_mode=train)
 
     if train:
-        _initialize_head_weights(model, weights, model_args)
+        _initialize_head_weights(model, weights, model_args, target_dtype=target_dtype)
 
     model.load_weights(list(weights.items()))
 

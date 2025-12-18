@@ -55,8 +55,8 @@ forced_chat_template = """
 {%- endif -%}
 """
 
-DEFAULT_MODEL_PATH : str = "google/t5gemma-b-b-ul2" #"./trained_models/Qwen3-Embedding-0.6B_text-classification_20251216_174716/checkpoint-14940" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
-DEFAULT_DATASET : str = "data/wines" # can be a local path "argilla/synthetic-domain-text-classification" "data/20251205_1125"
+DEFAULT_MODEL_PATH : str = "Qwen/Qwen3-Embedding-0.6B" #"./trained_models/Qwen3-Embedding-0.6B_text-classification_20251216_174716/checkpoint-14940" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
+DEFAULT_DATASET : str = "data/wines" # can be a local path or HF "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
 
 def init_args():
@@ -65,13 +65,14 @@ def init_args():
     parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET, help="Local path or HF identifier of the dataset to use for training/evaluation.")
     parser.add_argument("--task_type", type=str, default=DEFAULT_TASK_TYPE, help="Type of task (default: text-classification).")
     parser.add_argument("--is_regression", default=False, action='store_true', help="Set this flag if the task is regression.")
-    parser.add_argument("--train", default=True, action='store_true', help="Set this flag to train the model; if not set, only evaluation will be performed.")
+    parser.add_argument("--eval_only", dest="train", action='store_false', help="Set this flag to skip training and only evaluate.")
     parser.add_argument("--use_chat_template", action='store_true', help="Use chat template for decoder models when there are text pairs.")
     parser.add_argument("--force_separator", type=str, default=None, help="Force a specific separator between text pairs for decoder models, if not using chat template.")
     parser.add_argument("--resume_from_step", type=int, default=0, help="Step number to resume training from (if applicable).")
     parser.add_argument("--max_length", type=int, default=None, help="Maximum sequence length for the model inputs. If not specified, the model's default max length will be used.")
     parser.add_argument("--freeze_embeddings", default=False, action='store_true', help="Set this flag to freeze embedding layers during training.")
     parser.add_argument("--max_grad_norm", type=float, default=1, help="Maximum gradient norm for gradient clipping (Default: 1).")
+    parser.set_defaults(train=True)
     return parser.parse_args()
 
 def main():
@@ -88,6 +89,8 @@ def main():
     max_length : int = args.max_length
     freeze_embeddings : bool = args.freeze_embeddings
     max_grad_norm : float = args.max_grad_norm
+
+    print(f"Training Mode : {train}")
 
     if task_type not in PIPELINES:
         raise ValueError(f"Task type {task_type} not supported. Choose from {PIPELINES.items()}")
@@ -136,19 +139,19 @@ def main():
 
     # Training arguments
     training_args = TrainingArgs(
-        batch_size=2,
+        batch_size=8,
         gradient_accumulation_steps=8, 
         max_length= max_length if max_length else model.config.max_position_embeddings,
         resume_from_step=resume_from_step, # warmup will be ingnored if before this step and schedulers will only start after
-        num_train_epochs=1,
-        learning_rate=2e-5, # 3e-5 for ModernBERT, 5e-5 for T5Gemma, 1e-5 for Qwen
+        num_train_epochs=2,
+        learning_rate=1e-5, # 3e-5 for ModernBERT, 5e-5 for T5Gemma, 1e-5 for Qwen
         weight_decay=0.01,
         freeze_embeddings=freeze_embeddings,
         warmup_ratio=0.03, # can use warmup_steps=300 instead (both warmup_ratio and warmup_steps default to 0, steps override ratio)
         lr_scheduler_type="cosine_decay", # would default to "constant", can also use "cosine_decay" or "linear_schedule"
         max_grad_norm=max_grad_norm,
-        save_steps=1000,
-        logging_steps=12, # will be adjusted to be multiple of gradient_accumulation_steps inside Trainer
+        save_steps=5000,
+        logging_steps=64, # will be adjusted to be multiple of gradient_accumulation_steps inside Trainer
         eval_batch_size=4,
         output_dir=output_dir,
         save_total_limit=None,

@@ -14,7 +14,7 @@ tested_models = [
 
 def main():
     # Load the model and tokenizer
-    model_name =  "google/t5gemma-b-b-ul2"
+    model_name = "google/t5gemma-b-b-ul2"
     use_late_interaction = "ColBERT" in model_name
 
     model, tokenizer = load(
@@ -25,8 +25,6 @@ def main():
         pipeline="sentence-similarity" # or "sentence-transformers" if sentence-transformers model is used
     ) # if the model_path file includes "config_sentence_transformers.json", the "sentence-transformers" pipeline will be identified automatically so no need to specify it
     max_position_embeddings = getattr(model.config,"max_position_embeddings",512)
-
-    print(model.config)
 
     texts = [
         "What is TSNE?",
