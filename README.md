@@ -142,8 +142,8 @@ When using `load()`, the `pipeline` argument determines the class and return typ
 | `sentence-similarity` | `ModelForSentenceSimilarity` | Embeddings & Similarity | Semantic Search, RAG |
 | `sentence-transformers` | `ModelForSentenceTransformers` | Embeddings & Similarity | Same as `sentence-similarity` but  different sanitization strategy for Sentence Transformers weights |
 | `masked-lm` | `ModelForMaskedLM` | Token Logits | Domain adaptation, MLM training |
-| `token-classification` | `ModelForTokenClassification` | NER tasks | 
-| `zero-shot-classification` | `ModelForMaskedLM` | Implementation of [this AnswerAI paper](https://arxiv.org/html/2502.03793v2) |
+| `token-classification` | `ModelForTokenClassification` | Token Logits | NER tasks | 
+| `zero-shot-classification` | `ModelForMaskedLM` | Token Logits | Implementation of [this AnswerAI paper](https://arxiv.org/html/2502.03793v2) |
 
 This repository includes an `example` folder showcasing pipeline usage at inference.
 
