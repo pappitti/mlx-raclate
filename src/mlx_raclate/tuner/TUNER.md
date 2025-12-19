@@ -1,6 +1,6 @@
 # RACLATE Tuner
 
-The `tuner` module is the training engine of RACLATE (**R**etrieval **A**nd **C**lassification including with **LATE** interaction models). Built entirely on Apple's [MLX](https://github.com/ml-explore/mlx) framework, it provides a highly efficient, unified interface for fine-tuning [small] Transformer-based classifiers on Apple Silicon.
+The `tuner` module is the training engine of RACLATE (**R**etrieval **A**nd **C**lassification including **LATE** interaction models). Built entirely on Apple's [MLX](https://github.com/ml-explore/mlx) framework, it provides a highly efficient, unified interface for fine-tuning *small* Transformer-based classifiers on Apple Silicon.
 
 This trainer supports standard dense retrieval, classification, and masked language modeling, as well as **Late Interaction (ColBERT-style)** training patterns.
 
@@ -19,8 +19,8 @@ This trainer supports standard dense retrieval, classification, and masked langu
 The trainer supports a variety of modern architectures supporting long context (relative to BERT models). As these models are meant to be trained and run on local machines, model implementations are specifically optimized for small-to-mid-sized models:
 
 *   **ModernBERT**: MLX implementation of `answerdotai/ModernBERT-base` (encoder-only). Long context (8k) and high efficiency.
-*   **Qwen 3**: MLX implementation of `Qwen/Qwen3-Embedding-0.6B` (32k context window) which leverages the qwen3 
-*   **Gemma 3**: MLX implementation of `google/embeddinggemma-300m` (2k context window) which leverages the gemma3 text variant architecture with a few tweaks. As per the official embeddingggemma3 architecture, the attention mask is set to causal or bi-directional based on a config parameter (`use_bidirectional_attn` or `use_bidirectional_attention`). Therefore, it is possible to switch between encoder and decoder mode, and standard gemma3_text models (32k context window) are also supported. 
+*   **Qwen 3**: MLX implementation of `Qwen/Qwen3-Embedding-0.6B` (32k context window) which leverages the qwen3 architecture.
+*   **Gemma 3**: MLX implementation of `google/embeddinggemma-300m` (2k context window) which leverages the gemma3 text variant architecture with a few tweaks. As per the official embeddinggemma3 architecture, the attention mask is set to causal or bi-directional based on a config parameter (`use_bidirectional_attn` or `use_bidirectional_attention`). Therefore, it is possible to switch between encoder and decoder mode, and standard gemma3_text models (32k context window) are also supported. 
 *   **T5Gemma-Encoder**: MLX implementation of `google/t5gemma-b-b-ul2`, but only keeping the encoder weights at initialization (the encoder config is merged into the main model config)
 *   **LFM2**: MLX implementation of `LiquidAI/LFM2-350M` (Causal/AR) which also supports `LiquidAI/LFM2-ColBERT-350M` when model config file includes `use_late_interaction=True`. These models have a context window of 128k tokens. In training mode, 128k tokens exceeds the RAM capacity of most Apple hardware. _See parameters below to cap sequences to a more reasonable length during training_
 
@@ -58,7 +58,7 @@ Named Entity Recognition and Part-of-Speech tagging.
 
 ## Data Preparation
 
-The `datasets.py` module handles loading (JSONL, Parquet, CSV, HF Hub) and column standardization. If is built on top of HuggingFace's datasets.
+The `datasets.py` module handles loading (JSONL, Parquet, CSV, HF Hub) and column standardization. It is built on top of HuggingFace's datasets.
 
 ### 1. Column Mapping
 The trainer looks for specific column names. 
@@ -71,7 +71,7 @@ The trainer looks for specific column names.
 | **MLM** | `text` | Raw text for masking. |
 | **NER** | `tokens`, `labels` | Pre-tokenized words and aligned tags. |
 
-*Note: For Sentence Similarity, if a `label` column is present with floats, the trainer switches to Regression/MSE loss (e.g., for Cross-Encoders or scored Bi-Encoders).*
+*Note: For Sentence Similarity, if a `label` column is present with floats, the trainer switches to Regression/MSE loss (e.g., for scored Bi-Encoders).*
 
 You can map your custom dataset fields via `DatasetArgs`.
 ```
@@ -81,12 +81,12 @@ dataset_args = DatasetArgs(
     task_type=task_type, 
     text_field="question", # maps column 'question' to 'text'
     text_pair_field="response", # maps column 'response' to 'text_pair'
-    negative_field="semantically_different_response" # maps column 'semantically_different_response' to 'negative'
-    label_field="classification" # maps column 'classification to 'label'
+    negative_field="semantically_different_response", # maps column 'semantically_different_response' to 'negative'
+    label_field="classification", # maps column 'classification to 'label'
     test=True # creates a test split, if not already present in the dataset, out of the training set (validation set not affected).
 )
 ```  
-See _standardize_column_names() in `datasets.py` for more information on column mapping.
+Anchor is automatically mapped to `text` and Positive is automatically mapped to `text_pair`. See _standardize_column_names() in `datasets.py` for more information on column mapping. 
 
 ### 2. Text Pairs and Chat Template
 
@@ -105,10 +105,13 @@ batch = self.tokenizer(
 )
 ```
 
-For some models, you may want to use the chat template that was used to train the model you intend to finetune. For example, LFM2-350M recommends using a chat template.  
+In some cases, you may want to use the chat template that was used to train the model you intend to finetune. For example, LFM2-350M recommends using a chat template.  
+
 If `use_chat_template` is set to True when initializing the training (default False) and if a chat template is available in the tokenizer (do check!), the text and the text_pair values will be combined and text_pair will be set to None.  
 
-You can also force a specific string as separator
+You can also force a specific string as separator.  
+
+This is how it works under the hood:
 
 ```
 if text_pairs is not None:
@@ -140,7 +143,7 @@ See DataCollatorForSequenceClassification in `collators.py` for more information
 
 ## Quick Start (Programmatic)
 
-Below is a simplified example of how to set up a training run programmatically without using the CLI.
+Below is a simplified example of how to set up a training run programmatically.
 
 ```python
 from mlx_raclate.utils.utils import load
@@ -157,8 +160,9 @@ dataset_args = DatasetArgs(
     data=dataset_path, 
     task_type=task_type,
     # Optional: override field names if your data isn't standard
-    # text_field="text",
-    # label_field="label"
+    # text_field="question",
+    # text_pair_field="response",
+    # label_field="classification"
 )
 train_ds, valid_ds, test_ds, id2label, label2id = load_dataset(dataset_args)
 
@@ -211,7 +215,7 @@ if test_ds:
 
 ## CLI usage 
 
-An example of CLI tool including **all** parameters to train a model is available in `mlx_raclate/utils/train.py`.  
+An example of CLI tool including **all** parameters to train a model is available in `mlx_raclate.utils.train.py`.  
 
 WARNING : this example includes default values that override the default values of the DatasetArgs, TrainingArgs and Trainer classes presented below.
 
@@ -229,7 +233,7 @@ Used to configure how data is loaded and mapped.
 | `text_pair_field`| `str` | `None` | Name of the second text input column (for pairs). |
 | `label_field` | `str` | `None` | Name of the label/target column. |
 | `negative_field`| `str` | `None` | Name of the negative samples column. |
-| `test` | `bool` | `False` | If True, creates a test split from the training set if one doesn't exist. |. 
+| `test` | `bool` | `False` | If True, creates a test split from the training set if one doesn't exist. |   
 
 Note : use load_dataset("dataset_path") from `datasets.py` to fetch the dataset splits and the label2id dictionary.
 
@@ -264,13 +268,13 @@ Controls the hyperparameters and runtime configuration.
 | `save_steps` | `1000` | Frequency of saving model checkpoints (in steps). |
 | `logging_steps` | `16` | Frequency of logging metrics to console/files. |
 | `eval_batch_size` | `4` | Batch size used during evaluation/testing. |
-| `resume_from_step`| `0` | Step to resume training from. |  
+| `resume_from_step`| `0` | Step to resume training from. If this is after the last warmup step (either declared or calculated via warmup_ratio), warmup will be ignored. |  
 
-Gradient checkpointing is enabled by default
+Gradient checkpointing is enabled by default due to RAM constraints of consumer hardware.
 
 ### Model Config
 
-When loading a pretrained model, you can create a model_config dictionary with new parameters and pass it to the load() function. Examples 
+When loading a pretrained model, you can create a model_config dictionary with new parameters and pass it to the load() function. Common examples :
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -292,7 +296,7 @@ The main class that orchestrates the training.
 *   **`label2id`**: (Optional) Dictionary mapping labels to IDs (required for classification metrics).
 *   **`use_chat_template`** *(bool)*: If `True`, applies the tokenizer's chat template to inputs. Useful for decoder models (like Qwen/Llama) performing classification on text pairs.
 *   **`force_separator`** (Optional *str*): If not using a chat template, this string is used to join text pairs for decoder models.
-*   **`optimizer`** *(Optional *mlx.optimizer*): If no optimizer is passed, AdamW will be used with the hyper parameters set in TrainingArgs 
+*   **`optimizer`** (Optional *mlx.optimizer*): If no optimizer is passed, AdamW will be used with the hyper parameters set in TrainingArgs 
 
 **Methods:**
 
