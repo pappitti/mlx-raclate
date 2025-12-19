@@ -23,18 +23,19 @@ class TrainingArgs:
 
     def __init__(
         self,
-        batch_size: int = 4,
-        eval_batch_size: int = 2,
+        batch_size: int = 2,
+        eval_batch_size: int = 4,
         max_length: int = 512,
         resume_from_step: int = 0,
-        num_train_epochs: int = 3,
-        learning_rate: float = 5e-5,
+        num_train_epochs: int = 2,
+        learning_rate: float = 3e-5,
         weight_decay: float = 0.01,
         freeze_embeddings: bool = False,
         warmup_ratio: float = 0,
         warmup_steps: int = 0, # warmup steps take precedence over warmup ratio, warmup_steps are optimizer steps (dataset size / (batch_size * grad_accumulation))
         lr_scheduler_type: str = "constant", # "cosine_decay", "linear_schedule", https://ml-explore.github.io/mlx/build/html/python/optimizers/schedulers.html
-        gradient_accumulation_steps: int = 2,
+        min_lr: float = 0.0, # minimum learning rate for schedulers that need it
+        gradient_accumulation_steps: int = 8,
         max_grad_norm: float = 1,
         save_steps: int = 1000,
         logging_steps: int = 100,
@@ -54,6 +55,7 @@ class TrainingArgs:
         self.warmup_ratio = warmup_ratio
         self.warmup_steps = warmup_steps
         self.lr_scheduler_type = lr_scheduler_type
+        self.min_lr = min_lr
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
         self.save_steps = save_steps
@@ -156,11 +158,12 @@ class Trainer:
                 schedule_args = [training_args.learning_rate]
             
             elif scheduler_type == "linear_schedule":
-                schedule_args = [training_args.learning_rate, 0.0, decay_steps]
+                schedule_args = [training_args.learning_rate, training_args.min_lr if training_args.min_lr else 0.0, decay_steps]
                 
+            elif scheduler_type == "cosine_decay":
+                schedule_args = [training_args.learning_rate, decay_steps, training_args.min_lr if training_args.min_lr else 0.0]
             else:
-                # This covers "cosine_decay", "step_decay", "exponential_decay" (check specific sigs)
-                schedule_args = [training_args.learning_rate, decay_steps]
+                raise ValueError(f"Unsupported lr_scheduler_type: {scheduler_type}")
 
             print(f"Scheduler: {scheduler_type} | Warmup: {warmup_steps} | Total: {max_steps}")
 

@@ -25,13 +25,13 @@ The trainer supports a variety of modern architectures supporting long context (
 *   **LFM2**: MLX implementation of `LiquidAI/LFM2-350M` (Causal/AR) which also supports `LiquidAI/LFM2-ColBERT-350M` when model config file includes `use_late_interaction=True`. These models have a context window of 128k tokens. In training mode, 128k tokens exceeds the RAM capacity of most Apple hardware. _See parameters below to cap sequences to a more reasonable length during training_
 
 
-## 🛠 Supported Tasks & Pipelines
+## Supported Tasks & Pipelines
 
 The `Trainer` adapts its logic based on the `task_type` and the specific model class initialized.
 
 ### 1. Sentence Similarity (Embedding & Retrieval)
 Train models for semantic search, clustering, or RAG.
-*   **Task Type:** `sentence-similarity` or `sentence-transformers`
+*   **Task Type:** `sentence-similarity` 
 *   **Training Modes:**
     *   **Bi-Encoder (Dense):** Standard cosine similarity optimization.
     *   **Late Interaction (MaxSim):** ColBERT-style interaction where fine-grained token-level similarities are computed (requires `use_late_interaction=True`).
@@ -55,11 +55,12 @@ Named Entity Recognition and Part-of-Speech tagging.
 *   **Task Type:** `token-classification`
 *   **Features:** Handles label alignment for sub-word tokens automatically.
 
+
 ## 📊 Data Preparation
 
 The `datasets.py` module handles loading (JSONL, Parquet, CSV, HF Hub) and column standardization. If is built on top of HuggingFace's datasets.
 
-### Column Mapping
+### 1. Column Mapping
 The trainer looks for specific column names. 
 
 | Task | Required Columns | Description |
@@ -87,7 +88,7 @@ dataset_args = DatasetArgs(
 ```  
 See _standardize_column_names() in `datasets.py` for more information on column mapping.
 
-### Text Pairs and Chat Template
+### 2. Text Pairs and Chat Template
 
 For certain tasks like text-classification, you may want to classify how two token sequences (text and text_pair) relate to each other.  
 
@@ -137,68 +138,161 @@ if text_pairs is not None:
 
 See DataCollatorForSequenceClassification in `collators.py` for more information on text_pair handling for text-classification.
 
-## 🚀 Usage Example
 
-Here is a simplified example of how to set up a training run programmatically:
+## Quick Start (Programmatic)
+
+Below is a simplified example of how to set up a training run programmatically without using the CLI.
 
 ```python
-from tuner.trainer import Trainer, TrainingArgs
-from tuner.datasets import load_dataset, DatasetArgs
-from tuner.modernbert import ModelForSentenceSimilarity, ModelArgs
-from transformers import AutoTokenizer
+from mlx_raclate.utils.utils import load
+from mlx_raclate.tuner.datasets import load_dataset, DatasetArgs
+from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
 
-# 1. Setup Data
-data_args = DatasetArgs(
-    data="my_org/my_dataset",
-    task_type="sentence-similarity",
-    test=True
+# 1. Configuration variables
+model_path = "Qwen/Qwen3-Embedding-0.6B"
+dataset_path = "data/wines"
+task_type = "text-classification"
+
+# 2. Load and Prepare Dataset
+dataset_args = DatasetArgs(
+    data=dataset_path, 
+    task_type=task_type,
+    # Optional: override field names if your data isn't standard
+    # text_field="text",
+    # label_field="label"
 )
-train_ds, val_ds, test_ds, _, _ = load_dataset(data_args)
+train_ds, valid_ds, test_ds, id2label, label2id = load_dataset(dataset_args)
 
-# 2. Setup Model & Tokenizer
-model_config = ModelArgs(
-    model_type="modernbert",
-    use_late_interaction=False # Set True for ColBERT style
+# 3. Load Model and Tokenizer
+# Pass label mappings to model config for classification tasks
+model_config = {"id2label": id2label, "label2id": label2id} if id2label else {}
+
+model, tokenizer = load(
+    model_path, 
+    model_config=model_config, 
+    pipeline=task_type,
+    train=True
 )
-model = ModelForSentenceSimilarity(model_config)
-# Load weights... (custom logic usually required here to load from safetensors)
 
-tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base")
-
-# 3. Setup Training Arguments
+# 4. Define Training Arguments
 args = TrainingArgs(
-    output_dir="modernbert-retrieval-v1",
-    batch_size=32,
-    learning_rate=2e-5,
+    output_dir="outputs/my_run",
+    batch_size=4,
+    gradient_accumulation_steps=4,
+    learning_rate=1e-5,
     num_train_epochs=3,
-    gradient_accumulation_steps=4, # Crucial for Mac memory management
-    grad_checkpoint=True,          # Saves memory at cost of compute
-    push_to_hub=False
+    lr_scheduler_type="cosine_decay",
+    warmup_ratio=0.03,
+    save_steps=500,
+    logging_steps=10,
+    max_length=2048,
+    freeze_embeddings=False
 )
 
-# 4. Train
+# 5. Initialize Trainer
 trainer = Trainer(
     model=model,
     tokenizer=tokenizer,
-    task_type="sentence-similarity",
+    task_type=task_type,
     training_args=args,
     train_dataset=train_ds,
-    eval_dataset=val_ds
+    eval_dataset=valid_ds,
+    label2id=label2id,
+    # For decoder models doing classification on pairs:
+    use_chat_template=False 
 )
 
+# 6. Run Training
 trainer.train()
+
+# 7. Evaluate on Test Set (Optional)
+if test_ds:
+    trainer.test(test_ds)
 ```
 
-## 🧠 Advanced Concepts
+---
 
-### Late Interaction
-RACLATE treats Late Interaction as a first-class citizen. In `base.py`, the `compute_similarity_and_loss` function handles the "MaxSim" operation:
-$$ S(Q, D) = \sum_{i \in Q} \max_{j \in D} (q_i \cdot d_j) $$
-This allows for cheap indexing with high-precision retrieval. To enable this, set `use_late_interaction=True` in your model config.
+## API Reference
 
-### Gradient Accumulation & Checkpointing
-To train models like Gemma-3 or ModernBERT on MacBooks with 16GB or 24GB of RAM:
-1.  **Gradient Checkpointing:** Re-computes the forward pass during backprop to save activation memory.
-2.  **Gradient Accumulation:** Simulates a larger batch size by accumulating gradients over multiple steps before updating weights.
+### DatasetArgs
 
-Both are enabled via `TrainingArgs`.
+Used to configure how data is loaded and mapped.
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `data` | `str` | *Required* | Local path or HF identifier of the dataset. |
+| `task_type` | `str` | *Required* | The type of task (e.g., `text-classification`). |
+| `text_field` | `str` | `None` | Name of the text input column. |
+| `text_pair_field`| `str` | `None` | Name of the second text input column (for pairs). |
+| `label_field` | `str` | `None` | Name of the label/target column. |
+| `negative_field`| `str` | `None` | Name of the negative samples column. |
+| `test` | `bool` | `False` | If True, creates a test split from the training set if one doesn't exist. |. 
+
+Note : use load_dataset("dataset_path") from `datasets.py` to fetch the dataset splits and label2id
+
+### TrainingArgs
+
+Controls the hyperparameters and runtime configuration.
+
+#### Hyperparameters
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `batch_size` | `2` | The batch size per device/step. |
+| `gradient_accumulation_steps` | `8` | Number of steps to accumulate gradients before updating weights. |
+| `num_train_epochs` | `2` | Total number of training epochs. |
+| `max_length` | `512` | Max sequence length. If `None`, uses model's default config. |
+| `freeze_embeddings` | `False` | If `True`, freezes the embedding layer to save memory/compute. |
+
+#### Optimizer & Scheduler
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `learning_rate` | `3e-5` | Initial learning rate (Peak LR). |
+| `weight_decay` | `0.01` | Weight decay factor for AdamW. |
+| `lr_scheduler_type` | `"constant"` | Scheduler type: `"cosine_decay"`, `"linear_schedule"`, or `"constant"`. |
+| `min_lr` | `0.0` | Minimum learning rate at the end of the schedule. |
+| `warmup_ratio` | `0.0` | Ratio of total training steps used for warmup. |
+| `warmup_steps` | `0` | Absolute number of warmup steps (overrides `warmup_ratio` if set). |
+| `max_grad_norm` | `1.0` | Gradient clipping threshold. |
+
+#### Checkpointing & Logging
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `output_dir` | `None` | Directory to save checkpoints and logs. Defaults to a timestamped folder. |
+| `save_steps` | `1000` | Frequency of saving model checkpoints (in steps). |
+| `logging_steps` | `16` | Frequency of logging metrics to console/files. |
+| `eval_batch_size` | `4` | Batch size used during evaluation/testing. |
+| `resume_from_step`| `0` | Step to resume training from. |  
+
+Gradient checkpointing is enabled by default
+
+### Model Config
+
+When loading a pretrained model, you can create a model_config dictionary with new parameters and pass it to the load() function. Examples 
+
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `is_regression` | `bool` | `False` | For text-classification tasks, whether the classification is a regression |
+| `use_late_interaction`| `bool` | `False` | For sentence similarity tasks, whether late interaction (MaxSim) should be used instead of cosine similarity |
+
+## Trainer
+
+The main class that orchestrates the training.
+
+**Constructor Parameters:**
+
+*   **`model`**: The loaded MLX model.
+*   **`tokenizer`**: The loaded tokenizer. If you want to use a chat template, make sure that the tokenizer includes the chat template. If not, add it manually before instantiating the Trainer.
+*   **`task_type`**: String identifier for the pipeline (e.g., "text-classification").
+*   **`training_args`**: Instance of `TrainingArgs`.
+*   **`train_dataset`**: The processed training dataset.
+*   **`eval_dataset`**: (Optional) The processed validation dataset.
+*   **`label2id`**: (Optional) Dictionary mapping labels to IDs (required for classification metrics).
+*   **`use_chat_template`** *(bool)*: If `True`, applies the tokenizer's chat template to inputs. Useful for decoder models (like Qwen/Llama) performing classification on text pairs.
+*   **`force_separator`** (Optional *str*): If not using a chat template, this string is used to join text pairs for decoder models.
+*   **`optimizer`** *(Optional *mlx.optimizer*): If no optimizer is passed, AdamW will be used with the hyper parameters set in TrainingArgs 
+
+**Methods:**
+
+*   `train()`: Starts the training loop.
+*   `test(dataset)`: Runs evaluation on the provided dataset.
+
