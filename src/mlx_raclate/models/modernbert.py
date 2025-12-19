@@ -42,7 +42,6 @@ class ModelArgs(BaseModelArgs):
     output_hidden_states: bool = False 
     pad_token_id: int = 50283
     sep_token_id: int = 50282
-    use_return_dict: bool = True 
     vocab_size: int = 50368
 
     ### pipeline args
@@ -306,13 +305,12 @@ class ModernBertModel(nn.Module):
         attention_mask = None, # (batch_size, seq_len) see below
         sliding_window_mask = None,
         position_ids = None,
-        output_hidden_states: Optional[bool] = False,
-        return_dict: Optional[bool] = True,
+        output_hidden_states = False,
+        return_dict = True,
     ):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         batch_size, seq_len = input_ids.shape[:2]
 
@@ -530,6 +528,18 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             "similarities": similarities,  # [batch_size, num_references]
             "embeddings": embeddings,  # [batch_size, hidden_size]
         }
+    
+    def sanitize(self, weights):
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if "position_ids" in k:
+                # Remove unused position_ids
+                continue
+            if not k.startswith("model."):
+                continue
+            else:
+                sanitized_weights[k] = v
+        return sanitized_weights
 
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     """

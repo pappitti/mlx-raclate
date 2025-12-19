@@ -14,7 +14,7 @@ tested_models = [
 
 def main():
     # Load the model and tokenizer
-    model_name = "google/t5gemma-b-b-ul2"
+    model_name = "answerdotai/ModernBERT-base"
     use_late_interaction = "ColBERT" in model_name
 
     model, tokenizer = load(
@@ -33,6 +33,7 @@ def main():
         "Grandma's cat got bored last winter."
     ]
 
+    # Gemma3 models are extremely sensitive to input formatting (uncomment to test it)
     # texts = [
     #     "task: search result | query: What is TSNE?",
     #     "task: search result | query: Who is Laurens van der Maaten?",
@@ -50,6 +51,7 @@ def main():
         "The aggregate of people living together in a more or less ordered community.",
     ]
 
+    # Gemma3 models are extremely sensitive to input formatting (uncomment to test it)
     # reference_texts = [
     #     "title: none | text: I like fruits",
     #     "title: none | text: The slow green turtle crawls under the busy ant.",

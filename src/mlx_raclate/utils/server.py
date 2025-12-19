@@ -1,52 +1,63 @@
 # server.py
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional, Any, Union
+from pydantic import BaseModel, Field
+from typing import List, Optional, Any, Union, Dict
 import uvicorn
 import gc
 import mlx.core as mx
 from mlx_raclate.utils.utils import PIPELINES, load
 
-app = FastAPI(title="ModernBERT Inference API", 
-              description="API for using ModerBERT",
-              version="1.0.0")
+app = FastAPI(
+    title="Raclate Inference API", 
+    description="API for using Raclate pipelines (ModernBERT, LFM2, Qwen, etc.) on Apple Silicon",
+    version="0.1.0"
+)
 
 # TODO:
 # Separate Services: For complete isolation, run each pipeline type as a separate FastAPI service and use a lightweight API gateway to route requests.
 # Worker Pool Architecture: Implement a worker pool where each worker specializes in a specific pipeline, and a dispatcher routes requests to the appropriate worker.
 
 
-# Model cache to avoid reloading
 model_cache = {}
 
-def get_model(model_name: str, pipeline_name: str):
+def get_model(model_name: str, pipeline_name: str, model_config: Optional[Dict] = None):
     """
-    Factory function to get or create the appropriate model
+    Factory function to get or create the appropriate model.
+    Checks cache based on name, pipeline, AND configuration.
     """
     global model_cache
-
-    if pipeline_name not in PIPELINES:
-        raise HTTPException(status_code=400, detail=f"Pipeline '{pipeline_name}' not found. Available pipelines: {PIPELINES}")
     
-    # Return from cache if already loaded
-    if model_cache.get("pipeline", None)==pipeline_name and model_cache.get("model_name", None)==model_name:
+    # Create a cache key string that includes config to differentiate 
+    # e.g. LFM2 with late_interaction=True vs False
+    config_key = str(sorted(model_config.items())) if model_config else "default"
+    
+    current_key = f"{model_name}_{pipeline_name}_{config_key}"
+    cached_key = model_cache.get("key", None)
+
+    if cached_key == current_key:
         return model_cache
-    
-    # Load the appropriate model based on configuration
-    if model_cache:
-        # Clear references to existing model and tokenizer
-        model_cache = {}
-        
-        # Force garbage collection
-        gc.collect()
-    
-    model, tokenizer = load(
-        model_name,
-        pipeline=pipeline_name
-    ) 
 
-    # Update the cache
+    # Garbage collection before loading new model
+    if model_cache:
+        print(f"Unloading previous model: {model_cache.get('model_name')}")
+        model_cache = {}
+        mx.eval() # Ensure evaluation of any pending ops
+        gc.collect()
+        mx.metal.clear_cache()
+
+    print(f"Loading model: {model_name} | Pipeline: {pipeline_name} | Config: {model_config}")
+    
+    try:
+        model, tokenizer = load(
+            model_name,
+            pipeline=pipeline_name,
+            model_config=model_config
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
+
     model_cache = {
+        "key": current_key,
         "model_name": model_name,
         "pipeline": pipeline_name,
         "model": model,
@@ -55,96 +66,197 @@ def get_model(model_name: str, pipeline_name: str):
     
     return model_cache
 
-# Define request and response models
+# -----------------------------------------------------------------------------
+# Pydantic Models
+# -----------------------------------------------------------------------------
+
 class PredictionRequest(BaseModel):
-    text: Union[str, List[str]]
     model: str
-    pipeline: str = "masked-lm"
-    reference_text: Optional[Union[str, List[str]]] = None
-    label_candidates: Optional[Union[dict, List[str]]] = None
+    pipeline: str
+    text: Union[str, List[str]]
+    
+    # Optional parameters depending on pipeline
+    text_pair: Optional[Union[str, List[str]]] = Field(None, description="Secondary text for sequence classification pairs (e.g. NLI)")
+    reference_text: Optional[Union[str, List[str]]] = Field(None, description="Documents/References for similarity search")
+    
+    # Configuration
+    model_config: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Configuration overrides (e.g., {'use_late_interaction': True})")
+    label_candidates: Optional[Union[Dict[str, str], List[str]]] = Field(None, description="For zero-shot-classification only")
 
-class PipelineResponse(BaseModel):
-    result: Any
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
 
-class BatchPipelineResponse(BaseModel):
-    results: List[Any]
-
-@app.post("/predict", response_model=None)  # Dynamic response model
+@app.post("/predict")
 async def predict(request: PredictionRequest):
     """
-    Get predictions for a single text using the specified pipeline
+    Main inference endpoint handling multiple pipelines.
     """
-    is_batch = isinstance(request.text, list)
-    texts = request.text if is_batch else [request.text]
+    if request.pipeline not in PIPELINES:
+         raise HTTPException(status_code=400, detail=f"Pipeline '{request.pipeline}' not supported. Available: {PIPELINES}")
 
+    # Standardize inputs to lists
+    texts = request.text if isinstance(request.text, list) else [request.text]
+    
     if len(texts) > 32: 
-        raise HTTPException(status_code=400, detail="Batch size should not exceed 32")
+        raise HTTPException(status_code=400, detail="Batch size should not exceed 32 to protect memory")
 
-    model_info = get_model(request.model, request.pipeline)
+    # Load Model
+    model_info = get_model(request.model, request.pipeline, request.model_config)
     tokenizer = model_info["tokenizer"]
     model = model_info["model"]
 
-    max_position_embeddings = getattr(model.config,"max_position_embeddings",512)
+    # Determine generic args
+    max_len = getattr(model.config, "max_position_embeddings", 512)
+    result = {}
 
-    result=None
-    
-    if model_info["pipeline"] == "embedding":
-        input_ids = tokenizer._tokenizer(
-            texts, 
-            return_tensors="mlx", 
-            padding=True, 
-            truncation=True, 
-            max_length= max_position_embeddings
+    # -------------------------------------------------------------------------
+    # Pipeline: Text Classification (Sentiment, NLI, Regression)
+    # -------------------------------------------------------------------------
+    if request.pipeline == "text-classification":
+        text_pairs = None
+        if request.text_pair:
+            text_pairs = request.text_pair if isinstance(request.text_pair, list) else [request.text_pair]
+            if len(text_pairs) != len(texts):
+                raise HTTPException(status_code=400, detail="Length of text and text_pair must match")
+
+        inputs = tokenizer._tokenizer(
+            texts,
+            text_pairs,
+            return_tensors="mlx",
+            padding=True,
+            truncation=True,
+            max_length=max_len
         )
-        outputs = model(input_ids)
-        embeddings=outputs['embeddings'] # by default, output is returned as a dict. if not, outputs[0] is the pooled_output and outputs[1]
 
-        result = {
-            "embeddings":embeddings.tolist()
-        }
-    
-    elif model_info["pipeline"] == "sentence-transformers":
-        input_ids = tokenizer._tokenizer(
-            texts, 
-            return_tensors="mlx", 
-            padding=True, 
-            truncation=True, 
-            max_length= max_position_embeddings
+        outputs = model(
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask'],
+            return_dict=True
+        )
+
+        probs = outputs["probabilities"] # Shape: [batch, num_labels]
+        
+        # Format output
+        batch_results = []
+        id2label = getattr(model.config, "id2label", None)
+        
+        # Convert to python list structure
+        probs_list = probs.tolist()
+        
+        for i, row in enumerate(probs_list):
+            if id2label:
+                # Return dictionary mapping label -> score
+                item_res = {id2label[str(j)]: score for j, score in enumerate(row)}
+                # Sort by score descending
+                item_res = dict(sorted(item_res.items(), key=lambda x: x[1], reverse=True))
+                batch_results.append(item_res)
+            else:
+                # Just return raw scores (e.g. regression or missing config)
+                batch_results.append(row)
+
+        result = {"predictions": batch_results}
+
+    # -------------------------------------------------------------------------
+    # Pipeline: Sentence Similarity (Dense & Late Interaction)
+    # -------------------------------------------------------------------------
+    elif request.pipeline in ["sentence-similarity", "sentence-transformers"]:
+        if not request.reference_text:
+             raise HTTPException(status_code=400, detail="reference_text is required for sentence-similarity")
+        
+        refs = request.reference_text if isinstance(request.reference_text, list) else [request.reference_text]
+
+        q_inputs = tokenizer._tokenizer(texts, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
+        d_inputs = tokenizer._tokenizer(refs, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
+
+        # The model handles the complexity (Cosine vs MaxSim) internally based on config
+        outputs = model(
+            input_ids=q_inputs['input_ids'],
+            reference_input_ids=d_inputs['input_ids'],
+            attention_mask=q_inputs['attention_mask'],
+            reference_attention_mask=d_inputs['attention_mask'],
+            return_dict=True
         )
         
-        reference_ids = tokenizer._tokenizer(
-            request.reference_text, 
-            return_tensors="mlx", 
-            padding=True, 
-            truncation=True, 
-            max_length= max_position_embeddings
-        )
+        # Returns matrix: [batch_size, num_references]
+        result = {"similarities": outputs['similarities'].tolist()}
 
-        # Generate embeddings
+    # -------------------------------------------------------------------------
+    # Pipeline: Raw Embeddings
+    # -------------------------------------------------------------------------
+    elif request.pipeline == "embeddings":
+        inputs = tokenizer._tokenizer(texts, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
+        
         outputs = model(
-            input_ids['input_ids'], 
-            reference_ids['input_ids'],
-            attention_mask=input_ids['attention_mask'],
-            reference_attention_mask=reference_ids['attention_mask']
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask'],
+            return_dict=True
         )
-    
-        similarities = outputs['similarities'] # by default returned as a dictionary (use embeddings=outputs[1] otherwise)
+        
+        # 'embeddings' is the normalized pooled output
+        result = {"embeddings": outputs['embeddings'].tolist()}
 
-        result =  {
-            "similarities": similarities.tolist()
-        }
-    
-    elif model_info["pipeline"] == "zero-shot-classification":
+    # -------------------------------------------------------------------------
+    # Pipeline: Masked LM (Raw)
+    # -------------------------------------------------------------------------
+    elif request.pipeline == "masked-lm":
+        inputs = tokenizer._tokenizer(texts, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
+        
+        outputs = model(
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask'],
+            return_dict=True
+        )
+        
+        # Note: returning full logits is heavy. Usually this pipeline implies 
+        # looking for the mask token, but for a raw API, we might just return 
+        # a success status or specific logic. 
+        # Here we return the logits for the mask token if present, else empty.
+        
+        mask_token_id = tokenizer.mask_token_id
+        predictions = outputs["logits"]
+        mask_positions = mx.argmax(inputs['input_ids'] == mask_token_id, axis=1)
+        
+        batch_results = []
+        for i in range(len(texts)):
+            if mask_token_id in inputs['input_ids'][i]:
+                pos = mask_positions[i].item()
+                # Top 5 for the mask
+                token_logits = predictions[i, pos]
+                probs = mx.softmax(token_logits)
+                top_k = 5
+                sorted_indices = mx.argsort(probs)[::-1][:top_k]
+                
+                top_tokens = []
+                for idx in sorted_indices.tolist():
+                    top_tokens.append({
+                        "token": tokenizer.decode([idx]), 
+                        "score": probs[idx].item()
+                    })
+                batch_results.append(top_tokens)
+            else:
+                batch_results.append(None)
+
+        result = {"masked_predictions": batch_results}
+
+    # -------------------------------------------------------------------------
+    # Pipeline: Zero-Shot Classification (Custom Logic via Masked LM)
+    # -------------------------------------------------------------------------
+    elif request.pipeline == "zero-shot-classification":
+        if not request.label_candidates:
+            raise HTTPException(status_code=400, detail="label_candidates required for zero-shot")
+
+        # Reuse the logic from your old server, adapted for batching
         if isinstance(request.label_candidates, dict):
             categories = "\n".join([f"{i}: {k} ({v})" for i, (k, v) in enumerate(request.label_candidates.items())])
+            num_cats = len(request.label_candidates)
         else:
             categories = "\n".join([f"{i}: {label}" for i, label in enumerate(request.label_candidates)])
-
+            num_cats = len(request.label_candidates)
         
         classification_inputs = []
-
         for text in texts:
-            # Use in the f-string
+            # Answer.ai / ModernBERT style prompt
             classification_input = f"""You will be given a text and categories to classify the text.
 
                 {text}
@@ -156,107 +268,73 @@ async def predict(request: PredictionRequest):
             """
             classification_inputs.append(classification_input)
 
-        input_ids = tokenizer._tokenizer(
+        inputs = tokenizer._tokenizer(
             classification_inputs, 
             return_tensors="mlx", 
             padding=True, 
             truncation=True, 
-            max_length= max_position_embeddings
+            max_length=max_len
         )
 
-        # Forward pass
         outputs = model(
-            input_ids=input_ids['input_ids'],
-            attention_mask=input_ids.get('attention_mask', None),
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs.get('attention_mask', None),
             return_dict=True
         )
 
-        # Get the predictions for the masked token
         predictions = outputs["logits"]
         mask_token_id = tokenizer.mask_token_id
-        mask_positions = mx.argmax(input_ids['input_ids'] == mask_token_id, axis=1)
+        mask_positions = mx.argmax(inputs['input_ids'] == mask_token_id, axis=1)
 
         batch_results = []
-        for i in range(len(classification_inputs)):
-            # Find mask position for this example
+        for i in range(len(texts)):
             mask_position = mask_positions[i].item()
+            masked_token_predictions = predictions[i, mask_position]
             
-            # Get predictions for the masked token
-            masked_token_predictions =  predictions[i, mask_position]
-            
-            # Process as before
             probs = mx.softmax(masked_token_predictions)
-            top_k = min(5, len(request.label_candidates))
-            sorted_indices = mx.argsort(probs)[::-1]
-            top_indices = sorted_indices[:top_k].astype(mx.int32)
-            top_probs = probs[top_indices]
+            top_k = min(5, num_cats)
             
-            classification_result = [[tokenizer.decode([idx]), logit] for idx, logit in zip(top_indices.tolist(), top_probs.tolist())]
-            batch_results.append(classification_result)
+            # Sort generic probabilities
+            sorted_indices = mx.argsort(probs)[::-1][:top_k]
+            top_probs = probs[sorted_indices]
+            
+            item_res = []
+            for idx, logit in zip(sorted_indices.tolist(), top_probs.tolist()):
+                item_res.append({"label_index": tokenizer.decode([idx]), "score": logit})
+            
+            batch_results.append(item_res)
 
-        result =  {
-            "classification": batch_results
-        }
+        result = {"classification": batch_results}
 
-    mx.clear_cache()
-    gc.collect()  
+    # Clean up
+    mx.metal.clear_cache()
+    gc.collect()
     
     return result
 
-@app.get("/pipelines")
-async def list_pipelines():
-    """
-    List all available pipelines
-    """
+@app.get("/status")
+async def status():
     return {
-        "available_pipelines": list(PIPELINES),
+        "status": "online",
+        "loaded_model": model_cache.get("model_name"),
         "loaded_pipeline": model_cache.get("pipeline"),
-        "loaded_model" : model_cache.get("model_name")
-    }
-
-@app.get("/health")
-async def health_check():
-    """
-    Check if the server is healthy
-    """
-    return {
-        "status": "healthy", 
-        "available_pipelines": list(PIPELINES),
-        "loaded_pipeline": model_cache.get("pipeline"),
-        "loaded_model" : model_cache.get("model_name")
+        "loaded_config_key": model_cache.get("key")
     }
 
 @app.post("/unload")
 async def unload_model():
-    """
-    Unload the currently loaded model from memory
-    """
     global model_cache
-    
     if not model_cache:
-        return {"status": "no_model_loaded", "message": "No model is currently loaded"}
+        return {"message": "No model loaded"}
     
-    # Store what was unloaded for the response
-    unloaded_info = {
-        "model_name": model_cache.get("model_name"),
-        "pipeline": model_cache.get("pipeline")
-    }
-    
-    # Clear the model cache
+    name = model_cache.get("model_name")
     model_cache = {}
-    
-    # Force garbage collection to free memory
     gc.collect()
-    
-    return {
-        "status": "success", 
-        "message": f"Model unloaded successfully",
-        "unloaded": unloaded_info
-    }
+    mx.metal.clear_cache()
+    return {"message": f"Unloaded {name}"}
 
 if __name__ == "__main__":
-    uvicorn.run("utils.server:app", host="0.0.0.0", port=8000, workers=1)
-
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, workers=1)
 
 ### EXAMPLE
 '''
@@ -282,4 +360,34 @@ curl -X POST "http://localhost:8000/predict" \
     }
   }'
 
+'''
+
+'''
+curl -X POST "http://localhost:8000/predict" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "NousResearch/Minos-v1",
+    "pipeline": "text-classification",
+    "text": [
+      "I absolutely love this new framework!",
+      "The service was terrible and slow."
+    ]
+  }'
+'''
+
+'''
+curl -X POST "http://localhost:8000/predict" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "LiquidAI/LFM2-ColBERT-350M",
+    "pipeline": "sentence-similarity",
+    "model_config": {
+        "use_late_interaction": true
+    },
+    "text": ["What is liquid AI?"],
+    "reference_text": [
+        "Liquid AI builds efficient foundation models.",
+        "Water is a liquid state of matter."
+    ]
+  }'
 '''

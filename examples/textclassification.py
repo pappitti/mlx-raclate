@@ -24,7 +24,7 @@ def main():
     
     # Load the model and tokenizer
     model, tokenizer = load(
-         "./trained_models/ModernBERT-base_text-classification_20251216_191254/checkpoint-10018",
+        "NousResearch/Minos-v1",
         model_config={
             "is_regression": is_regression,
         }, 
