@@ -209,6 +209,11 @@ if test_ds:
     trainer.test(test_ds)
 ```
 
+## CLI usage 
+
+An example of CLI tool including **all** parameters to train a model is available in `mlx_raclate/utils/train.py`.  
+
+WARNING : this example includes default values that override the default values of the DatasetArgs, TrainingArgs and Trainer classes presented below.
 
 ## API Reference
 
@@ -226,7 +231,7 @@ Used to configure how data is loaded and mapped.
 | `negative_field`| `str` | `None` | Name of the negative samples column. |
 | `test` | `bool` | `False` | If True, creates a test split from the training set if one doesn't exist. |. 
 
-Note : use load_dataset("dataset_path") from `datasets.py` to fetch the dataset splits and label2id
+Note : use load_dataset("dataset_path") from `datasets.py` to fetch the dataset splits and the label2id dictionary.
 
 ### TrainingArgs
 
@@ -235,7 +240,7 @@ Controls the hyperparameters and runtime configuration.
 #### Hyperparameters
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
-| `batch_size` | `2` | The batch size per device/step. |
+| `batch_size` | `2` | The physical batch size per device/step. Reduce to 1 on Macbooks with limited RAM if training on long context. |
 | `gradient_accumulation_steps` | `8` | Number of steps to accumulate gradients before updating weights. |
 | `num_train_epochs` | `2` | Total number of training epochs. |
 | `max_length` | `512` | Max sequence length. If `None`, uses model's default config. |

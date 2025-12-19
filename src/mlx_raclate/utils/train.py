@@ -56,21 +56,21 @@ FORCED_CHAT_TEMPLATE = """
 {%- endif -%}
 """
 
-DEFAULT_MODEL_PATH : str = "Qwen/Qwen3-Embedding-0.6B" #"./trained_models/Qwen3-Embedding-0.6B_text-classification_20251216_174716/checkpoint-14940" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
+DEFAULT_MODEL_PATH : str = "./trained_models/Qwen3-Embedding-0.6B_text-classification_20251219_001137/checkpoint-39939" #"./trained_models/Qwen3-Embedding-0.6B_text-classification_20251219_001137/checkpoint-29955" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
 DEFAULT_DATASET : str = "data/wines" # can be a local path or HF "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
-DEFAULT_BATCH_SIZE : int = 1
+DEFAULT_BATCH_SIZE : int = 8
 DEFAULT_GRADIENT_ACCUMULATION_STEPS : int = 8
 DEFAULT_TRAIN_EPOCHS : int = 2
 DEFAULT_WEIGHT_DECAY : float = 0.01
-DEFAULT_LR : float = 1e-5 # 3e-5 for ModernBERT, 5e-5 for T5Gemma, 1e-5 for Qwen
-DEFAULT_LR_SCHEDULER_TYPE : str = "cosine_decay"
-DEFAULT_MIN_LR : float = 0.0
+DEFAULT_LR : float = 2e-5 # 3e-5 for ModernBERT, 5e-5 for T5Gemma, 1e-5 for Qwen
+DEFAULT_LR_SCHEDULER_TYPE : str = "linear_schedule"
+DEFAULT_MIN_LR : float = 2e-6
 DEFAULT_WARMUP_RATIO : float = 0.03
 DEFAULT_WARMUP_STEPS : int = 0
-DEFAULT_SAVE_STEPS : int = 1000
-DEFAULT_LOGGING_STEPS : int = 16
-DEFAULT_EVAL_BATCH_SIZE : int = 4
+DEFAULT_SAVE_STEPS : int = 5000
+DEFAULT_LOGGING_STEPS : int = 64
+DEFAULT_EVAL_BATCH_SIZE : int = 8
 
 def init_args():
     parser = argparse.ArgumentParser(description="Train or evaluate a classification model using MLX Raclate.")
