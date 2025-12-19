@@ -56,7 +56,7 @@ Named Entity Recognition and Part-of-Speech tagging.
 *   **Features:** Handles label alignment for sub-word tokens automatically.
 
 
-## 📊 Data Preparation
+## Data Preparation
 
 The `datasets.py` module handles loading (JSONL, Parquet, CSV, HF Hub) and column standardization. If is built on top of HuggingFace's datasets.
 
@@ -133,7 +133,6 @@ if text_pairs is not None:
             for t, p in zip(texts, text_pairs)
         ]
         text_pairs = None
-
 ```
 
 See DataCollatorForSequenceClassification in `collators.py` for more information on text_pair handling for text-classification.
@@ -210,7 +209,6 @@ if test_ds:
     trainer.test(test_ds)
 ```
 
----
 
 ## API Reference
 
