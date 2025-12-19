@@ -23,6 +23,7 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+    "polars>=1.36.1",
     "pytest>=9.0.1",
     "ruff>=0.14.5",
     "torch>=2.9.1",
