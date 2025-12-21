@@ -20,7 +20,7 @@ app = FastAPI(
 
 model_cache = {}
 
-def get_model(model_name: str, pipeline_name: str, model_config: Optional[Dict] = None):
+def get_model(model_name: str, pipeline_name: str, config_file: Optional[Dict] = None):
     """
     Factory function to get or create the appropriate model.
     Checks cache based on name, pipeline, AND configuration.
@@ -29,7 +29,7 @@ def get_model(model_name: str, pipeline_name: str, model_config: Optional[Dict] 
     
     # Create a cache key string that includes config to differentiate 
     # e.g. LFM2 with late_interaction=True vs False
-    config_key = str(sorted(model_config.items())) if model_config else "default"
+    config_key = str(sorted(config_file.items())) if config_file else "default"
     
     current_key = f"{model_name}_{pipeline_name}_{config_key}"
     cached_key = model_cache.get("key", None)
@@ -45,13 +45,13 @@ def get_model(model_name: str, pipeline_name: str, model_config: Optional[Dict] 
         gc.collect()
         mx.metal.clear_cache()
 
-    print(f"Loading model: {model_name} | Pipeline: {pipeline_name} | Config: {model_config}")
+    print(f"Loading model: {model_name} | Pipeline: {pipeline_name} | Config: {config_file}")
     
     try:
         model, tokenizer = load(
             model_name,
             pipeline=pipeline_name,
-            model_config=model_config
+            model_config=config_file
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
@@ -80,7 +80,7 @@ class PredictionRequest(BaseModel):
     reference_text: Optional[Union[str, List[str]]] = Field(None, description="Documents/References for similarity search")
     
     # Configuration
-    model_config: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Configuration overrides (e.g., {'use_late_interaction': True})")
+    config_file: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Configuration overrides (e.g., {'use_late_interaction': True})")
     label_candidates: Optional[Union[Dict[str, str], List[str]]] = Field(None, description="For zero-shot-classification only")
 
 # -----------------------------------------------------------------------------
@@ -102,7 +102,7 @@ async def predict(request: PredictionRequest):
         raise HTTPException(status_code=400, detail="Batch size should not exceed 32 to protect memory")
 
     # Load Model
-    model_info = get_model(request.model, request.pipeline, request.model_config)
+    model_info = get_model(request.model, request.pipeline, request.config_file)
     tokenizer = model_info["tokenizer"]
     model = model_info["model"]
 
@@ -147,9 +147,9 @@ async def predict(request: PredictionRequest):
         for i, row in enumerate(probs_list):
             if id2label:
                 # Return dictionary mapping label -> score
-                item_res = {id2label[str(j)]: score for j, score in enumerate(row)}
+                item_res = [[id2label[str(j)], score] for j, score in enumerate(row)]
                 # Sort by score descending
-                item_res = dict(sorted(item_res.items(), key=lambda x: x[1], reverse=True))
+                item_res = sorted(item_res, key=lambda x: x[1], reverse=True)
                 batch_results.append(item_res)
             else:
                 # Just return raw scores (e.g. regression or missing config)
@@ -334,7 +334,7 @@ async def unload_model():
     return {"message": f"Unloaded {name}"}
 
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, workers=1)
+    uvicorn.run("mlx_raclate.utils.server:app", host="0.0.0.0", port=8000, workers=1)
 
 ### EXAMPLE
 '''
@@ -381,7 +381,7 @@ curl -X POST "http://localhost:8000/predict" \
   -d '{
     "model": "LiquidAI/LFM2-ColBERT-350M",
     "pipeline": "sentence-similarity",
-    "model_config": {
+    "config_file": {
         "use_late_interaction": true
     },
     "text": ["What is liquid AI?"],
