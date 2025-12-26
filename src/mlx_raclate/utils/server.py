@@ -208,9 +208,6 @@ async def predict(request: PredictionRequest):
             return_dict=True
         )
         
-        # Note: returning full logits is heavy. Usually this pipeline implies 
-        # looking for the mask token, but for a raw API, we might just return 
-        # a success status or specific logic. 
         # Here we return the logits for the mask token if present, else empty.
         
         mask_token_id = tokenizer.mask_token_id

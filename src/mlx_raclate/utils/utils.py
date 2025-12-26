@@ -169,7 +169,7 @@ def _initialize_head_weights(model: nn.Module, loaded_weights: dict, config: Any
     model_params = dict(tree_flatten(model.parameters()))
     
     # Keywords that identify a 'Head' or 'Classifier' layer in your architectures
-    head_keywords = ["classifier", "score", "head", "decoder"]
+    head_keywords = ["classifier", "score", "head", "decoder", "dense"]
     
     initializer_range = getattr(config, "initializer_range", 0.02)
     

@@ -158,7 +158,7 @@ def load_dataset(args: DatasetArgs) -> Tuple[Optional[HFDataset], Optional[HFDat
     if not hasattr(args, "task_type"):
         raise ValueError("Must specify task_type in args")
     
-    supported_tasks = ["text-classification", "masked-lm", "token-classification", "sentence-transformers"]
+    supported_tasks = ["text-classification", "masked-lm", "token-classification", "sentence-transformers", "sentence-similarity"]
     if args.task_type not in supported_tasks:
         raise ValueError(f"Unsupported task type: {args.task_type}")
     
