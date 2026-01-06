@@ -166,6 +166,7 @@ class DataCollatorForMaskedLanguageModeling(DataCollator):
     Handles dynamic masking for MLM.
     """
     mlm_probability: float = 0.15
+    mask_token_id: Optional[int] = None
 
     def __call__(self, features: Dict[str, List[Any]]) -> Dict[str, mx.array]:
         texts = features["text"]
@@ -181,7 +182,7 @@ class DataCollatorForMaskedLanguageModeling(DataCollator):
         input_ids = batch["input_ids"]
         
         # Create Mask
-        probability_matrix = mx.random.uniform(input_ids.shape) < self.mlm_probability
+        probability_matrix = mx.random.uniform(shape=input_ids.shape) < self.mlm_probability
         
         # Protect special tokens
         special_tokens_mask = mx.array([
@@ -196,13 +197,23 @@ class DataCollatorForMaskedLanguageModeling(DataCollator):
         labels = mx.where(probability_matrix, input_ids, -100)
         
         # Apply masking (80% mask, 10% random, 10% original)
-        random_matrix = mx.random.uniform(input_ids.shape)
+        random_matrix = mx.random.uniform(shape=input_ids.shape)
         mask_indices = (probability_matrix) & (random_matrix < 0.8)
         random_indices = (probability_matrix) & (random_matrix >= 0.8) & (random_matrix < 0.9)
         
         # Create masked input
-        masked_inputs = input_ids.copy()
-        masked_inputs = mx.where(mask_indices, self.tokenizer.mask_token_id, masked_inputs)
+        masked_inputs = input_ids
+        
+        mask_token_id = self.tokenizer.mask_token_id
+        if mask_token_id is None:
+            if self.mask_token_id is not None:
+                mask_token_id = self.mask_token_id
+            else:
+                 raise ValueError(
+                     "Tokenizer does not have a mask token defined and no mask_token_id provided."
+                 )
+
+        masked_inputs = mx.where(mask_indices, mask_token_id, masked_inputs)
         random_tokens = mx.random.randint(
             0, self.tokenizer.vocab_size, 
             shape=input_ids.shape

@@ -1,11 +1,8 @@
-import json
-import yaml
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from datasets import load_dataset as hf_load_dataset 
 from datasets import DatasetDict, ClassLabel, Sequence, Value
 from datasets import Dataset as HFDataset
-import mlx.core as mx
 
 class DatasetArgs:
     """
@@ -154,7 +151,7 @@ def get_label_mapping(dataset: HFDataset, args: DatasetArgs) -> Tuple[Optional[D
     return id2label, label2id
 
 
-def load_dataset(args: DatasetArgs) -> Tuple[Optional[HFDataset], Optional[HFDataset], Optional[HFDataset]]:
+def load_dataset(args: DatasetArgs) -> Tuple[Optional[HFDataset], Optional[HFDataset], Optional[HFDataset], Dict[str, int], Dict[int, str]]:
     if not hasattr(args, "task_type"):
         raise ValueError("Must specify task_type in args")
     

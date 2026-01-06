@@ -19,3 +19,9 @@ trained_models/
 # DEV notes
 NOTES.md
 dev_tests/
+
+# Agents
+.agent
+
+# Pytest cache
+.pytest_cache

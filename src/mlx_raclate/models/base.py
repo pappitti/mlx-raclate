@@ -12,6 +12,47 @@ class RaclateBaseModel(nn.Module):
     def get_hf_transformers_arch(self):
         return self.hf_transformers_arch if hasattr(self, "hf_transformers_arch") else None
 
+    def resize_token_embeddings(self, new_num_tokens: Optional[int] = None) -> nn.Embedding:
+        """
+        Resizes input token embeddings matrix of the model if new_num_tokens != config.vocab_size.
+        """
+        old_embeddings = self.get_input_embeddings()
+        if old_embeddings is None:
+            raise ValueError("Model does not support get_input_embeddings")
+
+        if new_num_tokens is None:
+            return old_embeddings
+
+        old_num_tokens, old_embedding_dim = old_embeddings.weight.shape
+        
+        if new_num_tokens == old_num_tokens:
+            return old_embeddings
+
+        # Create new embeddings
+        new_embeddings = nn.Embedding(new_num_tokens, old_embedding_dim)
+        
+        # Initialize new weights (e.g. Normal)
+        new_embeddings.weight = mx.random.normal(shape=(new_num_tokens, old_embedding_dim)) * 0.02
+        
+        # We copy up to the min size to handle both expansion and shrinking (though usually expansion)
+        n = min(old_num_tokens, new_num_tokens)
+       
+        # Combine old relevant weights with new random weights for the extension
+        combined_weight = mx.concatenate([
+            old_embeddings.weight[:n],
+            new_embeddings.weight[n:]
+        ], axis=0) if new_num_tokens > old_num_tokens else old_embeddings.weight[:n]
+        
+        new_embeddings.weight = combined_weight
+
+        self.set_input_embeddings(new_embeddings)
+        
+        # Update config if present
+        if hasattr(self, "config"):
+            self.config.vocab_size = new_num_tokens
+            
+        return new_embeddings
+
 @dataclass
 class BaseModelArgs:
     @classmethod

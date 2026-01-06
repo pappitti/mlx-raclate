@@ -49,6 +49,8 @@ class ModelArgs(BaseModelArgs):
     decoder_bias=True,
     classifier_dropout_rate: float = 0.0 
     classifier_bias=False
+    norm_bias : bool = False
+    norm_eps: float = 1e-05
     sparse_prediction=True ### True seems a more appropriate value for MLM
     sparse_pred_ignore_index=-100 
     is_regression: Optional[bool] = None
@@ -356,6 +358,20 @@ class T5GemmaClassificationHead(nn.Module):
             logits = mx.tanh(logits / self.soft_cap) * self.soft_cap
         return logits
 
+class T5GemmaPredictionHead(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.dense = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=False
+        )
+        self.act = nn.GELU()
+        self.layer_norm = nn.LayerNorm(config.hidden_size, bias=config.norm_bias, eps=config.norm_eps)
+
+
+    def __call__(self, hidden_states: mx.array) -> mx.array:
+        return self.layer_norm(self.act(self.dense(hidden_states)))
+
 
 class Model(RaclateBaseModel):
     def __init__(self, config: ModelArgs):
@@ -650,10 +666,10 @@ class ModelForMaskedLM(RaclateBaseModel):
     def __init__(self, config : ModelArgs):
         super().__init__()
         self.config = config
-        if not config.is_causal:
+        if config.is_causal:
             raise ValueError("ModelForMaskedLM requires bidirectional attention.")
         self.model = T5GemmaEncoder(config)
-        self.head = T5GemmaClassificationHead(config) 
+        self.head = T5GemmaPredictionHead(config) 
         self.decoder = nn.Linear(
             config.hidden_size, config.vocab_size, bias=config.decoder_bias
         )
@@ -771,7 +787,9 @@ class ModelForTokenClassification(RaclateBaseModel):
     """
     def __init__(self, config: ModelArgs):
         super().__init__()
-        self.config = config       
+        self.config = config 
+        if config.is_causal:
+            raise ValueError("ModelForTokenClassification requires bidirectional attention.")      
         self.num_labels = config.num_labels
 
         self.model = T5GemmaEncoder(config)

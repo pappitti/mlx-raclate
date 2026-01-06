@@ -4,8 +4,7 @@ import gc
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List
-from textwrap import dedent
+from typing import Optional, Dict
 from functools import partial
 
 import mlx.core as mx
@@ -17,6 +16,7 @@ from mlx.utils import tree_flatten, tree_map
 
 from .collators import DataCollator
 from .utils import EMBEDDING_LAYER_NAMES, build_schedule
+from mlx_raclate.tuner.model_card_utils import get_code_for_trained_model
 
 @dataclass
 class TrainingArgs:
@@ -67,8 +67,10 @@ class TrainingArgs:
 
 class Trainer:
     """
-    A trainer for ModernBERT that adapts to the model's training objective.
+    A trainer that adapts to the model's training objective.
     The training logic is determined by the model's class implementation.
+
+    TODO : add basemodel and upload repo arguments to upload to HF hub
     """
     def __init__(
         self,
@@ -522,6 +524,20 @@ class Trainer:
         with open(save_path / "config.json", "w") as f:
             json.dump(self.model.config.__dict__, f, indent=2)
 
+        model_card_kwargs = {
+            "pipeline": self.task_type,
+            "model_path": save_path, # TODO : replace by upload repo id
+            "base_model": self.model.config.model_type, # TODO : replace by base model name
+        }
+        if hasattr(self.model.config, "use_late_interaction"):
+            model_card_kwargs["use_late_interaction"] = self.model.config.use_late_interaction
+        if hasattr(self.model.config, "is_regression"):
+            model_card_kwargs["is_regression"] = self.model.config.is_regression
+
+        card_text = get_code_for_trained_model(**model_card_kwargs)
+        with open(save_path / "README.md", "w") as f:
+            f.write(card_text)
+
         self.tokenizer.save_pretrained(save_path)
         
         weights = dict(tree_flatten(self.model.parameters()))
@@ -533,17 +549,17 @@ class Trainer:
         with open(save_path / "metrics.json", "w") as f:
             json.dump(metrics, f, indent=2)
         
-        # Push to Hub
+        # Push to Hub (PLACEHOLDER)
         if self.args.push_to_hub:
-            print("Warning, push to hub is untested")
-            # Assumes args.output_dir is the repo name or you have a separate arg
+            ### TODO
             repo_id = self.args.output_dir.split("/")[-1] # Simple heuristic
             print(f"Pushing to hub: {repo_id}")
             upload_to_hub(
                 path=str(save_path),
                 upload_repo=repo_id,
                 hf_path=self.model.config.model_type, # Or base model name
-                task_type=self.task_type
+                task_type=self.task_type,
+                card_text=card_text
             )
         
         # Manage checkpoint rotation
@@ -566,6 +582,7 @@ def upload_to_hub(
         upload_repo: str, 
         hf_path: str,
         task_type: str,
+        card_text: str,
         ):
     """
     Uploads the model to Hugging Face hub.
@@ -588,21 +605,9 @@ def upload_to_hub(
     card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"] 
     card.data.base_model = hf_path
     card.data.task_type = task_type
-    card.text = dedent(
-        f"""
-        # {upload_repo}
-
-        This model was trained using [MLX Raclate](https://github.com/pappitti/mlx-raclate) for {task_type}.
-
-        ## Usage
-
-        ```python
-        TODO
-       
-        ```
-        """
-    )
-    # Save the model card
+    
+    card.text = card_text
+    # Overwrite README.md to add metadata
     card.save(model_path / "README.md")
 
     logging.set_verbosity_info()

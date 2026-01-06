@@ -186,16 +186,20 @@ def _initialize_head_weights(model: nn.Module, loaded_weights: dict, config: Any
                     print(f"[INFO] Initializing missing bias {key} to Zeros ({target_dtype})")
                     loaded_weights[key] = mx.zeros(param.shape, dtype=target_dtype)
                 
-                # 2. Initialize Weights to Normal (std=0.02)
-                # We skip 'norm' weights (Gamma) which should be 1.0, but usually
-                # those are covered by default init or exist in the checkpoint.
-                elif "weight" in key and "norm" not in key:
-                    print(f"[INFO] Initializing missing weight {key} with Normal(0.0, {initializer_range})  ({target_dtype})")
-                    loaded_weights[key] = mx.random.normal(
-                        param.shape, 
-                        scale=initializer_range, 
-                        dtype=target_dtype
-                    )
+                # 2. Initialize Weights
+                elif "weight" in key:
+                    # Norm weights (Gamma) should be 1.0
+                    if "norm" in key:
+                         print(f"[INFO] Initializing missing normalization weight {key} to Ones ({target_dtype})")
+                         loaded_weights[key] = mx.ones(param.shape, dtype=target_dtype)
+                    # Other weights to Normal (std=0.02)
+                    else:
+                        print(f"[INFO] Initializing missing weight {key} with Normal(0.0, {initializer_range})  ({target_dtype})")
+                        loaded_weights[key] = mx.random.normal(
+                            param.shape, 
+                            scale=initializer_range, 
+                            dtype=target_dtype
+                        )
                     
                 initialized_count += 1
 

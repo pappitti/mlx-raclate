@@ -56,7 +56,7 @@ FORCED_CHAT_TEMPLATE = """
 {%- endif -%}
 """
 
-DEFAULT_MODEL_PATH : str = "./trained_models/Qwen3-Embedding-0.6B_text-classification_20251219_001137/checkpoint-39939" #"./trained_models/Qwen3-Embedding-0.6B_text-classification_20251219_001137/checkpoint-29955" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
+DEFAULT_MODEL_PATH : str = "./trained_models/Qwen3-Embedding-0.6B_text-classification_20251219_001137/checkpoint-39939" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
 DEFAULT_DATASET : str = "data/wines" # can be a local path or HF "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
 DEFAULT_BATCH_SIZE : int = 8

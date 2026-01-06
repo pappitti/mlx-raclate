@@ -718,7 +718,7 @@ class ModelForMaskedLM(RaclateBaseModel):
     def __init__(self, config : ModelArgs):
         super().__init__()
         self.config = config
-        if not config.is_causal:
+        if config.is_causal:
             raise ValueError("ModelForMaskedLM requires bidirectional attention.")
         self.model = Gemma3Model(config)
         self.head = Gemma3PredictionHead(config) 
@@ -844,12 +844,14 @@ class ModelForTokenClassification(RaclateBaseModel):
     """
     def __init__(self, config: ModelArgs):
         super().__init__()
-        self.config = config       
+        self.config = config 
+        if config.is_causal:
+            raise ValueError("ModelForTokenClassification requires bidirectional attention.")      
         self.num_labels = config.num_labels
 
         self.model = Gemma3Model(config)
         self.drop = nn.Dropout(p=config.classifier_dropout)
-        self.score = Gemma3PredictionHead(config)
+        self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
 
         # transformers does not have TokenClassification class for Gemma3
     

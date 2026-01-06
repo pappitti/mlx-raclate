@@ -892,6 +892,9 @@ class ModelForTokenClassification(RaclateBaseModel):
             if "position_ids" in k:
                 # Remove unused position_ids
                 continue
+            if k in ["decoder.bias"]:
+                ### this is the hack
+                continue
             else:
                 sanitized_weights[k] = v
         return sanitized_weights
