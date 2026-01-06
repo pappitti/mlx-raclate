@@ -15,13 +15,13 @@
 
 ## Installation
 
-<!-- Install via `uv` or `pip`:
+Install via `uv` or `pip`:
 
 ```bash
-uv add mlx-raclate
+uv add --prerelease=allow mlx-raclate
 # or
-pip install mlx-raclate
-``` -->
+pip install --pre mlx-raclate 
+```
 
 From source:
 
@@ -145,7 +145,11 @@ When using `load()`, the `pipeline` argument determines the class and return typ
 | `token-classification` | `ModelForTokenClassification` | Token Logits | NER tasks | 
 | `zero-shot-classification` | `ModelForMaskedLM` | Token Logits | Implementation of [this AnswerAI paper](https://arxiv.org/html/2502.03793v2) |
 
-This repository includes an `example` folder showcasing pipeline usage at inference.
+Detailed code for each pipeline is available in the `test` directory of this repository. See `tests/inference_examples`.
+
+## Server
+
+`mlx-raclate` includes a FastAPI server for classifier inference. See `mlx_raclate.utils.server`
 
 ## Training (Tuner)
 

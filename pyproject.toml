@@ -1,6 +1,6 @@
 [project]
 name = "mlx-raclate"
-version = "0.1.0a1"
+version = "0.1.0b1"
 description = "Raclate is a python library to run and train models for Retrieval and Classification, built on top of MLX."
 readme = "README.md"
 authors = [
