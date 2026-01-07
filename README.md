@@ -18,9 +18,9 @@
 Install via `uv` or `pip`:
 
 ```bash
-uv add --prerelease=allow mlx-raclate
+uv add mlx-raclate
 # or
-pip install --pre mlx-raclate 
+pip install mlx-raclate 
 ```
 
 From source:
