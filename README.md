@@ -137,7 +137,7 @@ When using `load()`, the `pipeline` argument determines the class and return typ
 
 | Pipeline | Class | Output | Use Case |
 | :--- | :--- | :--- | :--- |
-| `embeddings` | `Model` | Raw Embeddings | Feature extraction |
+| `embeddings` | `Model` | Raw Embeddings (normalized)| Feature extraction |
 | `text-classification` | `ModelForSequenceClassification` | Logits/Probs | Sentiment, Intent, Regression |
 | `sentence-similarity` | `ModelForSentenceSimilarity` | Embeddings & Similarity | Semantic Search, RAG |
 | `sentence-transformers` | `ModelForSentenceTransformers` | Embeddings & Similarity | Same as `sentence-similarity` but  different sanitization strategy for Sentence Transformers weights |
@@ -196,5 +196,5 @@ trainer.train()
 
 *   [MLX](https://github.com/ml-explore/mlx) team for the framework.
 *   [Transformers](https://github.com/huggingface/transformers) for the configuration standards.
-*   [MLX-Embeddings](https://github.com/Blaizzy/mlx-embeddings) for inspiration on broader embeddings architecture. MLX-Raclate focuses on longer-context models but you should definitely look there for BERT, XLM_RoBERTa and image embeddings.
+*   [MLX-Embeddings](https://github.com/Blaizzy/mlx-embeddings) for inspiration on broader embedding architectures. MLX-Raclate focuses on longer-context models but you should definitely look there for BERT, XLM_RoBERTa and image embeddings.
 *   [PyLate](https://github.com/lightonai/pylate) for inspiration on Late Interaction mechanics.
