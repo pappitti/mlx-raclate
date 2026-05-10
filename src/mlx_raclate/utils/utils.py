@@ -77,7 +77,7 @@ def _determine_model_dtype(config: dict, loaded_weights: dict) -> mx.Dtype:
         return mx.float16
 
     # Check Torch Config
-    dtype_entry = config.get("torch_dtype", "auto")
+    dtype_entry = config.get("torch_dtype", config.get("dtype", "auto"))
     
     if isinstance(dtype_entry, str):
         dtype_entry = dtype_entry.lower()
@@ -169,7 +169,7 @@ def _initialize_head_weights(model: nn.Module, loaded_weights: dict, config: Any
     model_params = dict(tree_flatten(model.parameters()))
     
     # Keywords that identify a 'Head' or 'Classifier' layer in your architectures
-    head_keywords = ["classifier", "score", "head", "decoder", "dense"]
+    head_keywords = ["classifier", "score", "head", "decoder", "dense", "unembedding"]
     
     initializer_range = getattr(config, "initializer_range", 0.02)
     
@@ -217,7 +217,7 @@ def _verify_weights(model: nn.Module, loaded_weights: dict, train_mode: bool):
     missing_keys = [k for k in model_params.keys() if k not in loaded_weights]
     extra_keys = [k for k in loaded_weights.keys() if k not in model_params]
     
-    head_keywords = ['classifier', 'score', 'head', 'decoder']
+    head_keywords = ['classifier', 'score', 'head', 'decoder', 'unembedding']
     missing_head_keys = [k for k in missing_keys if any(x in k for x in head_keywords)]
 
     if missing_head_keys:

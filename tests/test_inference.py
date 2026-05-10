@@ -25,6 +25,7 @@ from .inference_examples import (
     sentence_similarity,
     embeddings,
     masked_lm,
+    token_classification,
     zero_shot,
 )
 
@@ -41,6 +42,24 @@ def _get_inference_params():
         )
         for model_family, pipeline, config in test_cases
     ]
+
+
+PRIVACY_FILTER_ENDPOINTS = [
+    pytest.param(
+        "openai_privacy_filter",
+        "mlx-community/openai-privacy-filter-bf16",
+        33,
+        id="openai-privacy-filter-bf16",
+        marks=[pytest.mark.slow],
+    ),
+    pytest.param(
+        "openai_privacy_filter",
+        "OpenMed/privacy-filter-nemotron-mlx",
+        221,
+        id="privacy-filter-nemotron-mlx",
+        marks=[pytest.mark.slow],
+    ),
+]
 
 
 @pytest.mark.parametrize("model_family,pipeline,endpoint_config", _get_inference_params())
@@ -117,6 +136,21 @@ def test_inference(model_family: str, pipeline: str, endpoint_config):
         for pred in result["predictions"]:
             assert "token" in pred
             assert "probability" in pred
+
+    elif pipeline == "token-classification":
+        result = token_classification.run_inference(
+            model_path=endpoint,
+            texts=["Email me at alice.smith@example.com after 5pm."],
+            model_config=model_config,
+        )
+        assert "predictions" in result
+        assert "grouped_spans" in result
+        assert "logits" in result
+        assert len(result["predictions"]) == 1
+        assert len(result["grouped_spans"]) == 1
+        assert result["logits"].shape[0] == 1
+        if result["id2label"] is not None:
+            assert result["logits"].shape[-1] == len(result["id2label"])
         
     elif pipeline == "zero-shot-classification":
         result = zero_shot.run_inference(
@@ -131,6 +165,31 @@ def test_inference(model_family: str, pipeline: str, endpoint_config):
         
     else:
         pytest.skip(f"Inference test not implemented for pipeline: {pipeline}")
+
+
+@pytest.mark.parametrize("model_family,model_path,expected_num_labels", PRIVACY_FILTER_ENDPOINTS)
+def test_privacy_filter_token_classification_endpoints(
+    model_family: str,
+    model_path: str,
+    expected_num_labels: int,
+):
+    """Exercise the published privacy-filter checkpoints directly."""
+    result = token_classification.run_inference(
+        model_path=model_path,
+        texts=["Email me at alice.smith@example.com after 5pm."],
+    )
+
+    assert "predictions" in result
+    assert "grouped_spans" in result
+    assert "logits" in result
+    assert "id2label" in result
+    assert len(result["predictions"]) == 1
+    assert len(result["grouped_spans"]) == 1
+    assert result["logits"].shape[0] == 1
+    assert result["logits"].shape[-1] == expected_num_labels
+    assert result["id2label"] is not None
+    assert len(result["id2label"]) == expected_num_labels
+    assert result["id2label"]["0"] == "O"
 
 
 def test_model_registry_coverage():
@@ -209,6 +268,16 @@ def test_masked_lm_example_code_generation():
     )
     assert "pipeline=\"masked-lm\"" in code
     assert "[MASK]" in code
+    compile(code, "<string>", "exec")
+
+
+def test_token_classification_example_code_generation():
+    """Test that token-classification example code generates valid Python."""
+    code = token_classification.get_example_code(
+        model_path="mlx-community/openai-privacy-filter-bf16",
+        texts=["Email me at alice.smith@example.com after 5pm."],
+    )
+    assert "pipeline=\"token-classification\"" in code
     compile(code, "<string>", "exec")
 
 

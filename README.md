@@ -40,6 +40,7 @@ uv sync
 *   **Qwen3 Embedding**: (e.g., `Qwen/Qwen3-Embedding-0.6B`)
 *   **Gemma3 Embedding**: (e.g., `google/embeddinggemma-300m`)
 *   **T5Gemma Encoder**: stripping out the decoder part of T5Gemma models (e.g, `google/t5gemma-2b-2b-ul2`)
+*   **OpenAI Privacy Filter**: bidirectional token classification for PII detection (e.g., `OpenMed/privacy-filter-nemotron-mlx`)
 
 ## Inference: Quick Start
 

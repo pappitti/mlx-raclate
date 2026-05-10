@@ -1,6 +1,21 @@
 import mlx.core as mx
 from typing import List, Dict, Any, Optional
 
+from mlx_raclate.utils.token_classification import (
+    decode_token_classification_batch,
+    viterbi_decode_bioes_batch,
+)
+
+
+def _ordered_label_names(id2label: Dict[Any, str], num_labels: int) -> List[str]:
+    ordered = []
+    for index in range(num_labels):
+        if str(index) in id2label:
+            ordered.append(id2label[str(index)])
+        else:
+            ordered.append(id2label[index])
+    return ordered
+
 def run_inference(
     model_path: str,
     texts: List[str],
@@ -17,6 +32,7 @@ def run_inference(
     Returns:
         Dictionary containing:
         - predictions: List of token-level predictions per input
+        - grouped_spans: BIOES-decoded grouped spans per input
         - id2label: Label mapping (if available)
     """
     from mlx_raclate.utils.utils import load
@@ -54,27 +70,66 @@ def run_inference(
     )
     
     logits = outputs["logits"]
+    probabilities = outputs["probabilities"]
+    label_names = None
+    decoded_label_ids = None
+
+    if id2label is not None:
+        label_names = _ordered_label_names(id2label, logits.shape[-1])
+        special_tokens_mask = None
+        if offset_mapping is not None:
+            special_tokens_mask = [
+                [int(start) >= int(end) for start, end in sequence_offsets.tolist()]
+                for sequence_offsets in offset_mapping
+            ]
+        decoded_label_ids = viterbi_decode_bioes_batch(
+            emissions=logits.tolist(),
+            label_names=label_names,
+            special_tokens_mask=special_tokens_mask,
+        )
     
     # Get predictions
     predictions = []
+    grouped_labels = []
+    grouped_scores = []
     for i in range(logits.shape[0]):
-        token_logits = logits[i]
-        token_predictions = mx.argmax(token_logits, axis=-1)
+        if decoded_label_ids is None:
+            token_prediction_ids = mx.argmax(logits[i], axis=-1).tolist()
+        else:
+            token_prediction_ids = decoded_label_ids[i]
         
         pred_list = []
-        for j, pred_idx in enumerate(token_predictions.tolist()):
+        label_list = []
+        score_list = []
+        for j, pred_idx in enumerate(token_prediction_ids):
             token = tokenizer.decode([tokens["input_ids"][i][j].item()])
             label = id2label[str(pred_idx)] if id2label else str(pred_idx)
+            score = float(probabilities[i, j, pred_idx].item())
             pred_list.append({
                 "token": token,
                 "label": label,
                 "label_id": pred_idx,
+                "score": score,
             })
+            label_list.append(label)
+            score_list.append(score)
         
         predictions.append(pred_list)
+        grouped_labels.append(label_list)
+        grouped_scores.append(score_list)
+
+    grouped_spans = None
+    if offset_mapping is not None:
+        grouped_spans = decode_token_classification_batch(
+            texts=texts,
+            offsets=offset_mapping.tolist(),
+            labels=grouped_labels,
+            scores=grouped_scores,
+        )
     
     return {
         "predictions": predictions,
+        "grouped_spans": grouped_spans,
         "id2label": id2label,
         "logits": logits,
     }
@@ -114,15 +169,32 @@ logits = outputs["logits"]
 predictions = mx.argmax(logits, axis=-1)
 id2label = model.config.id2label
 
-# Process and print results
+# Process and print grouped spans
 for i, text in enumerate(texts):
     print(f"Text: {{text}}")
-    print("Token predictions:")
-    for j, pred_idx in enumerate(predictions[i].tolist()):
-        token = tokenizer.decode([tokens["input_ids"][i][j].item()])
-        label = id2label[str(pred_idx)] if id2label else str(pred_idx)
-        if label != "O":  # Skip non-entity tokens
-            print(f"  {{token}}: {{label}}")
+    labels = [id2label[str(index)] for index in range(logits.shape[-1])]
+    offsets = tokenizer._tokenizer(
+        [text],
+        return_tensors="mlx",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+        return_offsets_mapping=True,
+    )["offset_mapping"][0].tolist()
+
+    from mlx_raclate.utils.token_classification import decode_bioes_spans, viterbi_decode_bioes_ids
+    decoded_ids = viterbi_decode_bioes_ids(
+        logits[i].tolist(),
+        labels,
+        special_tokens_mask=[start >= end for start, end in offsets],
+    )
+    decoded_labels = [labels[pred_idx] for pred_idx in decoded_ids]
+    scores = [float(outputs["probabilities"][i, j, pred_idx].item()) for j, pred_idx in enumerate(decoded_ids)]
+    spans = decode_bioes_spans(text, offsets, decoded_labels, scores)
+
+    print("Grouped spans:")
+    for span in spans:
+        print(f"  {{span['entity_group']}}: {{span['word']!r}} [{{span['start']}}, {{span['end']}}] score={{span['score']:.3f}}")
     print()
 '''
 
