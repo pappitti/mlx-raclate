@@ -42,33 +42,6 @@ def test_openai_privacy_filter_tiny_forward():
     assert outputs["loss"] is not None
 
 
-def test_openai_privacy_filter_sanitize_openmed_layout():
-    model = ModelForTokenClassification(_tiny_config())
-    sinks = mx.array([1.0, 2.0, 3.0, 4.0], dtype=mx.float32)
-
-    sanitized = model.sanitize(
-        {
-            "embedding.weight": mx.zeros((128, 32), dtype=mx.float32),
-            "block.0.attn.norm.scale": mx.ones((32,), dtype=mx.float32),
-            "block.0.attn.sinks": sinks,
-            "block.0.mlp.norm.scale": mx.ones((32,), dtype=mx.float32),
-            "block.0.mlp.swiglu.weight": mx.zeros((4, 32, 32), dtype=mx.float32),
-            "block.0.mlp.out.weight": mx.zeros((4, 16, 32), dtype=mx.float32),
-            "unembedding.weight": mx.zeros((5, 32), dtype=mx.float32),
-        }
-    )
-
-    assert "model.embed_tokens.weight" in sanitized
-    assert "model.layers.0.input_layernorm.scale" in sanitized
-    assert "model.layers.0.self_attn.sinks" in sanitized
-    assert "model.layers.0.post_attention_layernorm.scale" in sanitized
-    assert "model.layers.0.mlp.experts.gate_up_proj" in sanitized
-    assert "model.layers.0.mlp.experts.down_proj" in sanitized
-    assert "unembedding.weight" in sanitized
-    delta = mx.max(mx.abs(sanitized["model.layers.0.self_attn.sinks"] - sinks))
-    assert float(delta.item()) < 1e-6
-
-
 def test_openai_privacy_filter_sanitize_hf_attention_weights():
     config = _tiny_config()
     model = ModelForTokenClassification(config)
@@ -86,9 +59,10 @@ def test_openai_privacy_filter_sanitize_hf_attention_weights():
             "model.layers.0.self_attn.v_proj.weight": v,
             "model.layers.0.input_layernorm.weight": mx.ones((config.hidden_size,), dtype=mx.float32),
             "model.layers.0.post_attention_layernorm.weight": mx.ones((config.hidden_size,), dtype=mx.float32),
+            "model.layers.0.mlp.router.weight": mx.zeros((config.num_local_experts, config.hidden_size), dtype=mx.float32),
             "model.layers.0.mlp.experts.gate_up_proj": gate_up,
             "model.layers.0.mlp.experts.down_proj": down,
-            "unembedding.weight": mx.zeros((config.num_labels, config.hidden_size), dtype=mx.float32),
+            "score.weight": mx.zeros((config.num_labels, config.hidden_size), dtype=mx.float32),
         }
     )
 
@@ -98,10 +72,13 @@ def test_openai_privacy_filter_sanitize_hf_attention_weights():
     assert float(sanitized["model.layers.0.self_attn.q_proj.weight"][0, 0].item()) == 1.0
     assert float(sanitized["model.layers.0.self_attn.k_proj.weight"][0, 0].item()) == 2.0
     assert float(sanitized["model.layers.0.self_attn.v_proj.weight"][0, 0].item()) == 3.0
-    assert "model.layers.0.input_layernorm.scale" in sanitized
-    assert "model.layers.0.post_attention_layernorm.scale" in sanitized
+    assert "model.layers.0.input_layernorm.weight" in sanitized
+    assert "model.layers.0.post_attention_layernorm.weight" in sanitized
+    assert "model.layers.0.mlp.router.weight" in sanitized
     assert "model.layers.0.mlp.experts.gate_up_proj" in sanitized
     assert "model.layers.0.mlp.experts.down_proj" in sanitized
+    assert "score.weight" in sanitized
+    assert "score.bias" in sanitized
 
 
 def test_openai_privacy_filter_sanitize_targets_existing_parameters():
@@ -110,49 +87,34 @@ def test_openai_privacy_filter_sanitize_targets_existing_parameters():
 
     sanitized = model.sanitize(
         {
-            "block.0.attn.norm.scale": mx.ones((32,), dtype=mx.float32),
-            "block.0.mlp.swiglu.bias": mx.zeros((4, 32), dtype=mx.float32),
-            "block.0.mlp.out.bias": mx.zeros((4, 32), dtype=mx.float32),
+            "model.layers.0.input_layernorm.weight": mx.ones((32,), dtype=mx.float32),
+            "model.layers.0.mlp.router.bias": mx.zeros((4,), dtype=mx.float32),
             "score.weight": mx.zeros((5, 32), dtype=mx.float32),
             "score.bias": mx.zeros((5,), dtype=mx.float32),
+            "classifier.weight": mx.zeros((5, 32), dtype=mx.float32),
         }
     )
 
     assert set(sanitized) <= param_names
 
 
-def test_openai_privacy_filter_sanitize_openmed_layout_loads_strictly():
+def test_openai_privacy_filter_sanitize_hf_layout_loads_strictly():
     model = ModelForTokenClassification(_tiny_config())
-    openmed_weights = {}
+    hf_weights = {
+        name: mx.zeros(value.shape, dtype=value.dtype)
+        for name, value in tree_flatten(model.parameters())
+    }
+    hf_weights["model.rotary_emb.inv_freq"] = mx.zeros((4,), dtype=mx.float32)
 
-    for name, value in tree_flatten(model.parameters()):
-        key = name
-        if key.startswith("model."):
-            key = key.removeprefix("model.")
-            key = key.replace("embed_tokens.weight", "embedding.weight")
-            key = key.replace(".self_attn.o_proj.", ".attn.out.")
-            key = key.replace(".self_attn.q_proj.", ".attn.q_proj.")
-            key = key.replace(".self_attn.k_proj.", ".attn.k_proj.")
-            key = key.replace(".self_attn.v_proj.", ".attn.v_proj.")
-            key = key.replace(".self_attn.sinks", ".attn.sinks")
-            key = key.replace(".input_layernorm.scale", ".attn.norm.scale")
-            key = key.replace(".post_attention_layernorm.scale", ".mlp.norm.scale")
-            key = key.replace(".mlp.experts.gate_up_proj_bias", ".mlp.swiglu.bias")
-            key = key.replace(".mlp.experts.gate_up_proj", ".mlp.swiglu.weight")
-            key = key.replace(".mlp.experts.down_proj_bias", ".mlp.out.bias")
-            key = key.replace(".mlp.experts.down_proj", ".mlp.out.weight")
-            key = key.replace("layers.", "block.")
-        openmed_weights[key] = mx.zeros(value.shape, dtype=value.dtype)
-
-    sanitized = model.sanitize(openmed_weights)
+    sanitized = model.sanitize(hf_weights)
     model.load_weights(list(sanitized.items()))
 
 
-def test_loader_helpers_treat_unembedding_as_pipeline_head():
+def test_loader_helpers_treat_score_as_pipeline_head():
     model = ModelForTokenClassification(_tiny_config())
     weights = dict(tree_flatten(model.parameters()))
-    weights.pop("unembedding.weight")
-    weights.pop("unembedding.bias")
+    weights.pop("score.weight")
+    weights.pop("score.bias")
 
     with pytest.raises(ValueError, match="pipeline head"):
         _verify_weights(model, weights, train_mode=False)
@@ -160,5 +122,5 @@ def test_loader_helpers_treat_unembedding_as_pipeline_head():
     _verify_weights(model, weights, train_mode=True)
     _initialize_head_weights(model, weights, model.config, target_dtype=mx.float32)
 
-    assert "unembedding.weight" in weights
-    assert "unembedding.bias" in weights
+    assert "score.weight" in weights
+    assert "score.bias" in weights

@@ -3,6 +3,7 @@ import pytest
 from mlx_raclate.utils.token_classification import (
     decode_bioes_spans,
     decode_token_classification_batch,
+    postprocess_token_classification_output,
     viterbi_decode_bioes_ids,
 )
 
@@ -25,7 +26,7 @@ def test_decode_bioes_spans_groups_multi_token_entity():
 
 def test_decode_bioes_spans_handles_singleton_and_special_tokens():
     text = "Email alice@example.com"
-    offsets = [(0, 0), (0, 5), (6, 23), (0, 0)]
+    offsets = [(0, 0), (0, 5), (5, 23), (0, 0)]
     labels = ["O", "O", "S-private_email", "O"]
     scores = [0.0, 0.2, 0.95, 0.0]
 
@@ -101,3 +102,52 @@ def test_viterbi_decode_bioes_ids_forces_special_tokens_to_outside():
     )
 
     assert decoded == [0, 4]
+
+
+def test_viterbi_decode_bioes_ids_applies_transition_biases():
+    label_names = ["O", "B-email", "E-email", "S-email"]
+    emissions = [
+        [1.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+    ]
+
+    decoded = viterbi_decode_bioes_ids(
+        emissions,
+        label_names,
+        transition_biases={"transition_bias_background_to_start": 3.0},
+    )
+
+    assert decoded == [0, 3]
+
+
+def test_postprocess_token_classification_output_decodes_predictions_and_spans():
+    id2label = {
+        "0": "O",
+        "1": "B-private_person",
+        "2": "E-private_person",
+        "3": "S-private_email",
+    }
+    logits = [
+        [
+            [5.0, 0.0, 0.0, 0.0],
+            [0.0, 5.0, 0.0, 0.0],
+            [0.0, 0.0, 5.0, 0.0],
+            [5.0, 0.0, 0.0, 0.0],
+        ]
+    ]
+    text = "Hi Alice Smith"
+    offsets = [[(0, 2), (2, 8), (8, 14), (0, 0)]]
+
+    result = postprocess_token_classification_output(
+        logits=logits,
+        id2label=id2label,
+        texts=[text],
+        offsets=offsets,
+    )
+
+    assert result["decoded_label_ids"] == [[0, 1, 2, 0]]
+    assert result["predictions"][0][1]["label"] == "B-private_person"
+    assert result["grouped_spans"][0][0]["entity_group"] == "private_person"
+    assert result["grouped_spans"][0][0]["word"] == "Alice Smith"
+    assert result["grouped_spans"][0][0]["start"] == 3
+    assert result["grouped_spans"][0][0]["end"] == 14

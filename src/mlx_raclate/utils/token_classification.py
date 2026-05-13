@@ -1,7 +1,36 @@
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import math
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 _INVALID_PATH_SCORE = -1e12
+VITERBI_BIAS_KEYS = (
+    "transition_bias_background_stay",
+    "transition_bias_background_to_start",
+    "transition_bias_inside_to_continue",
+    "transition_bias_inside_to_end",
+    "transition_bias_end_to_background",
+    "transition_bias_end_to_start",
+)
+
+
+def zero_viterbi_transition_biases() -> Dict[str, float]:
+    return {key: 0.0 for key in VITERBI_BIAS_KEYS}
+
+
+def _resolve_viterbi_transition_biases(
+    transition_biases: Optional[Mapping[str, float]] = None,
+) -> Dict[str, float]:
+    resolved = zero_viterbi_transition_biases()
+    if transition_biases is None:
+        return resolved
+
+    for key, value in transition_biases.items():
+        if key not in resolved:
+            raise ValueError(f"Unknown Viterbi transition bias: {key}")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Viterbi transition bias {key} must be numeric")
+        resolved[key] = float(value)
+    return resolved
 
 
 def _split_bioes_label(label: str) -> Tuple[Optional[str], str]:
@@ -96,11 +125,49 @@ def _is_valid_transition(previous_label: str, current_label: str, scheme: str) -
     return current_prefix == "B"
 
 
+def _transition_bias(
+    previous_label: str,
+    current_label: str,
+    scheme: str,
+    transition_biases: Mapping[str, float],
+) -> float:
+    if scheme != "BIOES":
+        return 0.0
+
+    previous_prefix, previous_entity = _split_bioes_label(previous_label)
+    current_prefix, current_entity = _split_bioes_label(current_label)
+    previous_is_background = previous_label == "O" or previous_prefix is None
+    current_is_background = current_label == "O" or current_prefix is None
+
+    if previous_is_background:
+        if current_is_background:
+            return transition_biases["transition_bias_background_stay"]
+        if current_prefix in {"B", "S"}:
+            return transition_biases["transition_bias_background_to_start"]
+        return 0.0
+
+    if previous_prefix in {"B", "I"} and previous_entity == current_entity:
+        if current_prefix == "I":
+            return transition_biases["transition_bias_inside_to_continue"]
+        if current_prefix == "E":
+            return transition_biases["transition_bias_inside_to_end"]
+        return 0.0
+
+    if previous_prefix in {"E", "S"}:
+        if current_is_background:
+            return transition_biases["transition_bias_end_to_background"]
+        if current_prefix in {"B", "S"}:
+            return transition_biases["transition_bias_end_to_start"]
+
+    return 0.0
+
+
 def viterbi_decode_bioes_ids(
     emissions: Sequence[Sequence[float]],
     label_names: Sequence[str],
     special_tokens_mask: Optional[Sequence[bool]] = None,
     outside_label: str = "O",
+    transition_biases: Optional[Mapping[str, float]] = None,
 ) -> List[int]:
     """Decode a single label sequence with BIO/BIOES transition constraints."""
     if not emissions:
@@ -121,6 +188,7 @@ def viterbi_decode_bioes_ids(
     num_labels = len(label_names)
     num_tokens = len(emissions)
     special_mask = list(special_tokens_mask or [])
+    biases = _resolve_viterbi_transition_biases(transition_biases)
 
     scores = [[_INVALID_PATH_SCORE] * num_labels for _ in range(num_tokens)]
     backpointers = [[-1] * num_labels for _ in range(num_tokens)]
@@ -154,7 +222,11 @@ def viterbi_decode_bioes_ids(
                 if not _is_valid_transition(previous_label, current_label, scheme):
                     continue
 
-                candidate_score = previous_score + emission_score
+                candidate_score = (
+                    previous_score
+                    + _transition_bias(previous_label, current_label, scheme, biases)
+                    + emission_score
+                )
                 if candidate_score > best_score:
                     best_score = candidate_score
                     best_previous_index = previous_index
@@ -197,6 +269,7 @@ def viterbi_decode_bioes_batch(
     label_names: Sequence[str],
     special_tokens_mask: Optional[Sequence[Sequence[bool]]] = None,
     outside_label: str = "O",
+    transition_biases: Optional[Mapping[str, float]] = None,
 ) -> List[List[int]]:
     """Decode a batch of label sequences with BIO/BIOES transition constraints."""
     decoded: List[List[int]] = []
@@ -207,9 +280,23 @@ def viterbi_decode_bioes_batch(
                 label_names=label_names,
                 special_tokens_mask=None if special_tokens_mask is None else special_tokens_mask[index],
                 outside_label=outside_label,
+                transition_biases=transition_biases,
             )
         )
     return decoded
+
+
+def ordered_label_names(id2label: Mapping[Any, str], num_labels: int) -> List[str]:
+    """Return label names ordered by numeric class id."""
+    ordered = []
+    for index in range(num_labels):
+        if index in id2label:
+            ordered.append(id2label[index])
+        elif str(index) in id2label:
+            ordered.append(id2label[str(index)])
+        else:
+            raise KeyError(f"id2label is missing label id {index}")
+    return ordered
 
 
 def decode_bioes_spans(
@@ -218,6 +305,8 @@ def decode_bioes_spans(
     labels: Sequence[str],
     scores: Optional[Sequence[float]] = None,
     score_aggregation: str = "mean",
+    trim_span_whitespace: bool = True,
+    discard_overlapping: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Decode BIOES token labels into grouped entity spans.
@@ -228,13 +317,36 @@ def decode_bioes_spans(
     spans: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
 
+    def append_span(entity_group: str, start: int, end: int, span_scores: Sequence[float]):
+        if trim_span_whitespace:
+            while start < end and text[start].isspace():
+                start += 1
+            while end > start and text[end - 1].isspace():
+                end -= 1
+
+        if end <= start:
+            return
+
+        spans.append(
+            {
+                "entity_group": entity_group,
+                "score": _aggregate_scores(span_scores, score_aggregation),
+                "word": text[start:end],
+                "start": start,
+                "end": end,
+            }
+        )
+
     def flush_current():
         nonlocal current
         if current is None:
             return
-        current["score"] = _aggregate_scores(current.pop("_scores"), score_aggregation)
-        current["word"] = text[current["start"] : current["end"]]
-        spans.append(current)
+        append_span(
+            entity_group=current["entity_group"],
+            start=current["start"],
+            end=current["end"],
+            span_scores=current.pop("_scores"),
+        )
         current = None
 
     for index, raw_offset in enumerate(offsets):
@@ -257,28 +369,12 @@ def decode_bioes_spans(
 
         if prefix is None:
             flush_current()
-            spans.append(
-                {
-                    "entity_group": entity_group,
-                    "score": 0.0 if score is None else score,
-                    "word": text[start:end],
-                    "start": start,
-                    "end": end,
-                }
-            )
+            append_span(entity_group, start, end, [] if score is None else [score])
             continue
 
         if prefix == "S":
             flush_current()
-            spans.append(
-                {
-                    "entity_group": entity_group,
-                    "score": 0.0 if score is None else score,
-                    "word": text[start:end],
-                    "start": start,
-                    "end": end,
-                }
-            )
+            append_span(entity_group, start, end, [] if score is None else [score])
             continue
 
         if prefix == "B":
@@ -308,7 +404,21 @@ def decode_bioes_spans(
             flush_current()
 
     flush_current()
+    if discard_overlapping:
+        spans = _discard_overlapping_spans(spans)
     return spans
+
+
+def _discard_overlapping_spans(spans: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ordered = sorted(spans, key=lambda span: (span["start"], -(span["end"] - span["start"]), span["entity_group"]))
+    kept: List[Dict[str, Any]] = []
+    cursor = 0
+    for span in ordered:
+        if span["start"] < cursor or span["end"] <= span["start"]:
+            continue
+        kept.append(dict(span))
+        cursor = span["end"]
+    return kept
 
 
 def decode_token_classification_batch(
@@ -317,6 +427,8 @@ def decode_token_classification_batch(
     labels: Sequence[Sequence[str]],
     scores: Optional[Sequence[Sequence[float]]] = None,
     score_aggregation: str = "mean",
+    trim_span_whitespace: bool = True,
+    discard_overlapping: bool = False,
 ) -> List[List[Dict[str, Any]]]:
     """Decode a batch of token-classification predictions into grouped spans."""
     decoded: List[List[Dict[str, Any]]] = []
@@ -328,6 +440,132 @@ def decode_token_classification_batch(
                 labels=labels[index],
                 scores=None if scores is None else scores[index],
                 score_aggregation=score_aggregation,
+                trim_span_whitespace=trim_span_whitespace,
+                discard_overlapping=discard_overlapping,
             )
         )
     return decoded
+
+
+def _to_list(value):
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return value
+
+
+def _softmax(values: Sequence[float]) -> List[float]:
+    if not values:
+        return []
+    max_value = max(float(value) for value in values)
+    exps = [math.exp(float(value) - max_value) for value in values]
+    total = sum(exps)
+    if total == 0.0:
+        return [0.0 for _ in exps]
+    return [value / total for value in exps]
+
+
+def _softmax_batch(logits: Sequence[Sequence[Sequence[float]]]) -> List[List[List[float]]]:
+    return [[_softmax(token_logits) for token_logits in sequence] for sequence in logits]
+
+
+def postprocess_token_classification_output(
+    *,
+    logits,
+    id2label: Optional[Mapping[Any, str]] = None,
+    probabilities=None,
+    texts: Optional[Sequence[str]] = None,
+    offsets: Optional[Sequence[Sequence[Sequence[int] | Tuple[int, int]]]] = None,
+    special_tokens_mask: Optional[Sequence[Sequence[bool]]] = None,
+    decode_mode: str = "viterbi",
+    transition_biases: Optional[Mapping[str, float]] = None,
+    score_aggregation: str = "mean",
+    trim_span_whitespace: bool = True,
+    discard_overlapping: bool = False,
+) -> Dict[str, Any]:
+    """
+    Convert token-classification logits into token predictions and grouped spans.
+
+    `logits` and `probabilities` can be MLX arrays, NumPy-like arrays, or nested
+    Python sequences with shape `[batch, sequence, labels]`.
+    """
+    logits_list = _to_list(logits)
+    if not logits_list:
+        return {
+            "predictions": [],
+            "grouped_spans": [] if texts is not None and offsets is not None else None,
+            "decoded_label_ids": [],
+            "label_names": [],
+        }
+
+    probabilities_list = _to_list(probabilities) if probabilities is not None else _softmax_batch(logits_list)
+    num_labels = len(logits_list[0][0]) if logits_list and logits_list[0] else 0
+    label_names = (
+        ordered_label_names(id2label, num_labels)
+        if id2label is not None
+        else [str(index) for index in range(num_labels)]
+    )
+
+    if special_tokens_mask is None and offsets is not None:
+        special_tokens_mask = [
+            [int(start) >= int(end) for start, end in sequence_offsets]
+            for sequence_offsets in offsets
+        ]
+
+    if decode_mode == "viterbi" and id2label is not None:
+        decoded_label_ids = viterbi_decode_bioes_batch(
+            emissions=logits_list,
+            label_names=label_names,
+            special_tokens_mask=special_tokens_mask,
+            transition_biases=transition_biases,
+        )
+    elif decode_mode == "argmax" or id2label is None:
+        decoded_label_ids = [
+            [_argmax_index(token_logits) for token_logits in sequence_logits]
+            for sequence_logits in logits_list
+        ]
+    else:
+        raise ValueError(f"Unsupported decode_mode: {decode_mode!r}")
+
+    predictions: List[List[Dict[str, Any]]] = []
+    grouped_labels: List[List[str]] = []
+    grouped_scores: List[List[float]] = []
+    for sequence_index, sequence_ids in enumerate(decoded_label_ids):
+        sequence_predictions: List[Dict[str, Any]] = []
+        sequence_labels: List[str] = []
+        sequence_scores: List[float] = []
+
+        for token_index, label_id in enumerate(sequence_ids):
+            label = label_names[int(label_id)]
+            score = float(probabilities_list[sequence_index][token_index][int(label_id)])
+            sequence_predictions.append(
+                {
+                    "label": label,
+                    "label_id": int(label_id),
+                    "score": score,
+                }
+            )
+            sequence_labels.append(label)
+            sequence_scores.append(score)
+
+        predictions.append(sequence_predictions)
+        grouped_labels.append(sequence_labels)
+        grouped_scores.append(sequence_scores)
+
+    grouped_spans = None
+    if texts is not None and offsets is not None:
+        grouped_spans = decode_token_classification_batch(
+            texts=texts,
+            offsets=offsets,
+            labels=grouped_labels,
+            scores=grouped_scores,
+            score_aggregation=score_aggregation,
+            trim_span_whitespace=trim_span_whitespace,
+            discard_overlapping=discard_overlapping,
+        )
+
+    return {
+        "predictions": predictions,
+        "grouped_spans": grouped_spans,
+        "decoded_label_ids": decoded_label_ids,
+        "label_names": label_names,
+    }

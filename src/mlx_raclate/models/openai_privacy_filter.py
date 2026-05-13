@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
 import math
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -243,14 +242,14 @@ def _get_rope_parameters(config: ModelArgs) -> Tuple[mx.array, float]:
 class OpenAIPrivacyFilterRMSNorm(nn.Module):
 	def __init__(self, dims: int, eps: float = 1e-5):
 		super().__init__()
-		self.scale = mx.ones((dims,))
+		self.weight = mx.ones((dims,))
 		self.eps = eps
 
 	def __call__(self, hidden_states: mx.array) -> mx.array:
 		hidden_states_f32 = hidden_states.astype(mx.float32)
 		variance = mx.mean(hidden_states_f32 * hidden_states_f32, axis=-1, keepdims=True)
 		normalized = hidden_states_f32 * mx.rsqrt(variance + self.eps)
-		return (normalized * self.scale.astype(mx.float32)).astype(hidden_states.dtype)
+		return (normalized * self.weight.astype(mx.float32)).astype(hidden_states.dtype)
 
 
 class OpenAIPrivacyFilterRotaryEmbedding(nn.Module):
@@ -474,13 +473,13 @@ class OpenAIPrivacyFilterMLP(nn.Module):
 	def __init__(self, config: ModelArgs):
 		super().__init__()
 		self.num_experts = config.num_experts_per_tok
-		self.gate = OpenAIPrivacyFilterTopKRouter(config)
+		self.router = OpenAIPrivacyFilterTopKRouter(config)
 		self.experts = OpenAIPrivacyFilterExperts(config)
 
 	def __call__(self, hidden_states: mx.array) -> Tuple[mx.array, mx.array]:
 		batch_size, sequence_length, hidden_dim = hidden_states.shape
 		flat_states = hidden_states.reshape(-1, hidden_dim)
-		router_logits, router_scores, router_indices = self.gate(flat_states)
+		router_logits, router_scores, router_indices = self.router(flat_states)
 		next_states = self.experts(flat_states, router_indices, router_scores)
 		next_states = (next_states * self.num_experts).reshape(batch_size, sequence_length, hidden_dim) # mlx-embeddings uses  y = y * mx.expand_dims(weights, axis=-1) return y.sum(axis=-2)
 		return next_states.astype(hidden_states.dtype), router_logits.reshape(batch_size, sequence_length, -1)
@@ -600,59 +599,6 @@ class OpenAIPrivacyFilterModel(nn.Module):
 		}
 
 
-def _remap_openmed_mlx_key(key: str) -> Optional[str]:
-	"""Map OpenMed/mlx-embeddings privacy-filter keys to this module tree."""
-	body = key[6:] if key.startswith("model.") else key
-
-	if body.startswith("unembedding."):
-		return body
-
-	if not body.startswith(("embedding.", "block.", "norm.")):
-		return None
-
-	if body == "embedding.weight":
-		return "model.embed_tokens.weight"
-
-	if body == "norm.scale":
-		return "model.norm.scale"
-
-	match = re.match(r"^block\.(\d+)\.attn\.norm\.scale$", body)
-	if match:
-		return f"model.layers.{match.group(1)}.input_layernorm.scale"
-
-	match = re.match(r"^block\.(\d+)\.mlp\.norm\.scale$", body)
-	if match:
-		return f"model.layers.{match.group(1)}.post_attention_layernorm.scale"
-
-	match = re.match(r"^block\.(\d+)\.attn\.out\.(weight|bias)$", body)
-	if match:
-		return f"model.layers.{match.group(1)}.self_attn.o_proj.{match.group(2)}"
-
-	match = re.match(r"^block\.(\d+)\.attn\.sinks$", body)
-	if match:
-		return f"model.layers.{match.group(1)}.self_attn.sinks"
-
-	match = re.match(r"^block\.(\d+)\.attn\.(q|k|v|o)_proj\.(weight|bias)$", body)
-	if match:
-		return f"model.layers.{match.group(1)}.self_attn.{match.group(2)}_proj.{match.group(3)}"
-
-	match = re.match(r"^block\.(\d+)\.mlp\.(?:gate|router)\.(weight|bias)$", body)
-	if match:
-		return f"model.layers.{match.group(1)}.mlp.gate.{match.group(2)}"
-
-	match = re.match(r"^block\.(\d+)\.mlp\.swiglu\.(weight|bias)$", body)
-	if match:
-		suffix = "_bias" if match.group(2) == "bias" else ""
-		return f"model.layers.{match.group(1)}.mlp.experts.gate_up_proj{suffix}"
-
-	match = re.match(r"^block\.(\d+)\.mlp\.out\.(weight|bias)$", body)
-	if match:
-		suffix = "_bias" if match.group(2) == "bias" else ""
-		return f"model.layers.{match.group(1)}.mlp.experts.down_proj{suffix}"
-
-	return f"model.{body}"
-
-
 def _sanitize_weights(weights: Dict[str, Any], include_head: bool) -> Dict[str, Any]:
 	sanitized: Dict[str, Any] = {}
 
@@ -660,98 +606,24 @@ def _sanitize_weights(weights: Dict[str, Any], include_head: bool) -> Dict[str, 
 		if "position_ids" in key or key.endswith("rotary_emb.inv_freq"):
 			continue
 
-		mapped_key = _remap_openmed_mlx_key(key)
-		if mapped_key is not None:
-			if include_head or not mapped_key.startswith("unembedding."):
-				sanitized[mapped_key] = value
+		if key.startswith("model."):
+			sanitized[key] = value
+			continue
+
+		if include_head and key.startswith("score."):
+			sanitized[key] = value
+			continue
+
+		if include_head and key.startswith("classifier."):
+			sanitized[f"score.{key.removeprefix('classifier.')}"] = value
 			continue
 
 		if include_head and key.startswith("unembedding."):
-			sanitized[key] = value
+			sanitized[f"score.{key.removeprefix('unembedding.')}"] = value
 			continue
 
-		if key == "model.embed_tokens.weight":
-			sanitized[key] = value
-			continue
-
-		if key == "model.norm.scale":
-			sanitized[key] = value
-			continue
-
-		if key == "model.norm.weight":
-			sanitized["model.norm.scale"] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.input_layernorm\.weight$", key)
-		if match:
-			sanitized[f"model.layers.{match.group(1)}.input_layernorm.scale"] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.post_attention_layernorm\.weight$", key)
-		if match:
-			sanitized[f"model.layers.{match.group(1)}.post_attention_layernorm.scale"] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$", key)
-		if match:
-			sanitized[key] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.self_attn\.sinks$", key)
-		if match:
-			sanitized[key] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.self_attn\.out\.(weight|bias)$", key)
-		if match:
-			sanitized[f"model.layers.{match.group(1)}.self_attn.o_proj.{match.group(2)}"] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.self_attn\.(q|k|v)_proj\.(weight|bias)$", key)
-		if match:
-			sanitized[key] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.mlp\.router\.(weight|bias)$", key)
-		if match:
-			sanitized[f"model.layers.{match.group(1)}.mlp.gate.{match.group(2)}"] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.mlp\.gate\.(weight|bias)$", key)
-		if match:
-			sanitized[key] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj(?:\.weight)?$", key)
-		if match:
-			sanitized[f"model.layers.{match.group(1)}.mlp.experts.gate_up_proj"] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj_bias$", key)
-		if match:
-			sanitized[key] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.mlp\.experts\.down_proj(?:\.weight)?$", key)
-		if match:
-			sanitized[f"model.layers.{match.group(1)}.mlp.experts.down_proj"] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.mlp\.experts\.down_proj_bias$", key)
-		if match:
-			sanitized[key] = value
-			continue
-
-		if include_head and key in {"score.weight", "classifier.weight"}:
-			sanitized["unembedding.weight"] = value
-			continue
-
-		if include_head and key in {"score.bias", "classifier.bias"}:
-			sanitized["unembedding.bias"] = value
-			continue
-
-	if include_head and "unembedding.weight" in sanitized and "unembedding.bias" not in sanitized:
-		sanitized["unembedding.bias"] = mx.zeros((sanitized["unembedding.weight"].shape[0],), dtype=sanitized["unembedding.weight"].dtype)
+	if include_head and "score.weight" in sanitized and "score.bias" not in sanitized:
+		sanitized["score.bias"] = mx.zeros((sanitized["score.weight"].shape[0],), dtype=sanitized["score.weight"].dtype)
 
 	return sanitized
 
@@ -821,7 +693,7 @@ class ModelForTokenClassification(RaclateBaseModel):
 		self.config = config
 		self.model = OpenAIPrivacyFilterModel(config)
 		self.dropout = nn.Dropout(p=config.classifier_dropout)
-		self.unembedding = nn.Linear( # self.score?
+		self.score = nn.Linear(
 			config.hidden_size,
 			config.num_labels,
 			bias=config.classifier_bias,
@@ -874,7 +746,7 @@ class ModelForTokenClassification(RaclateBaseModel):
 			return_dict=True,
 		)
 		last_hidden_state = outputs["last_hidden_state"]
-		logits = self.unembedding(self.dropout(last_hidden_state))
+		logits = self.score(self.dropout(last_hidden_state))
 		probabilities = mx.softmax(logits, axis=-1)
 
 		loss = None
