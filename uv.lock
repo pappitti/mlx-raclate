@@ -515,31 +515,37 @@ wheels = [
 
 [[package]]
 name = "mlx"
-version = "0.29.0"
+version = "0.31.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "mlx-metal", marker = "platform_system == 'Darwin'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/de/8e/c11cbbcd61b2faad5aeec78fa3d326f47438dd3eccedeecfbc25a99f889c/mlx-0.29.0-cp313-cp313-macosx_13_0_arm64.whl", hash = "sha256:5a150c6097784b6f7a688f378f93daac7d3e87b5bf3ad357af19b364cb6845b8", size = 546440 },
-    { url = "https://files.pythonhosted.org/packages/26/35/8443d8117a98b8a395723f83d4ccaae48c79e0d8a433a97213e8e51d02dc/mlx-0.29.0-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:471817815dd0119fe646348f173f5a23a1fb112ea97aa346d988339978e2a248", size = 546438 },
-    { url = "https://files.pythonhosted.org/packages/eb/7a/1548b82c7d41614d472b9347dca66e56a0538c773a122d88e5a7dc117605/mlx-0.29.0-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:c19e722a4ae74cdcddcbe6689a2c7d019b332e2209ba4afd84d498314bba025f", size = 546441 },
-    { url = "https://files.pythonhosted.org/packages/42/ce/d8736d58e97e47d717cee0f1c01652aa6ca2318551683f5bd31c78d21487/mlx-0.29.0-cp313-cp313-manylinux_2_35_x86_64.whl", hash = "sha256:adf9eeb1829ebdff5c3c406ae6b50044b766354b10218c18d5f3304520a573cd", size = 644973 },
+    { url = "https://files.pythonhosted.org/packages/a3/3f/888f8664d4f8e23a1363a5f50024be5216e199ab7ad0ba20988c7ed6d729/mlx-0.31.2-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:1b3fb0dda955b0d552ce57bdd6f42b3309ab21b067e40587d6848443d307e91f", size = 584796 },
+    { url = "https://files.pythonhosted.org/packages/dd/14/e9cd18b51f9e1dbcb060eec0fafc2d2428c8e1eacd9b0a02d7c5ce75b661/mlx-0.31.2-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:34b0171cd9eb5c43fdd82091f6135d6ccc5a065363a4a3e68fac64fb4e53d37c", size = 584790 },
+    { url = "https://files.pythonhosted.org/packages/ca/20/c6c5fb998c7834d094b2bfb9f003b5246cb270f0266da055c55546c34999/mlx-0.31.2-cp313-cp313-macosx_26_0_arm64.whl", hash = "sha256:c05981684279a8935d58b0dde3ea5b02d210c3bad3319aa0e9934ec2df165752", size = 584795 },
+    { url = "https://files.pythonhosted.org/packages/0b/19/aca251d4c5f3532ce9c2c1e95ad76740d9c6c298f406f62d992f465b9be0/mlx-0.31.2-cp313-cp313-manylinux_2_35_aarch64.whl", hash = "sha256:cd1f4189e5f1bc68735f44eb63ce98ae09d66ac75d7ab5b15a41afae7e9f0513", size = 627843 },
+    { url = "https://files.pythonhosted.org/packages/3e/2b/b89364883b98f21c2fe29e52d4ac8bc2fa2fe0d79293b36ec421efc1854a/mlx-0.31.2-cp313-cp313-manylinux_2_35_x86_64.whl", hash = "sha256:53c8d57ffa9ce77f8355663be05014c0dd37280e57f19126fb0a24389a30684b", size = 685064 },
+    { url = "https://files.pythonhosted.org/packages/8b/f5/e63f6a9316ded2d14a8ebc7a9ca25734c784e8c54d064a78b4dceeacec0e/mlx-0.31.2-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:a13c9ce23c3deef6aa5a09315e7953e1a5dc311e851fa16fc74c81fb2509c0b9", size = 588417 },
+    { url = "https://files.pythonhosted.org/packages/31/50/9d0c03ea3134cd85c132df7b0e4b75e6344bd8b4881a0b9c465cfa27f724/mlx-0.31.2-cp314-cp314-macosx_15_0_arm64.whl", hash = "sha256:b0764bf11fc3a71dee988e19275eef67775cab63112d8bb7ef173ca8b2a1247c", size = 588421 },
+    { url = "https://files.pythonhosted.org/packages/ef/5b/d364cc793bcb504621313acb55627cf0d5403ab2e0a594aa081cdbe4591f/mlx-0.31.2-cp314-cp314-macosx_26_0_arm64.whl", hash = "sha256:59ccbd0f0044d4f97f11ebcbf0c480bc9e962935fd96275f120954afea65be8a", size = 588384 },
+    { url = "https://files.pythonhosted.org/packages/1b/a4/e822202dd2e4e7d08671f2ecf7b6500af74f5bad5ceb27086b1aa6902f3a/mlx-0.31.2-cp314-cp314-manylinux_2_35_aarch64.whl", hash = "sha256:e81798c610f95a09c642c89214ba5c23b72ce18ce4728184aceabe7eddca33d7", size = 630473 },
+    { url = "https://files.pythonhosted.org/packages/40/6f/da48d2d7a76e644d35438ef6f33c68755fdd382e2c546fd1804ccba01d04/mlx-0.31.2-cp314-cp314-manylinux_2_35_x86_64.whl", hash = "sha256:69fbc94bf53607a75af9eb3e22c354738a6fe4e25aa4e2b20934b009a4bba1f3", size = 685459 },
 ]
 
 [[package]]
 name = "mlx-metal"
-version = "0.29.0"
+version = "0.31.2"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/08/28/3fb942b27d53061cacd12883629e5c48821f9e661f01210f55d89dabe3a6/mlx_metal-0.29.0-py3-none-macosx_13_0_arm64.whl", hash = "sha256:7e8279851504a8394122497d491276db37ef85d29f2f54d8a711ac90edfef7bf", size = 34964891 },
-    { url = "https://files.pythonhosted.org/packages/6d/82/582555232044bbdc0d74186077bcd79f1ce45f07a79e49b36afc25f9e313/mlx_metal-0.29.0-py3-none-macosx_14_0_arm64.whl", hash = "sha256:674fc7df4b9502dffe56c92cc95bae3a44950c70aa50f5b53291f228cfbbb631", size = 34694819 },
-    { url = "https://files.pythonhosted.org/packages/30/d6/b3fc6d07b9bc814551078e53438ebfae8e44c47e4e5f762df244150e4e3a/mlx_metal-0.29.0-py3-none-macosx_15_0_arm64.whl", hash = "sha256:f69eb71128dcc55b5d9baa7606c31641bdd214b859d809deac51be4248d6fddb", size = 34685946 },
+    { url = "https://files.pythonhosted.org/packages/3f/69/fe3b783ebe999f3118234e1e940feb622518bfb1dea6ac5d13b1d36a8449/mlx_metal-0.31.2-py3-none-macosx_14_0_arm64.whl", hash = "sha256:b25385bcee18fc194092255b8b53b9a3d8489eb650e59160f1b57aadd07aa2dc", size = 40055588 },
+    { url = "https://files.pythonhosted.org/packages/4f/5d/4c690d5b93c30ba002656c37363159d978705bf8eb801b8481840fb942c2/mlx_metal-0.31.2-py3-none-macosx_15_0_arm64.whl", hash = "sha256:e9d4e5fce6ca10a87a0e388597f99519ad594d09e674708b5312bd8bd4f5997d", size = 40053220 },
+    { url = "https://files.pythonhosted.org/packages/99/82/11fd62a8d7a3e96e5c43220b17de0151e3f10101f8bb3b865f5bd9cdd074/mlx_metal-0.31.2-py3-none-macosx_26_0_arm64.whl", hash = "sha256:84ffb60ee503f03eb684f5fb168d5cff31e2a16b7f27c1731eaf7662bd6e9b46", size = 55792151 },
 ]
 
 [[package]]
 name = "mlx-raclate"
-version = "0.1.0a1"
+version = "0.1.0b1"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
@@ -566,7 +572,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.121.3" },
     { name = "huggingface-hub", specifier = ">=0.36.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "mlx", specifier = ">=0.29.0" },
+    { name = "mlx", specifier = ">=0.31.0" },
     { name = "transformers", specifier = ">=4.57.1" },
     { name = "uvicorn", specifier = ">=0.38.0" },
 ]

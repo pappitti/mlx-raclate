@@ -69,7 +69,7 @@ def test_openai_privacy_filter_sanitize_openmed_layout():
     assert float(delta.item()) < 1e-6
 
 
-def test_openai_privacy_filter_sanitize_hf_qkv_weights():
+def test_openai_privacy_filter_sanitize_hf_attention_weights():
     config = _tiny_config()
     model = ModelForTokenClassification(config)
 
@@ -92,11 +92,12 @@ def test_openai_privacy_filter_sanitize_hf_qkv_weights():
         }
     )
 
-    qkv = sanitized["model.layers.0.self_attn.qkv.weight"]
-    assert qkv.shape == (q.shape[0] + k.shape[0] + v.shape[0], q.shape[1])
-    assert float(qkv[0, 0].item()) == 1.0
-    assert float(qkv[q.shape[0], 0].item()) == 2.0
-    assert float(qkv[q.shape[0] + k.shape[0], 0].item()) == 3.0
+    assert "model.layers.0.self_attn.q_proj.weight" in sanitized
+    assert "model.layers.0.self_attn.k_proj.weight" in sanitized
+    assert "model.layers.0.self_attn.v_proj.weight" in sanitized
+    assert float(sanitized["model.layers.0.self_attn.q_proj.weight"][0, 0].item()) == 1.0
+    assert float(sanitized["model.layers.0.self_attn.k_proj.weight"][0, 0].item()) == 2.0
+    assert float(sanitized["model.layers.0.self_attn.v_proj.weight"][0, 0].item()) == 3.0
     assert "model.layers.0.input_layernorm.scale" in sanitized
     assert "model.layers.0.post_attention_layernorm.scale" in sanitized
     assert "model.layers.0.mlp.experts.gate_up_proj" in sanitized
@@ -129,8 +130,10 @@ def test_openai_privacy_filter_sanitize_openmed_layout_loads_strictly():
         if key.startswith("model."):
             key = key.removeprefix("model.")
             key = key.replace("embed_tokens.weight", "embedding.weight")
-            key = key.replace(".self_attn.qkv.", ".attn.qkv.")
-            key = key.replace(".self_attn.out.", ".attn.out.")
+            key = key.replace(".self_attn.o_proj.", ".attn.out.")
+            key = key.replace(".self_attn.q_proj.", ".attn.q_proj.")
+            key = key.replace(".self_attn.k_proj.", ".attn.k_proj.")
+            key = key.replace(".self_attn.v_proj.", ".attn.v_proj.")
             key = key.replace(".self_attn.sinks", ".attn.sinks")
             key = key.replace(".input_layernorm.scale", ".attn.norm.scale")
             key = key.replace(".post_attention_layernorm.scale", ".mlp.norm.scale")

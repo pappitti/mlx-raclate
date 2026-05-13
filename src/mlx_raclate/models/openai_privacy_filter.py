@@ -119,7 +119,7 @@ class ModelArgs(BaseModelArgs):
 		params.setdefault("rope_theta", self.rope_theta)
 
 		if "rope_type" not in params:
-			params["rope_type"] = "yarn" if self.rope_scaling_factor else "default"
+			params["rope_type"] = "yarn"
 
 		if params["rope_type"] == "yarn":
 			params.setdefault(
@@ -169,13 +169,11 @@ def _find_correction_range(
 	dim: int,
 	base: float,
 	max_position_embeddings: int,
-	truncate: bool,
 ) -> Tuple[float, float]:
 	low = _find_correction_dim(low_rot, dim, base, max_position_embeddings)
 	high = _find_correction_dim(high_rot, dim, base, max_position_embeddings)
-	if truncate:
-		low = math.floor(low)
-		high = math.ceil(high)
+	low = math.floor(low)
+	high = math.ceil(high)
 	return max(low, 0.0), min(high, dim - 1.0)
 
 
@@ -186,17 +184,30 @@ def _linear_ramp_factor(start: float, stop: float, dim: int) -> mx.array:
 	return mx.clip(linear, 0.0, 1.0)
 
 
+def _yarn_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
+	if scale <= 1:
+		return 1.0
+	return 0.1 * mscale * math.log(scale) + 1.0
+
+
 def _get_rope_parameters(config: ModelArgs) -> Tuple[mx.array, float]:
 	rope_parameters = dict(config.rope_parameters or {})
 	rope_type = rope_parameters.get("rope_type", "default")
 	base = float(rope_parameters.get("rope_theta", config.rope_theta))
 	dim = int(config.head_dim)
+	freq_extra = base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
 
 	if rope_type == "yarn":
 		factor = float(rope_parameters.get("factor", 1.0))
 		attention_factor = rope_parameters.get("attention_factor")
 		if attention_factor is None:
-			attention_factor = 1.0 if factor <= 1 else 0.1 * math.log(factor) + 1.0
+			attention_factor = _yarn_mscale(
+				factor,
+				float(rope_parameters.get("mscale", 1.0)),
+			) / _yarn_mscale(
+				factor,
+				float(rope_parameters.get("mscale_all_dim", 0.0)),
+			)
 
 		beta_fast = float(rope_parameters.get("beta_fast", 32.0))
 		beta_slow = float(rope_parameters.get("beta_slow", 1.0))
@@ -206,12 +217,8 @@ def _get_rope_parameters(config: ModelArgs) -> Tuple[mx.array, float]:
 				config.initial_context_length,
 			)
 		)
-		truncate = bool(rope_parameters.get("truncate", False))
 
-		positions = mx.arange(0, dim, 2, dtype=mx.float32) / dim
-		pos_freqs = base ** positions
-		inv_freq_extrapolation = 1.0 / pos_freqs
-		inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+		freq_inter = factor * freq_extra
 
 		low, high = _find_correction_range(
 			beta_fast,
@@ -219,43 +226,18 @@ def _get_rope_parameters(config: ModelArgs) -> Tuple[mx.array, float]:
 			dim,
 			base,
 			original_max,
-			truncate,
 		)
-		extrapolation_factor = 1.0 - _linear_ramp_factor(low, high, dim // 2)
-		inv_freq = (
-			inv_freq_interpolation * (1.0 - extrapolation_factor)
-			+ inv_freq_extrapolation * extrapolation_factor
+		freq_mask = 1.0 - _linear_ramp_factor(low, high, dim // 2)
+		freqs = (freq_inter * freq_extra) / (
+			freq_inter * freq_mask + freq_extra * (1.0 - freq_mask)
 		)
-		return inv_freq.astype(mx.float32), float(attention_factor)
-
-	positions = mx.arange(0, dim, 2, dtype=mx.float32) / dim
-	inv_freq = 1.0 / (base ** positions)
+		return freqs.astype(mx.float32), float(attention_factor)
 
 	if rope_type == "linear":
 		factor = float(rope_parameters.get("factor", 1.0))
-		inv_freq = inv_freq / factor
+		freq_extra = freq_extra * factor
 
-	return inv_freq.astype(mx.float32), 1.0
-
-
-def _apply_rotary_pos_emb(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-	x_even = x[..., ::2]
-	x_odd = x[..., 1::2]
-	rotated_even = x_even * cos - x_odd * sin
-	rotated_odd = x_even * sin + x_odd * cos
-	return mx.stack([rotated_even, rotated_odd], axis=-1).reshape(x.shape)
-
-
-def _repeat_kv(hidden_states: mx.array, repeats: int) -> mx.array:
-	if repeats == 1:
-		return hidden_states
-	batch, num_heads, seq_len, head_dim = hidden_states.shape
-	hidden_states = mx.expand_dims(hidden_states, axis=2)
-	hidden_states = mx.broadcast_to(
-		hidden_states,
-		(batch, num_heads, repeats, seq_len, head_dim),
-	)
-	return hidden_states.reshape(batch, num_heads * repeats, seq_len, head_dim)
+	return freq_extra.astype(mx.float32), 1.0
 
 
 class OpenAIPrivacyFilterRMSNorm(nn.Module):
@@ -274,38 +256,65 @@ class OpenAIPrivacyFilterRMSNorm(nn.Module):
 class OpenAIPrivacyFilterRotaryEmbedding(nn.Module):
 	def __init__(self, config: ModelArgs):
 		super().__init__()
-		self.freqs = _get_rope_parameters(config)
+		self.dims = config.head_dim
+		freqs, self.mscale = _get_rope_parameters(config)
+		self._freqs = (freqs,)
 
 	def __call__(
 		self,
 		hidden_states: mx.array,
-		position_ids: mx.array,
-	) -> Tuple[mx.array, mx.array]:
-		if len(position_ids.shape) == 1:
-			position_ids = mx.expand_dims(position_ids, axis=0)
-
-		inv_freq, attention_factor = self.freqs
-		freqs = position_ids.astype(mx.float32)[..., None] * inv_freq[None, None, :]
-		cos = (mx.cos(freqs) * attention_factor).astype(hidden_states.dtype)
-		sin = (mx.sin(freqs) * attention_factor).astype(hidden_states.dtype)
-		return cos[:, None, :, :], sin[:, None, :, :]
+		offset: int = 0,
+	) -> mx.array:
+		x = hidden_states
+		if self.mscale != 1.0:
+			scaled = x[..., : self.dims] * self.mscale
+			x = (
+				scaled
+				if self.dims == x.shape[-1]
+				else mx.concatenate([scaled, x[..., self.dims :]], axis=-1)
+			)
+		return mx.fast.rope(
+			x,
+			self.dims,
+			traditional=True,
+			base=None,
+			scale=1.0,
+			offset=offset,
+			freqs=self._freqs[0],
+		)
 
 
 class OpenAIPrivacyFilterAttention(nn.Module):
 	def __init__(self, config: ModelArgs):
 		super().__init__()
-		self.num_heads = config.num_attention_heads
+		self.num_attention_heads = config.num_attention_heads
 		self.num_key_value_heads = config.num_key_value_heads
 		self.head_dim = config.head_dim
-		self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-		self.left_context, self.right_context = config.context_window
-		self.chunk_size = max(self.left_context + self.right_context + 1, 128)
-		qkv_dim = self.num_heads * self.head_dim + 2 * self.num_key_value_heads * self.head_dim
-
-		self.qkv = nn.Linear(config.hidden_size, qkv_dim, bias=config.attention_bias)
-		self.out = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
-		self.sinks = mx.zeros((self.num_heads,))
-		self.scale = config.head_dim**-0.25
+		self.q_proj = nn.Linear(
+			config.hidden_size,
+			self.num_attention_heads * self.head_dim,
+			bias=config.attention_bias,
+		)
+		self.k_proj = nn.Linear(
+			config.hidden_size,
+			self.num_key_value_heads * self.head_dim,
+			bias=config.attention_bias,
+		)
+		self.v_proj = nn.Linear(
+			config.hidden_size,
+			self.num_key_value_heads * self.head_dim,
+			bias=config.attention_bias,
+		)
+		self.o_proj = nn.Linear(
+			self.num_attention_heads * self.head_dim,
+			config.hidden_size,
+			bias=config.attention_bias,
+		)
+		self.sliding_window = int(config.sliding_window)
+		self.chunk_size = max(2 * self.sliding_window + 1, 128)
+		self.scaling = config.head_dim**-0.25
+		self.sinks = mx.zeros((self.num_attention_heads,))
+		self.rope = OpenAIPrivacyFilterRotaryEmbedding(config)
 
 	def _chunked_attention(
 		self,
@@ -314,77 +323,89 @@ class OpenAIPrivacyFilterAttention(nn.Module):
 		value_states: mx.array,
 		attention_mask: Optional[mx.array],
 	) -> mx.array:
-		batch_size, num_heads, sequence_length, _ = query_states.shape
+		sequence_length = query_states.shape[2]
 		outputs: List[mx.array] = []
-		all_positions = mx.arange(sequence_length)
-		key_token_mask = attention_mask.astype(mx.bool_) if attention_mask is not None else None
 
 		for start in range(0, sequence_length, self.chunk_size):
 			end = min(start + self.chunk_size, sequence_length)
-			span_start = max(0, start - self.left_context)
-			span_end = min(sequence_length, end + self.right_context)
+			span_start = max(0, start - self.sliding_window)
+			span_end = min(sequence_length, end + self.sliding_window + 1)
 
 			query_chunk = query_states[:, :, start:end, :]
 			key_chunk = key_states[:, :, span_start:span_end, :]
 			value_chunk = value_states[:, :, span_start:span_end, :]
 
-			query_positions = all_positions[start:end]
-			key_positions = all_positions[span_start:span_end]
-			allowed_window = (key_positions[None, :] >= (query_positions[:, None] - self.left_context))
-			allowed_window = allowed_window & (key_positions[None, :] <= (query_positions[:, None] + self.right_context))
-			allowed_window = allowed_window[None, None, :, :]
-
-			logits = mx.matmul(query_chunk.astype(mx.float32), key_chunk.astype(mx.float32).transpose(0, 1, 3, 2))
-
-			if key_token_mask is not None:
-				allowed_window = allowed_window & key_token_mask[:, None, None, span_start:span_end]
-
-			logits = mx.where(allowed_window, logits, -1e9)
-
-			sink_logits = mx.broadcast_to(
-				self.sinks.astype(mx.float32).reshape(1, num_heads, 1, 1),
-				(batch_size, num_heads, end - start, 1),
-			)
-			combined_logits = mx.concatenate([logits, sink_logits], axis=-1)
-			combined_logits = combined_logits - mx.max(combined_logits, axis=-1, keepdims=True)
-			probs = mx.softmax(combined_logits, axis=-1)
-			scores = probs[..., :-1].astype(value_chunk.dtype)
-			attn_output = mx.matmul(scores.astype(mx.float32), value_chunk.astype(mx.float32))
-
+			mask_chunk = None
 			if attention_mask is not None:
-				query_token_mask = attention_mask[:, start:end].astype(mx.float32)
-				attn_output = attn_output * query_token_mask[:, None, :, None]
+				if len(attention_mask.shape) == 4:
+					mask_chunk = attention_mask[:, :, start:end, span_start:span_end]
+				else:
+					key_mask = attention_mask[:, None, None, span_start:span_end].astype(mx.bool_)
+					mask_chunk = mx.where(
+						key_mask,
+						mx.array(0.0, dtype=query_states.dtype),
+						mx.array(-mx.inf, dtype=query_states.dtype),
+					)
 
-			outputs.append(attn_output.astype(query_states.dtype))
+			outputs.append(
+				mx.fast.scaled_dot_product_attention(
+					query_chunk,
+					key_chunk,
+					value_chunk,
+					scale=1.0,
+					mask=mask_chunk,
+					sinks=self.sinks,
+				)
+			)
 
 		return mx.concatenate(outputs, axis=2)
 
 	def __call__(
 		self,
 		hidden_states: mx.array,
-		# position_embeddings: Tuple[mx.array, mx.array],
 		attention_mask: Optional[mx.array] = None,
 	) -> Tuple[mx.array, None]:
 		batch_size, sequence_length, _ = hidden_states.shape
-		q_len = self.num_heads * self.head_dim
-		kv_len = self.num_key_value_heads * self.head_dim
 
-		qkv = self.qkv(hidden_states)
-		query_states, key_states, value_states = mx.split(qkv, [q_len, q_len + kv_len], axis=-1)
+		query_states = self.q_proj(hidden_states)
+		key_states = self.k_proj(hidden_states)
+		value_states = self.v_proj(hidden_states)
 
-		query_states = query_states.reshape(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-		key_states = key_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
-		value_states = value_states.reshape(batch_size, sequence_length, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
+		query_states = query_states.reshape(
+			batch_size,
+			sequence_length,
+			self.num_attention_heads,
+			self.head_dim,
+		).transpose(0, 2, 1, 3)
+		key_states = key_states.reshape(
+			batch_size,
+			sequence_length,
+			self.num_key_value_heads,
+			self.head_dim,
+		).transpose(0, 2, 1, 3)
+		value_states = value_states.reshape(
+			batch_size,
+			sequence_length,
+			self.num_key_value_heads,
+			self.head_dim,
+		).transpose(0, 2, 1, 3)
 
-		cos, sin = position_embeddings
-		query_states = _apply_rotary_pos_emb(query_states, cos, sin) * self.scale
-		key_states = _apply_rotary_pos_emb(key_states, cos, sin) * self.scale
-		key_states = _repeat_kv(key_states, self.num_key_value_groups)
-		value_states = _repeat_kv(value_states, self.num_key_value_groups)
-
-		attn_output = self._chunked_attention(query_states, key_states, value_states, attention_mask)
-		attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, sequence_length, -1)
-		return self.out(attn_output), None
+		query_states = self.rope(query_states)
+		key_states = self.rope(key_states)
+		query_states = query_states * self.scaling
+		key_states = key_states * self.scaling
+		attn_output = self._chunked_attention(
+			query_states,
+			key_states,
+			value_states,
+			attention_mask,
+		)
+		attn_output = attn_output.transpose(0, 2, 1, 3).reshape(
+			batch_size,
+			sequence_length,
+			-1,
+		)
+		return self.o_proj(attn_output), None
 
 
 class OpenAIPrivacyFilterExperts(nn.Module):
@@ -476,14 +497,12 @@ class OpenAIPrivacyFilterEncoderLayer(nn.Module):
 	def __call__(
 		self,
 		x: mx.array,
-		# position_embeddings: Tuple[mx.array, mx.array],
 		attention_mask: Optional[mx.array] = None,
 	) -> Tuple[mx.array, mx.array]:
 
 		h = self.input_layernorm(x)
 		h, _ = self.self_attn(
 			h,
-			# position_embeddings=position_embeddings,
 			attention_mask=attention_mask,
 		)
 		x = x + h
@@ -501,7 +520,6 @@ class OpenAIPrivacyFilterModel(nn.Module):
 		self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 		self.layers = [OpenAIPrivacyFilterEncoderLayer(config) for _ in range(config.num_hidden_layers)]
 		self.norm = OpenAIPrivacyFilterRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-		# self.rotary_emb = OpenAIPrivacyFilterRotaryEmbedding(config) # TBC
 		self.sliding_window = config.sliding_window
 
 	def get_input_embeddings(self) -> nn.Embedding:
@@ -524,10 +542,10 @@ class OpenAIPrivacyFilterModel(nn.Module):
 		mask_base = mx.zeros((L, L), dtype=mx.bool_) # All False (visible)
 
 		# Sliding Window Logic for Bidirectional:
-		# Valid if abs(row - col) < window
-		# Mask if distance >= window
+		# Valid if abs(row - col) <= window
+		# Mask if distance > window
 		dist = mx.abs(row - col)
-		mask_window_violator = dist >= window_size # should this be window_size // 2 for bidirectional (not the case for gemma3, but yes for modernBert)
+		mask_window_violator = dist > window_size # should this be window_size // 2 for bidirectional (not the case for gemma3, but yes for modernBert)
 
 		sliding_mask_bool = mask_base | mask_window_violator
 		sliding_mask = mx.where(sliding_mask_bool, -1e9, 0.0).astype(dtype)
@@ -552,12 +570,7 @@ class OpenAIPrivacyFilterModel(nn.Module):
 			dtype=model_dtype
 		)
 
-		# if position_ids is None:  # TBC
-		# 	position_ids = mx.arange(seq_len, dtype=mx.int32)[None, :]
-
 		capture_router_logits = self.config.output_router_logits if output_router_logits is None else output_router_logits
-
-		# position_embeddings = self.rotary_emb(hidden_states, position_ids) # TBC
 
 		hidden_state_list = [] if output_hidden_states else None
 		router_logits_list = [] if capture_router_logits else None
@@ -567,7 +580,6 @@ class OpenAIPrivacyFilterModel(nn.Module):
 				hidden_state_list.append(hidden_states)
 			hidden_states, router_logits = layer(
 				hidden_states,
-				# position_embeddings=position_embeddings, # TBC
 				attention_mask=attention_mask,
 			)
 			if router_logits_list is not None:
@@ -614,15 +626,15 @@ def _remap_openmed_mlx_key(key: str) -> Optional[str]:
 
 	match = re.match(r"^block\.(\d+)\.attn\.out\.(weight|bias)$", body)
 	if match:
-		return f"model.layers.{match.group(1)}.self_attn.out.{match.group(2)}"
+		return f"model.layers.{match.group(1)}.self_attn.o_proj.{match.group(2)}"
 
 	match = re.match(r"^block\.(\d+)\.attn\.sinks$", body)
 	if match:
 		return f"model.layers.{match.group(1)}.self_attn.sinks"
 
-	match = re.match(r"^block\.(\d+)\.attn\.qkv\.(weight|bias)$", body)
+	match = re.match(r"^block\.(\d+)\.attn\.(q|k|v|o)_proj\.(weight|bias)$", body)
 	if match:
-		return f"model.layers.{match.group(1)}.self_attn.qkv.{match.group(2)}"
+		return f"model.layers.{match.group(1)}.self_attn.{match.group(2)}_proj.{match.group(3)}"
 
 	match = re.match(r"^block\.(\d+)\.mlp\.(?:gate|router)\.(weight|bias)$", body)
 	if match:
@@ -643,7 +655,6 @@ def _remap_openmed_mlx_key(key: str) -> Optional[str]:
 
 def _sanitize_weights(weights: Dict[str, Any], include_head: bool) -> Dict[str, Any]:
 	sanitized: Dict[str, Any] = {}
-	qkv_parts: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
 	for key, value in weights.items():
 		if "position_ids" in key or key.endswith("rotary_emb.inv_freq"):
@@ -683,7 +694,7 @@ def _sanitize_weights(weights: Dict[str, Any], include_head: bool) -> Dict[str, 
 
 		match = re.match(r"model\.layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$", key)
 		if match:
-			sanitized[f"model.layers.{match.group(1)}.self_attn.out.{match.group(2)}"] = value
+			sanitized[key] = value
 			continue
 
 		match = re.match(r"model\.layers\.(\d+)\.self_attn\.sinks$", key)
@@ -691,21 +702,14 @@ def _sanitize_weights(weights: Dict[str, Any], include_head: bool) -> Dict[str, 
 			sanitized[key] = value
 			continue
 
-		match = re.match(r"model\.layers\.(\d+)\.self_attn\.qkv_proj\.(weight|bias)$", key)
+		match = re.match(r"model\.layers\.(\d+)\.self_attn\.out\.(weight|bias)$", key)
 		if match:
-			sanitized[f"model.layers.{match.group(1)}.self_attn.qkv.{match.group(2)}"] = value
-			continue
-
-		match = re.match(r"model\.layers\.(\d+)\.self_attn\.(qkv|out)\.(weight|bias)$", key)
-		if match:
-			sanitized[key] = value
+			sanitized[f"model.layers.{match.group(1)}.self_attn.o_proj.{match.group(2)}"] = value
 			continue
 
 		match = re.match(r"model\.layers\.(\d+)\.self_attn\.(q|k|v)_proj\.(weight|bias)$", key)
 		if match:
-			layer_key = match.group(1)
-			attr = match.group(3)
-			qkv_parts.setdefault((layer_key, attr), {})[match.group(2)] = value
+			sanitized[key] = value
 			continue
 
 		match = re.match(r"model\.layers\.(\d+)\.mlp\.router\.(weight|bias)$", key)
@@ -745,13 +749,6 @@ def _sanitize_weights(weights: Dict[str, Any], include_head: bool) -> Dict[str, 
 		if include_head and key in {"score.bias", "classifier.bias"}:
 			sanitized["unembedding.bias"] = value
 			continue
-
-	for (layer_key, attr), parts in qkv_parts.items():
-		if all(name in parts for name in ("q", "k", "v")):
-			sanitized[f"model.layers.{layer_key}.self_attn.qkv.{attr}"] = mx.concatenate(
-				[parts["q"], parts["k"], parts["v"]],
-				axis=0,
-			)
 
 	if include_head and "unembedding.weight" in sanitized and "unembedding.bias" not in sanitized:
 		sanitized["unembedding.bias"] = mx.zeros((sanitized["unembedding.weight"].shape[0],), dtype=sanitized["unembedding.weight"].dtype)

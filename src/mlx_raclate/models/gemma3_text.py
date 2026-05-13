@@ -301,10 +301,10 @@ class Gemma3Model(nn.Module):
             mask_base = mx.zeros((L, L), dtype=mx.bool_) # All False (visible)
             
             # Sliding Window Logic for Bidirectional:
-            # Valid if abs(row - col) < window
-            # Mask if distance >= window
+            # Valid if abs(row - col) <= window
+            # Mask if distance > window
             dist = mx.abs(row - col)
-            mask_window_violator = dist >= window_size
+            mask_window_violator = dist > window_size
         
         else:
             # Causal: Standard triangular mask
@@ -312,9 +312,9 @@ class Gemma3Model(nn.Module):
             mask_base = mask_future
             
             # Sliding Window Logic for Causal:
-            # Valid if row - col < window (and not future)
-            # Mask if (row - col) >= window
-            mask_past = (row - col) >= window_size
+            # Valid if row - col <= window (and not future)
+            # Mask if (row - col) > window
+            mask_past = (row - col) > window_size
             mask_window_violator = mask_past
 
         global_mask = mx.where(mask_base, -1e9, 0.0).astype(dtype)
