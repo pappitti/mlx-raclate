@@ -1,7 +1,7 @@
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple
 from datasets import load_dataset as hf_load_dataset 
-from datasets import DatasetDict, ClassLabel, Sequence, Value
+from datasets import DatasetDict, ClassLabel, Sequence
 from datasets import Dataset as HFDataset
 
 class DatasetArgs:
@@ -15,7 +15,10 @@ class DatasetArgs:
     """
     def __init__(self, data: str, task_type: str, 
         text_field: Optional[str] = "text", label_field: Optional[str] = "label",
-        text_pair_field: Optional[str] = None, negative_field: Optional[str] = None, test: Optional[bool]=False
+        text_pair_field: Optional[str] = None, negative_field: Optional[str] = None,
+        test: Optional[bool]=False,
+        train_limit: Optional[int] = None, validation_limit: Optional[int] = None,
+        test_limit: Optional[int] = None,
     ):
         self.data = data
         self.task_type = task_type
@@ -24,6 +27,15 @@ class DatasetArgs:
         self.text_pair_field = text_pair_field
         self.negative_field = negative_field
         self.test = test # whether to create a test set if not present
+        self.train_limit = train_limit
+        self.validation_limit = validation_limit
+        self.test_limit = test_limit
+
+
+def _limit_dataset(dataset: Optional[HFDataset], limit: Optional[int]) -> Optional[HFDataset]:
+    if dataset is None or limit is None:
+        return dataset
+    return dataset.select(range(min(limit, len(dataset))))
 
 
 def _standardize_column_names(dataset: HFDataset, args: DatasetArgs) -> HFDataset:
@@ -111,9 +123,12 @@ def get_label_mapping(dataset: HFDataset, args: DatasetArgs) -> Tuple[Optional[D
     target_col = "labels" if args.task_type == "token-classification" else "label"
     if target_col not in dataset.column_names:
         # Fallback: sometimes text-classification uses 'labels' or vice versa
-        if "label" in dataset.column_names: target_col = "label"
-        elif "labels" in dataset.column_names: target_col = "labels"
-        else: return None, None
+        if "label" in dataset.column_names:
+            target_col = "label"
+        elif "labels" in dataset.column_names:
+            target_col = "labels"
+        else:
+            return None, None
 
     labels = []
     
@@ -223,6 +238,10 @@ def load_dataset(args: DatasetArgs) -> Tuple[Optional[HFDataset], Optional[HFDat
         t_t_split = raw_datasets["train"].train_test_split(test_size=0.176, seed=42) 
         raw_datasets["train"] = t_t_split["train"]
         raw_datasets["test"] = t_t_split["test"]
+
+    raw_datasets["train"] = _limit_dataset(raw_datasets.get("train"), args.train_limit)
+    raw_datasets["validation"] = _limit_dataset(raw_datasets.get("validation"), args.validation_limit)
+    raw_datasets["test"] = _limit_dataset(raw_datasets.get("test"), args.test_limit)
 
     # Standardize Columns
     for split in raw_datasets.keys():

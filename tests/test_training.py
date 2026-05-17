@@ -215,6 +215,7 @@ def test_token_classification_dataset_columns_are_standardized():
     assert standardized[0]["text"] == ["John", "lives", "there"]
     assert standardized[0]["labels"] == [1, 0, 0]
 
+
 def test_label_mappings_generation():
     """Test label mapping generators."""
     id2label = generate_id2label(3)

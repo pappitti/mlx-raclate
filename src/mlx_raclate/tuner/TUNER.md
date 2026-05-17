@@ -233,6 +233,9 @@ Used to configure how data is loaded and mapped.
 | `text_pair_field`| `str` | `None` | Name of the second text input column (for pairs). |
 | `label_field` | `str` | `"label"` | Name of the label/target column. |
 | `negative_field`| `str` | `None` | Name of the negative samples column. |
+| `train_limit` | `int` | `None` | Optional cap on training examples after loading and split creation. |
+| `validation_limit` | `int` | `None` | Optional cap on validation examples after loading and split creation. |
+| `test_limit` | `int` | `None` | Optional cap on test examples after loading and split creation. |
 | `test` | `bool` | `False` | If True, creates a test split from the training set if one doesn't exist. |   
 
 Note : use load_dataset("dataset_path") from `datasets.py` to fetch the dataset splits and the label2id dictionary.

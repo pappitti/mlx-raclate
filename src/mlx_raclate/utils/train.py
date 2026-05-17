@@ -82,6 +82,9 @@ def init_args():
     parser.add_argument("--label_field", type=str, default=None, help="Name of the label field in the dataset (if different from default).")
     parser.add_argument("--negative_field", type=str, default=None, help="Name of the negative samples field in the dataset (if applicable and different from default).")
     parser.add_argument("--create_test", action='store_true', help="Set this flag to create a test split, if not already present in the dataset, out of the training set (validation set not affected).")
+    parser.add_argument("--train_limit", type=int, default=None, help="Limit the number of training examples after loading and split creation.")
+    parser.add_argument("--validation_limit", type=int, default=None, help="Limit the number of validation examples after loading and split creation.")
+    parser.add_argument("--test_limit", type=int, default=None, help="Limit the number of test examples after loading and split creation.")
 
     # Trainer / End Model Init Params
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help="Path to the pre-trained model or model identifier from a model hub.")
@@ -128,6 +131,9 @@ def main():
     label_field : str = args.label_field
     negative_field : str = args.negative_field
     create_test : bool = args.create_test
+    train_limit : int = args.train_limit
+    validation_limit : int = args.validation_limit
+    test_limit : int = args.test_limit
 
     # Trainer / End Model Params
     model_path : str = args.model_path 
@@ -173,7 +179,10 @@ def main():
         text_pair_field=text_pair_field,
         label_field=label_field,
         negative_field=negative_field,
-        test=create_test
+        test=create_test,
+        train_limit=train_limit,
+        validation_limit=validation_limit,
+        test_limit=test_limit,
     )
     
     train_dataset, valid_dataset, test_dataset, id2label, label2id = load_dataset(dataset_args)
