@@ -1,5 +1,4 @@
 # Copyright © 2024 Apple Inc.
-from pathlib import Path
 from typing import Dict
 
 import mlx.core as mx
@@ -10,6 +9,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 EMBEDDING_LAYER_NAMES = {
     "gemma3_text": ["embed_tokens"],
     "lfm2": ["embed_tokens"],
+    "neobert": ["encoder"],
     "qwen3": ["embed_tokens"],
     "t5gemma_encoder": ["embed_tokens"],
     "modernbert": ["embeddings"]
@@ -27,7 +27,8 @@ def build_schedule(schedule_config: Dict):
     # Create the main schedule function
     if name == "constant":
         # Create a callable that ignores the step and returns the LR
-        bound_schedule_fn = lambda _: initial_lr
+        def bound_schedule_fn(_):
+            return initial_lr
     else:
         # For cosine_decay, linear_schedule, etc.
         schedule_fn = getattr(opt, name)

@@ -1,8 +1,9 @@
 import inspect
 from dataclasses import dataclass
+import math
 import mlx.core as mx
 import mlx.nn as nn
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 class RaclateBaseModel(nn.Module):
     """Base class for Raclate models."""
@@ -64,6 +65,128 @@ class BaseModelArgs:
                 if k in inspect.signature(cls).parameters
             }
         )
+
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        dims: int,
+        freqs: Optional[mx.array] = None,
+        base: Optional[float] = None,
+        scale: float = 1.0,
+        mscale: float = 1.0,
+        traditional: bool = True,
+    ):
+        super().__init__()
+        self.dims = dims
+        self._freqs = None if freqs is None else (freqs,)
+        self.base = base
+        self.scale = scale
+        self.mscale = mscale
+        self.traditional = traditional
+
+    def _default_freqs(self) -> mx.array:
+        if self.base is None:
+            raise ValueError("base must be set when explicit position_ids are used")
+        return self.base ** (mx.arange(0, self.dims, 2, dtype=mx.float32) / self.dims)
+
+    def _apply_with_position_ids(
+        self,
+        hidden_states: mx.array,
+        position_ids: mx.array,
+    ) -> mx.array:
+        if self.dims % 2 != 0:
+            raise ValueError("RoPE dimensions must be even when explicit position_ids are used")
+
+        freqs = self._freqs[0] if self._freqs is not None else self._default_freqs()
+        inv_freqs = 1.0 / freqs
+        positions = position_ids.astype(mx.float32) * self.scale
+        angles = mx.expand_dims(positions, -1) * inv_freqs
+
+        if len(position_ids.shape) == 1:
+            while len(angles.shape) < len(hidden_states.shape):
+                angles = mx.expand_dims(angles, 0)
+        elif len(position_ids.shape) == 2 and len(hidden_states.shape) == 4:
+            angles = angles[:, None, :, :]
+        else:
+            while len(angles.shape) < len(hidden_states.shape):
+                angles = mx.expand_dims(angles, 1)
+
+        cos = mx.cos(angles).astype(hidden_states.dtype)
+        sin = mx.sin(angles).astype(hidden_states.dtype)
+
+        rotary_states = hidden_states[..., : self.dims]
+        pass_states = hidden_states[..., self.dims :]
+        if self.traditional:
+            even_states = rotary_states[..., 0::2]
+            odd_states = rotary_states[..., 1::2]
+
+            rotated = mx.stack(
+                [
+                    even_states * cos - odd_states * sin,
+                    even_states * sin + odd_states * cos,
+                ],
+                axis=-1,
+            ).reshape(rotary_states.shape)
+        else:
+            half_dims = self.dims // 2
+            first_half = rotary_states[..., :half_dims]
+            second_half = rotary_states[..., half_dims:self.dims]
+            rotated = mx.concatenate(
+                [
+                    first_half * cos - second_half * sin,
+                    second_half * cos + first_half * sin,
+                ],
+                axis=-1,
+            )
+
+        if pass_states.shape[-1] == 0:
+            return rotated
+        return mx.concatenate([rotated, pass_states], axis=-1)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        offset: int = 0,
+        position_ids: Optional[mx.array] = None,
+    ) -> mx.array:
+        x = hidden_states
+        if self.mscale != 1.0:
+            scaled = x[..., : self.dims] * self.mscale
+            x = (
+                scaled
+                if self.dims == x.shape[-1]
+                else mx.concatenate([scaled, x[..., self.dims :]], axis=-1)
+            )
+        if position_ids is not None:
+            return self._apply_with_position_ids(x, position_ids)
+        return mx.fast.rope(
+            x,
+            self.dims,
+            traditional=self.traditional,
+            base=self.base,
+            scale=self.scale,
+            offset=offset,
+            freqs=None if self._freqs is None else self._freqs[0],
+        )
+
+
+class SwiGLU(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.w12 = nn.Linear(input_dim, 2 * hidden_dim, bias=bias)
+        self.w3 = nn.Linear(hidden_dim, output_dim, bias=bias)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        gate, up = mx.split(self.w12(x), 2, axis=-1)
+        return self.w3(nn.silu(gate) * up)
 
 def compute_similarity(query_embeddings: mx.array, reference_embeddings: mx.array) -> mx.array:
         """Computes cosine similarity between query embeddings and reference embeddings.
@@ -155,7 +278,8 @@ def compute_similarity_and_loss(
     call_model : callable,
     similarity_scores: Optional[mx.array],
     negative_input_ids: Optional[mx.array] = None,
-    negative_attention_mask: Optional[mx.array] = None
+    negative_attention_mask: Optional[mx.array] = None,
+    negative_position_ids: Optional[mx.array] = None,
 ):
     # MSE loss between computed similarities and target scores
     if similarity_scores is not None:
@@ -179,7 +303,12 @@ def compute_similarity_and_loss(
         if config.use_late_interaction:
             # Q: [B, L, D], C: [2B, L, D] (if negatives exist)
             if negative_input_ids is not None:
-                neg_outputs = call_model(negative_input_ids, negative_attention_mask)
+                neg_outputs = call_model(
+                    input_ids=negative_input_ids,
+                    attention_mask=negative_attention_mask,
+                    position_ids=negative_position_ids,
+                    return_dict=True,
+                )
                 neg_embeddings = neg_outputs["embeddings"]
                 candidates = mx.concatenate([reference_embeddings, neg_embeddings], axis=0)
             else:
@@ -203,6 +332,7 @@ def compute_similarity_and_loss(
                 neg_outputs = call_model(
                     input_ids=negative_input_ids, 
                     attention_mask=negative_attention_mask, 
+                    position_ids=negative_position_ids,
                     return_dict=True
                 )
                 neg_embeddings = neg_outputs["embeddings"]

@@ -9,7 +9,7 @@ To add custom test endpoints, use the `register_endpoint` function or pass
 additional endpoints via pytest fixtures.
 """
 
-from typing import Dict, Tuple, Optional, List, Set
+from typing import Dict, Tuple, Optional, List
 from dataclasses import dataclass, field
 from mlx_raclate.utils.utils import PIPELINES
 
@@ -20,6 +20,7 @@ MODEL_FAMILIES = [
     "gemma3",
     "t5gemma",
     "lfm2",
+    "neobert",
 ]
 
 # Pipelines that support training
@@ -37,6 +38,7 @@ BASE_MODELS: Dict[str, str] = {
     "gemma3": "google/embeddinggemma-300m",
     "t5gemma": "google/t5gemma-s-s-ul2",
     "lfm2": "LiquidAI/LFM2-350M",
+    "neobert": "chandar-lab/NeoBERT",
 }
 
 @dataclass
@@ -84,6 +86,27 @@ def _init_registry():
     _register("lfm2", "sentence-similarity", "LiquidAI/LFM2-ColBERT-350M",
               model_config={"use_late_interaction": True},
               notes="Late interaction (ColBERT-style) model")
+
+    # NeoBERT endpoints (custom HF code implemented locally in mlx-raclate)
+    _register("neobert", "embeddings", "chandar-lab/NeoBERT",
+              model_config={"model_type": "neobert", "classifier_pooling": "cls"},
+              notes="NeoBERT encoder with RoPE, SwiGLU and pre-RMSNorm")
+    _register("neobert", "masked-lm", "chandar-lab/NeoBERT",
+              notes="Remote-code NeoBERTLMHead implemented locally")
+
+    # Backbone-derived embedding endpoints with dedicated thin wrappers
+    _register("granite_embedding", "embeddings", "ibm-granite/granite-embedding-97m-multilingual-r2",
+              model_config={"model_type": "granite_embedding", "classifier_pooling": "cls"},
+              notes="ModernBERT-derived Granite embedding model with SiLU MLP and CLS pooling")
+    _register("colbert_zero", "sentence-similarity", "lightonai/ColBERT-Zero",
+              model_config={"model_type": "colbert_zero", "use_late_interaction": True},
+              notes="ModernBERT + PyLate dense projection + MaxSim")
+    _register("lateon", "sentence-similarity", "lightonai/LateOn",
+              notes="ModernBERT + PyLate residual dense stack + MaxSim; auto-detected from Dense module layout")
+    _register("bidirectional_pplx_qwen3", "embeddings", "perplexity-ai/pplx-embed-v1-0.6b",
+              notes="Qwen3-derived embedding model with bidirectional attention and mean pooling")
+    # _register("jina_embeddings_v5", "embeddings", "jinaai/jina-embeddings-v5-text-small",
+    #           notes="Qwen3-derived Jina v5 text-small wrapper; task adapters require adapter loading")
 
 
 def _register(

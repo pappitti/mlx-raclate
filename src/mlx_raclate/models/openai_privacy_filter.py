@@ -5,7 +5,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, RaclateBaseModel, mean_pooling, normalize_embeddings
+from .base import (
+	BaseModelArgs,
+	RaclateBaseModel,
+	compute_similarity_and_loss,
+	RotaryEmbedding,
+	mean_pooling,
+	normalize_embeddings,
+)
 
 
 OPENAI_PRIVACY_FILTER_SPAN_LABELS = (
@@ -44,7 +51,7 @@ class ModelArgs(BaseModelArgs):
 	classifier_bias: bool = True
 	eos_token_id: Optional[int] = 199999
 	experts_per_token: Optional[int] = None
-	
+
 	head_dim: int = 64
 	hidden_size: int = 640
 	initializer_range: float = 0.02
@@ -61,7 +68,7 @@ class ModelArgs(BaseModelArgs):
 	num_local_experts: int = 128
 	output_router_logits: bool = False
 	pad_token_id: Optional[int] = 199999
-	
+
 	rope_ntk_alpha: Optional[float] = None
 	rope_ntk_beta: Optional[float] = None
 	rope_parameters: Optional[Dict[str, Any]] = None
@@ -152,14 +159,15 @@ class ModelArgs(BaseModelArgs):
 		right = max(left - 1, 0)
 		return left, right
 
-
 def _find_correction_dim(
 	num_rotations: float,
 	dim: int,
 	base: float,
 	max_position_embeddings: int,
 ) -> float:
-	return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+	return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
+		2 * math.log(base)
+	)
 
 
 def _find_correction_range(
@@ -213,7 +221,7 @@ def _get_rope_parameters(config: ModelArgs) -> Tuple[mx.array, float]:
 		original_max = int(
 			rope_parameters.get(
 				"original_max_position_embeddings",
-				config.initial_context_length,
+				config.initial_context_length or 1,
 			)
 		)
 
@@ -252,35 +260,10 @@ class OpenAIPrivacyFilterRMSNorm(nn.Module):
 		return (normalized * self.weight.astype(mx.float32)).astype(hidden_states.dtype)
 
 
-class OpenAIPrivacyFilterRotaryEmbedding(nn.Module):
+class OpenAIPrivacyFilterRotaryEmbedding(RotaryEmbedding):
 	def __init__(self, config: ModelArgs):
-		super().__init__()
-		self.dims = config.head_dim
-		freqs, self.mscale = _get_rope_parameters(config)
-		self._freqs = (freqs,)
-
-	def __call__(
-		self,
-		hidden_states: mx.array,
-		offset: int = 0,
-	) -> mx.array:
-		x = hidden_states
-		if self.mscale != 1.0:
-			scaled = x[..., : self.dims] * self.mscale
-			x = (
-				scaled
-				if self.dims == x.shape[-1]
-				else mx.concatenate([scaled, x[..., self.dims :]], axis=-1)
-			)
-		return mx.fast.rope(
-			x,
-			self.dims,
-			traditional=True,
-			base=None,
-			scale=1.0,
-			offset=offset,
-			freqs=self._freqs[0],
-		)
+		freqs, mscale = _get_rope_parameters(config)
+		super().__init__(config.head_dim, freqs=freqs, mscale=mscale)
 
 
 class OpenAIPrivacyFilterAttention(nn.Module):
@@ -363,6 +346,7 @@ class OpenAIPrivacyFilterAttention(nn.Module):
 		self,
 		hidden_states: mx.array,
 		attention_mask: Optional[mx.array] = None,
+		position_ids: Optional[mx.array] = None,
 	) -> Tuple[mx.array, None]:
 		batch_size, sequence_length, _ = hidden_states.shape
 
@@ -389,8 +373,8 @@ class OpenAIPrivacyFilterAttention(nn.Module):
 			self.head_dim,
 		).transpose(0, 2, 1, 3)
 
-		query_states = self.rope(query_states)
-		key_states = self.rope(key_states)
+		query_states = self.rope(query_states, position_ids=position_ids)
+		key_states = self.rope(key_states, position_ids=position_ids)
 		query_states = query_states * self.scaling
 		key_states = key_states * self.scaling
 		attn_output = self._chunked_attention(
@@ -449,7 +433,7 @@ class OpenAIPrivacyFilterExperts(nn.Module):
 			next_states = next_states + expert_output * weights
 
 		return next_states
-	
+
 
 class OpenAIPrivacyFilterTopKRouter(nn.Module):
 	def __init__(self, config: ModelArgs):
@@ -462,12 +446,12 @@ class OpenAIPrivacyFilterTopKRouter(nn.Module):
 		logits = mx.matmul(
 			hidden_states.astype(mx.float32),
 			self.weight.astype(mx.float32).T,
-		) + self.bias.astype(mx.float32) 
+		) + self.bias.astype(mx.float32)
 		sorted_indices = mx.argsort(logits, axis=-1)[..., -self.top_k :]
 		top_values = mx.take_along_axis(logits, sorted_indices, axis=-1)
 		router_scores = mx.softmax(top_values, axis=-1) / self.top_k
 		return logits, router_scores, sorted_indices
-		
+
 
 class OpenAIPrivacyFilterMLP(nn.Module):
 	def __init__(self, config: ModelArgs):
@@ -497,12 +481,14 @@ class OpenAIPrivacyFilterEncoderLayer(nn.Module):
 		self,
 		x: mx.array,
 		attention_mask: Optional[mx.array] = None,
+		position_ids: Optional[mx.array] = None,
 	) -> Tuple[mx.array, mx.array]:
 
 		h = self.input_layernorm(x)
 		h, _ = self.self_attn(
 			h,
 			attention_mask=attention_mask,
+			position_ids=position_ids,
 		)
 		x = x + h
 
@@ -527,7 +513,10 @@ class OpenAIPrivacyFilterModel(nn.Module):
 	def set_input_embeddings(self, value):
 		self.embed_tokens = value
 
-	def _update_attention_mask(self, attention_mask: mx.array = None, dtype = None) -> mx.array:
+	def _update_attention_mask(self, attention_mask: mx.array ,dtype: mx.Dtype) -> mx.array:
+		if dtype is None:
+			raise ValueError("dtype must be provided when updating the attention mask.")
+
 		B, L = attention_mask.shape
 		window_size = self.sliding_window
 
@@ -565,7 +554,7 @@ class OpenAIPrivacyFilterModel(nn.Module):
 		model_dtype = hidden_states.dtype
 
 		attention_mask = self._update_attention_mask(
-			attention_mask, 
+			attention_mask,
 			dtype=model_dtype
 		)
 
@@ -580,6 +569,7 @@ class OpenAIPrivacyFilterModel(nn.Module):
 			hidden_states, router_logits = layer(
 				hidden_states,
 				attention_mask=attention_mask,
+				position_ids=position_ids,
 			)
 			if router_logits_list is not None:
 				router_logits_list.append(router_logits)
@@ -633,8 +623,8 @@ class Model(RaclateBaseModel):
 		super().__init__()
 		self.config = config
 		self.model = OpenAIPrivacyFilterModel(config)
-		
-        # no transformer architecture for embedding model
+
+		self.hf_transformers_arch = "OpenAIPrivacyFilterModel"
 
 	def get_input_embeddings(self) -> nn.Embedding:
 		return self.model.get_input_embeddings()
@@ -656,7 +646,7 @@ class Model(RaclateBaseModel):
                 (batch_size, seq_len),
                 dtype=self.model.embed_tokens.weight.dtype,
             )
-	
+
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -665,7 +655,7 @@ class Model(RaclateBaseModel):
 			return_dict=True,
 		)
 		last_hidden_state = outputs["last_hidden_state"]
-		
+
 		pooled = mean_pooling(last_hidden_state, attention_mask)
 		embeddings = normalize_embeddings(pooled)
 
@@ -680,12 +670,221 @@ class Model(RaclateBaseModel):
 
 	def sanitize(self, weights):
 		sanitized = _sanitize_weights(weights, include_head=False)
+		# getting rid the dropout and score weights
 		return {
 			key: value
 			for key, value in sanitized.items()
 			if key.startswith("model.")
 		}
 
+class ModelForSentenceSimilarity(RaclateBaseModel):
+	def __init__(self, config: ModelArgs):
+		super().__init__()
+		self.config = config
+		self.model = OpenAIPrivacyFilterModel(config)
+
+		# no HF architectures for sentence similarity
+
+	def _call_model(
+		self,
+		input_ids: mx.array,
+		attention_mask: Optional[mx.array] = None,
+		position_ids: Optional[mx.array] = None,
+		output_hidden_states: bool = False,
+		return_dict: bool = True,
+	):
+		
+		outputs = self.model(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			output_hidden_states=output_hidden_states,
+			return_dict=True,
+		)
+		last_hidden_state = outputs["last_hidden_state"]
+
+		pooled = mean_pooling(last_hidden_state, attention_mask)
+		embeddings = normalize_embeddings(pooled)
+
+		if not return_dict:
+			return embeddings, last_hidden_state
+
+		return {
+			"embeddings": embeddings,
+			"last_hidden_state": last_hidden_state,
+			"hidden_states": outputs.get("hidden_states"),
+		}
+
+	def __call__(
+		self,
+		input_ids: mx.array,
+		reference_input_ids : Optional[mx.array] = None,  # Shape: [num_references, seq_len]
+		negative_input_ids : Optional[mx.array] = None,  # Shape: [num_negatives, seq_len]
+		attention_mask: Optional[mx.array] = None,
+		reference_attention_mask: Optional[mx.array] = None,
+		negative_attention_mask: Optional[mx.array] = None,
+		similarity_scores: Optional[mx.array] = None,  # Shape: [batch_size, num_references]
+		position_ids: Optional[mx.array] = None,
+		return_dict: Optional[bool] = True,
+		reference_position_ids: Optional[mx.array] = None,
+		negative_position_ids: Optional[mx.array] = None,
+	):
+		if attention_mask is None:
+			batch_size, seq_len = input_ids.shape
+			attention_mask = mx.ones(
+				(batch_size, seq_len),
+				dtype=self.model.embed_tokens.weight.dtype,
+			)
+
+		batch_outputs = self._call_model(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			return_dict=True,
+		)
+		embeddings = batch_outputs["embeddings"]  # [batch_size, hidden_size]
+
+		loss = None
+		similarities = None
+		if reference_input_ids is not None:
+
+			# Get embeddings for reference sentences
+			ref_outputs = self._call_model(
+				input_ids=reference_input_ids,
+				attention_mask=reference_attention_mask,
+				position_ids=reference_position_ids,
+				return_dict=True
+			)
+			reference_embeddings = ref_outputs["embeddings"]  # [num_references, hidden_size]
+
+			similarities, loss = compute_similarity_and_loss(
+				self.config,
+				input_ids,
+				embeddings,
+				reference_embeddings,
+				self._call_model,
+				similarity_scores,
+				negative_input_ids,
+				negative_attention_mask,
+				negative_position_ids,
+			)
+
+		if not return_dict:
+			return (loss, similarities, embeddings)
+
+		return {
+			"loss": loss,
+			"similarities": similarities,  # [batch_size, num_references]
+			"embeddings": embeddings,  # [batch_size, hidden_size]
+		}
+
+	def sanitize(self, weights):
+		sanitized = _sanitize_weights(weights, include_head=False)
+		# getting rid the dropout and score weights
+		return {
+			key: value
+			for key, value in sanitized.items()
+			if key.startswith("model.")
+		}
+
+class ModelForSentenceTransformers(ModelForSentenceSimilarity):
+	pass
+
+class ModelForMaskedLM(RaclateBaseModel):
+	def __init__(self, config: ModelArgs):
+		raise NotImplementedError("Masked language modeling is not supported for OpenAIPrivacyFilterModel")
+
+class ModelForSequenceClassification(RaclateBaseModel):
+	def __init__(self, config: ModelArgs):
+		super().__init__()
+		self.config = config
+		self.num_labels = config.num_labels
+		self.is_regression = config.is_regression
+		self.model = OpenAIPrivacyFilterModel(config)
+
+		## as a placeheolder we use a simple linear layer
+		self.score = nn.Linear(
+            config.hidden_size,
+            config.num_labels,
+            bias=False
+        )
+
+	def _process_outputs(self, logits: mx.array) -> mx.array:
+		"""Apply the appropriate activation function to the logits."""
+		if self.is_regression:
+			return logits  # No activation for regression
+		elif self.num_labels == 1:
+			return mx.sigmoid(logits)  # Binary classification
+		else:
+			# Using softmax for multi-class classification
+			return mx.softmax(logits, axis=-1)
+
+	def _compute_loss(self, logits: mx.array, labels: mx.array) -> mx.array:
+		"""Compute the appropriate loss based on label characteristics."""
+		if self.is_regression:
+			return nn.losses.mse_loss(logits.squeeze(), labels.squeeze())
+		elif self.num_labels == 1:
+			return nn.losses.binary_cross_entropy(mx.sigmoid(logits), labels)
+		else:
+			return nn.losses.cross_entropy(
+				logits.reshape(-1, self.num_labels),
+				labels.reshape(-1)
+			)
+
+	def __call__(
+		self,
+		input_ids,
+		attention_mask: Optional[mx.array] = None,
+		position_ids: Optional[mx.array] = None, ### need this?
+		labels: Optional[mx.array] = None,
+		output_hidden_states: Optional[bool] = False,
+		return_dict: Optional[bool] = True,
+	):
+		if attention_mask is None:
+			batch_size, seq_len = input_ids.shape
+			attention_mask = mx.ones(
+				(batch_size, seq_len),
+				dtype=self.model.embed_tokens.weight.dtype,
+			)
+
+		outputs = self.model(
+			input_ids,
+			attention_mask,
+			position_ids=position_ids,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict
+		)
+		last_hidden_state = (
+			outputs["last_hidden_state"] if isinstance(outputs, dict) else outputs[0]
+		)
+
+		# pooling for AR models such as Qwen3 leverages the last token
+		pooled = mean_pooling(last_hidden_state, attention_mask)
+
+		logits = self.score(pooled)
+
+		processed_logits = self._process_outputs(logits)
+
+		loss = None
+		if labels is not None :
+			loss = self._compute_loss(logits, labels)
+
+		if not return_dict:
+			return [loss, processed_logits, outputs[1:]]
+
+		return {
+			"loss": loss,
+			"probabilities": processed_logits,
+			"hidden_states": outputs.get("hidden_states", None),
+		}
+
+	def sanitize(self, weights):
+		sanitized = _sanitize_weights(weights, include_head=True)
+		return {
+			key: value
+			for key, value in sanitized.items()
+			if key.startswith("model.") or key == "score.weight"
+		}
 
 class ModelForTokenClassification(RaclateBaseModel):
 	def __init__(self, config: ModelArgs):
@@ -729,14 +928,14 @@ class ModelForTokenClassification(RaclateBaseModel):
 		output_router_logits: Optional[bool] = None,
 		return_dict: bool = True,
 	):
-		
+
 		if attention_mask is None:
 			batch_size, seq_len = input_ids.shape
 			attention_mask = mx.ones(
                 (batch_size, seq_len),
                 dtype=self.model.embed_tokens.weight.dtype,
             )
-			
+
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,

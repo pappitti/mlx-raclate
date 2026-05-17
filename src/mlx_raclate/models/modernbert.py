@@ -7,6 +7,7 @@ import mlx.nn as nn
 from .base import (
     BaseModelArgs, 
     RaclateBaseModel, 
+    RotaryEmbedding,
     compute_similarity_and_loss, 
     mean_pooling, 
     normalize_embeddings
@@ -25,6 +26,7 @@ class ModelArgs(BaseModelArgs):
     eos_token_id : int = 50282
     global_attn_every_n_layers : int = 3
     global_rope_theta : float = 160000.0
+    hidden_activation: str = "gelu"
     hidden_size: int = 768
     initializer_range : float = 0.02 
     initializer_cutoff_factor: float = 2.0 # relevant for MLX?
@@ -109,7 +111,15 @@ class ModernBertMLP(nn.Module):
         super().__init__()
         self.config = config
         self.Wi = nn.Linear(config.hidden_size, config.intermediate_size *2, bias=config.mlp_bias)
-        self.act = nn.GELU()
+        hidden_activation = config.hidden_activation.lower()
+        if hidden_activation in ("silu", "swish"):
+            self.act = nn.silu
+        elif hidden_activation == "gelu":
+            self.act = nn.GELU()
+        else:
+            raise ValueError(
+                f"Unsupported ModernBERT hidden_activation: {config.hidden_activation}"
+            )
         self.drop = nn.Dropout(p=config.mlp_dropout)
         self.Wo = nn.Linear(int(config.intermediate_size), config.hidden_size, bias=config.mlp_bias)
 
@@ -150,7 +160,11 @@ class ModernBertAttention(nn.Module):
         if self.local_attention != (-1, -1) and config.local_rope_theta is not None:
             rope_theta = config.local_rope_theta
 
-        self.rotary_emb = nn.RoPE(dims=self.head_dim, base=rope_theta)
+        self.rotary_emb = RotaryEmbedding(
+            dims=self.head_dim,
+            base=rope_theta,
+            traditional=False,
+        )
 
         self.Wo = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
         self.out_drop = nn.Dropout(p=config.attention_dropout) if config.attention_dropout > 0.0 else nn.Identity()
@@ -161,6 +175,7 @@ class ModernBertAttention(nn.Module):
             hidden_states, 
             attention_mask = None,
             sliding_window_mask = None,
+            position_ids = None,
             **kwargs
         ):
         qkv = self.Wqkv(hidden_states)
@@ -179,8 +194,8 @@ class ModernBertAttention(nn.Module):
         value = value.squeeze(2)  # [batch_size, nheads, seqlen, headdim]
 
         # Applying rotary embeddings
-        query = self.rotary_emb(query)
-        key = self.rotary_emb(key)
+        query = self.rotary_emb(query, position_ids=position_ids)
+        key = self.rotary_emb(key, position_ids=position_ids)
         
         # Handling local attention if needed
         if self.local_attention != (-1, -1):
@@ -440,7 +455,13 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
         output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
     ):
-        out = self.model(input_ids, attention_mask)
+        out = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
         last_hidden_state = (
             out["last_hidden_state"] if isinstance(out, dict) else out[0]
         )
@@ -479,6 +500,8 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
         similarity_scores: Optional[mx.array] = None,  # Shape: [batch_size, num_references]
         position_ids: Optional[mx.array] = None,
         return_dict: Optional[bool] = True,
+        reference_position_ids: Optional[mx.array] = None,
+        negative_position_ids: Optional[mx.array] = None,
     ):
         
         if attention_mask is None:
@@ -504,7 +527,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             ref_outputs = self._call_model(
                 input_ids=reference_input_ids,
                 attention_mask=reference_attention_mask,
-                position_ids=position_ids, ### ?
+                position_ids=reference_position_ids,
                 return_dict=True
             )
             reference_embeddings = ref_outputs["embeddings"]  # [num_references, hidden_size]
@@ -518,6 +541,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
                 similarity_scores,
                 negative_input_ids,
                 negative_attention_mask,
+                negative_position_ids,
             )
             
         if not return_dict:
@@ -629,11 +653,14 @@ class ModelForMaskedLM(RaclateBaseModel):
         position_ids: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = True,
-    ) -> Dict:
+    ) :
         
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape 
-            attention_mask = mx.ones((batch_size, seq_len)) ###  updated via _update_attention_mask() in the model
+            attention_mask = mx.ones(
+                (batch_size, seq_len),
+                dtype=self.model.embeddings.tok_embeddings.weight.dtype
+            ) ###  updated via _update_attention_mask() in the model
 
         outputs = self.model(
             input_ids=input_ids,
@@ -658,14 +685,16 @@ class ModelForMaskedLM(RaclateBaseModel):
                 ignore_index = getattr(self.config, "sparse_pred_ignore_index", -100)
                 mask_tokens = flat_labels != ignore_index
                 
-                # Only compute loss on masked tokens
-                masked_predictions = flat_predictions[mask_tokens]
-                masked_labels = flat_labels[mask_tokens]
-                
-                loss = nn.losses.cross_entropy(
-                    masked_predictions,
-                    masked_labels,
-                    reduction='mean'
+                safe_labels = mx.where(mask_tokens, flat_labels, 0)
+                token_losses = nn.losses.cross_entropy(
+                    flat_predictions,
+                    safe_labels,
+                    reduction='none'
+                )
+                valid_weights = mask_tokens.astype(token_losses.dtype)
+                loss = mx.sum(token_losses * valid_weights) / mx.maximum(
+                    mx.sum(valid_weights),
+                    1.0,
                 )
             else:
                 # Standard loss computation on all tokens
@@ -753,11 +782,14 @@ class ModelForSequenceClassification(RaclateBaseModel):
         labels: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
-    ) -> Dict:
+    ) :
         
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape
-            attention_mask = mx.ones((batch_size, seq_len))
+            attention_mask = mx.ones(
+                (batch_size, seq_len),
+                dtype=self.model.embeddings.tok_embeddings.weight.dtype
+            )
 
         outputs = self.model(
             input_ids=input_ids,
@@ -846,10 +878,13 @@ class ModelForTokenClassification(RaclateBaseModel):
         labels: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = True,
-    ) -> Dict:
+    ) :
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape
-            attention_mask = mx.ones((batch_size, seq_len))
+            attention_mask = mx.ones(
+                (batch_size, seq_len),
+                dtype=self.model.embeddings.tok_embeddings.weight.dtype
+            )
 
         outputs = self.model(
             input_ids=input_ids,
@@ -871,10 +906,19 @@ class ModelForTokenClassification(RaclateBaseModel):
 
         loss = None
         if labels is not None:
-            # Compute token classification loss
-            loss = nn.losses.cross_entropy(
-                logits.reshape(-1, self.num_labels),
-                labels.reshape(-1)
+            flat_logits = logits.reshape(-1, self.num_labels)
+            flat_labels = labels.reshape(-1)
+            valid_mask = flat_labels != -100
+            safe_labels = mx.where(valid_mask, flat_labels, 0)
+            token_losses = nn.losses.cross_entropy(
+                flat_logits,
+                safe_labels,
+                reduction="none",
+            )
+            valid_weights = valid_mask.astype(token_losses.dtype)
+            loss = mx.sum(token_losses * valid_weights) / mx.maximum(
+                mx.sum(valid_weights),
+                1.0,
             )
 
         if not return_dict:

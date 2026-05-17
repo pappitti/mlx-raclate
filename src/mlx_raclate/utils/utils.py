@@ -1,13 +1,12 @@
 # Copyright © 2023-2024 Apple Inc.
 
-import contextlib
 import copy
 import glob
 import importlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Optional, Tuple, Type, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -217,7 +216,7 @@ def _verify_weights(model: nn.Module, loaded_weights: dict, train_mode: bool):
     missing_keys = [k for k in model_params.keys() if k not in loaded_weights]
     extra_keys = [k for k in loaded_weights.keys() if k not in model_params]
     
-    head_keywords = ['classifier', 'score', 'head', 'decoder', 'unembedding']
+    head_keywords = ["classifier", "score", "head", "decoder", "dense", "unembedding"]
     missing_head_keys = [k for k in missing_keys if any(x in k for x in head_keywords)]
 
     if missing_head_keys:
@@ -266,13 +265,15 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                         "*.json",
                         "*.safetensors",
                         "*.py",
+                        # "adapters/*/*.json",
+                        # "adapters/*/*.safetensors",
                         "tokenizer.model",
                         "*.tiktoken",
                         "*.txt",
                     ],
                 )
             )
-        except:
+        except Exception:
             raise ModelNotFoundError(
                 f"Model not found for path or HF repo: {path_or_hf_repo}.\n"
                 "Please make sure you specified the local path or Hugging Face"
@@ -293,6 +294,89 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
+def _load_sentence_transformer_dense_layers(
+    model_path: Path,
+    sentence_transformer_modules: list,
+) -> list:
+    dense_layers = []
+    for module in sentence_transformer_modules:
+        module_type = module.get("type", "")
+        module_path = module.get("path", "")
+        if "Dense" not in module_type or not module_path:
+            continue
+
+        config_file = model_path / module_path / "config.json"
+        if not config_file.exists():
+            continue
+
+        with open(config_file, "r") as f:
+            layer_config = json.load(f)
+        layer_config["path"] = module_path
+        dense_layers.append(layer_config)
+    return dense_layers
+
+
+def _is_lateon_dense_layout(dense_layers: list) -> bool:
+    expected = [
+        (768, 1536, True),
+        (1536, 768, True),
+        (768, 128, False),
+    ]
+    if len(dense_layers) != len(expected):
+        return False
+
+    for layer, (in_features, out_features, use_residual) in zip(dense_layers, expected):
+        if int(layer.get("in_features", -1)) != in_features:
+            return False
+        if int(layer.get("out_features", -1)) != out_features:
+            return False
+        if bool(layer.get("use_residual", False)) != use_residual:
+            return False
+    return True
+
+# Not too sure about adpaters. It's necessary for jina models but it adds 
+# complexity. we may et rid of of jina altogether
+def _load_adapter_weights(
+    weights: dict,
+    config: dict,
+    adapter_dir: Path,
+    required: bool = False,
+    adapter_name: Optional[str] = None,
+) -> None:
+    if not adapter_dir.exists():
+        if required:
+            raise FileNotFoundError(f"The adapter path does not exist: {adapter_dir}")
+        return
+
+    adapter_config_file = adapter_dir / "adapter_config.json"
+    if adapter_config_file.exists():
+        with open(adapter_config_file, "r") as f:
+            config["adapter_config"] = json.load(f)
+
+    adapter_weight_files = glob.glob(str(adapter_dir / "adapter*.safetensors"))
+    if not adapter_weight_files:
+        if required:
+            raise FileNotFoundError(f"No adapter safetensors found in {adapter_dir}")
+        return
+
+    inferred_adapter_name = adapter_name or adapter_dir.name
+    task_names = config.get("task_names") or []
+    if inferred_adapter_name in task_names:
+        requested_task = config.get("task")
+        if requested_task is not None and requested_task != inferred_adapter_name:
+            raise ValueError(
+                f"Adapter path '{adapter_dir}' is for task '{inferred_adapter_name}' "
+                f"but model_config requested task '{requested_task}'."
+            )
+        config["task"] = inferred_adapter_name
+
+    for wf in adapter_weight_files:
+        adapter_weights = mx.load(wf)
+        for key, value in adapter_weights.items():
+            adapter_key = key if key.startswith("adapter.") else f"adapter.{key}"
+            weights[adapter_key] = value
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -300,6 +384,7 @@ def load_model(
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
     pipeline: Optional[str] = None,
     train: bool = False, 
+    # adapter_path: Optional[Union[str, Path]] = None,
 ) -> nn.Module:
     """
     Load and initialize the model from a given path.
@@ -319,6 +404,9 @@ def load_model(
         train (bool, optional): Whether the model is being loaded for training.
             In training model, models can be loaded from a different pipeline and
             some weights can be initialized accordingly. Defaults to False.
+        # adapter_path (str | Path, optional): Explicit adapter directory containing
+        #     adapter_config.json and adapter*.safetensors. If omitted, task adapters
+        #     under model_path/adapters/<task> are used when present.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -329,7 +417,19 @@ def load_model(
     """
 
     # check if model_path/config_sentence_transformers.json exists
-    is_sentence_transformer= (model_path / "config_sentence_transformers.json").exists()
+    sentence_transformers_config_file = model_path / "config_sentence_transformers.json"
+    modules_file = model_path / "modules.json"
+    is_sentence_transformer = sentence_transformers_config_file.exists()
+    sentence_transformers_config = {}
+    sentence_transformer_modules = []
+
+    if is_sentence_transformer:
+        with open(sentence_transformers_config_file, "r") as f:
+            sentence_transformers_config = json.load(f)
+
+    if modules_file.exists():
+        with open(modules_file, "r") as f:
+            sentence_transformer_modules = json.load(f)
 
     config = load_config(model_path)
     if 'is_encoder_decoder' in config and config.get('encoder', None):
@@ -339,10 +439,56 @@ def load_model(
         encoder_config = config.get('encoder', {})
         encoder_config['model_type'] = model_type + '_encoder'
         config.update(encoder_config)
-    
+    explicit_model_type = "model_type" in model_config
     config.update(model_config)
 
+    if is_sentence_transformer:
+        config["sentence_transformers_config"] = sentence_transformers_config
+        config["sentence_transformer_modules"] = sentence_transformer_modules
+        
+        # this feels like a terrible hack
+        # the only way to avoid this would be to have something closer
+        # to Sentence Transformers with a dynamic architecture that can be inferred from the config, 
+        # that may be a future iteration 
+        dense_layers = _load_sentence_transformer_dense_layers(
+            model_path,
+            sentence_transformer_modules,
+        )
+        if dense_layers:
+            config["pylate_dense_layers"] = dense_layers
+            config["colbert_dim"] = dense_layers[-1].get(
+                "out_features",
+                config.get("colbert_dim", 128),
+            )
+
+        st_model_type = sentence_transformers_config.get("model_type")
+        if not explicit_model_type and st_model_type == "ColBERT":
+            if (
+                config.get("model_type") == "modernbert"
+                and _is_lateon_dense_layout(dense_layers)
+            ):
+                config["model_type"] = "lateon"
+            else:
+                config["model_type"] = "colbert_zero"
+            config.setdefault("use_late_interaction", True)
+
+        ## Currently a contradiction between pooling strategy in granite's config
+        ## and in the sentence_transformers config, 
+        ## we can enforece the sentence_transformers config here
+        ## or even route to a different model class, 
+        ## for now, all this is ignore and config will be passed to modernbert
+        
+        # if (
+        #     not explicit_model_type
+        #     and config.get("model_type") == "modernbert"
+        #     and config.get("vocab_size") == 180000
+        #     and config.get("hidden_size") == 384
+        # ):
+        #     config["model_type"] = "granite_embedding"
+        #     config["classifier_pooling"] = "cls"
+
     arch = config.get("architectures", None)
+    model_arch = None
     if arch is not None:
         model_arch = _get_pipeline_from_config(arch[0])
 
@@ -369,15 +515,11 @@ def load_model(
             print(f"[INFO] Using pipeline {pipeline} based on Sentence Transformer config file.")
 
     weights = {}
-    modules_file = model_path / "modules.json"
 
     # Sentence Transformer weights may be loaded from subfolders 
     # prefix keys added so sanitize() can identify them
     if is_sentence_transformer and modules_file.exists():
-        with open(modules_file, "r") as f:
-            modules = json.load(f)
-        
-        for module in modules:
+        for module in sentence_transformer_modules:
             sub_path = module.get("path", "")
             module_dir = model_path / sub_path
             
@@ -411,6 +553,25 @@ def load_model(
 
         for wf in weight_files:
             weights.update(mx.load(wf))
+
+    ## disabling adapters for now, we can reintroduce them later if needed, 
+    ## They would be necessary for jina models
+    # if adapter_path is not None:
+    #     _load_adapter_weights(
+    #         weights,
+    #         config,
+    #         Path(adapter_path),
+    #         required=True,
+    #     )
+    # else:
+    #     adapter_root = model_path / "adapters"
+    #     adapter_task = config.get("task", "retrieval")
+    #     _load_adapter_weights(
+    #         weights,
+    #         config,
+    #         adapter_root / adapter_task,
+    #         adapter_name=adapter_task,
+    #     )
 
     target_dtype = _determine_model_dtype(config, weights)
     print(f"[INFO] Model initialized with precision: {target_dtype}")
@@ -491,11 +652,14 @@ def load(
     """
     model_path = get_model_path(path_or_hf_repo)
 
-    model, config = load_model(model_path, lazy, model_config, pipeline=pipeline, train=train)
-    ### disabling adapter for encoders
-    # if adapter_path is not None:
-    #     model = load_adapters(model, adapter_path)
-    #     model.eval()
+    model, config = load_model(
+        model_path,
+        lazy,
+        model_config,
+        pipeline=pipeline,
+        train=train,
+        # adapter_path=adapter_path,
+    )
     tokenizer = load_tokenizer(model_path, tokenizer_config)
 
     return model, tokenizer

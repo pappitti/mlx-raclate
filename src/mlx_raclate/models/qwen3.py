@@ -8,6 +8,7 @@ import mlx.nn as nn
 from .base import (
     BaseModelArgs,
     RaclateBaseModel,
+    RotaryEmbedding,
     last_token_pooling,
     normalize_embeddings,
     compute_similarity_and_loss,
@@ -129,10 +130,17 @@ class Attention(nn.Module):
 
         self.q_norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
-        self.rope = nn.RoPE(dims=head_dim, base=config.rope_theta)
+        self.rope = RotaryEmbedding(
+            dims=head_dim,
+            base=config.rope_theta,
+            traditional=False,
+        )
 
     def __call__(
-        self, hidden_states: mx.array, attention_mask: Optional[mx.array] = None
+        self,
+        hidden_states: mx.array,
+        attention_mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = hidden_states.shape
 
@@ -152,8 +160,8 @@ class Attention(nn.Module):
 
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        queries = self.rope(queries)
-        keys = self.rope(keys)
+        queries = self.rope(queries, position_ids=position_ids)
+        keys = self.rope(keys, position_ids=position_ids)
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=attention_mask
@@ -191,10 +199,15 @@ class TransformerBlock(nn.Module):
         self.config = config
 
     def __call__(
-        self, hidden_states: mx.array, attention_mask: Optional[mx.array] = None
+        self,
+        hidden_states: mx.array,
+        attention_mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         attention_output = self.self_attn(
-            self.input_layernorm(hidden_states), attention_mask
+            self.input_layernorm(hidden_states),
+            attention_mask,
+            position_ids,
         )
         hidden_states = hidden_states + attention_output[0]
         mlp_output = self.mlp(self.post_attention_layernorm(hidden_states))
@@ -256,14 +269,24 @@ class Qwen3Model(nn.Module):
             dtype=model_dtype
         )
 
+        all_hidden_states = () if output_hidden_states else None
         for layer in self.layers:
-            layer_outputs = layer(hidden_states, attention_mask)
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+            layer_outputs = layer(hidden_states, attention_mask, position_ids)
             hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
 
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, all_hidden_states] if v is not None)
+
         return {
             "last_hidden_state": hidden_states,
+            "hidden_states": all_hidden_states,
         }
 
 # Not used for now
@@ -299,7 +322,7 @@ class Model(RaclateBaseModel):
             attention_mask: Optional[mx.array] = None, 
             output_hidden_states: Optional[bool] = False,
             return_dict: Optional[bool] = True,
-    ) -> Dict:
+    ) :
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape
             attention_mask = mx.ones(
@@ -307,7 +330,13 @@ class Model(RaclateBaseModel):
                 dtype=self.model.embed_tokens.weight.dtype,
             )
 
-        out = self.model(input_ids, attention_mask)
+        out = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
         last_hidden_state = (
             out["last_hidden_state"] if isinstance(out, dict) else out[0]
         )
@@ -349,8 +378,19 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
         self.model_type = config.model_type # not used for now (placeholder)
         self.model = Qwen3Model(config)
 
-    def _call_model(self, input_ids, attention_mask=None, return_dict=True):
-        out = self.model(input_ids, attention_mask)
+    def _call_model(
+        self,
+        input_ids,
+        attention_mask=None,
+        position_ids=None,
+        return_dict=True,
+    ):
+        out = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
+        )
         last_hidden_state = (
             out["last_hidden_state"] if isinstance(out, dict) else out[0]
         )
@@ -386,6 +426,8 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
         similarity_scores: Optional[mx.array] = None,  # Shape: [batch_size, num_references]
         position_ids: Optional[mx.array] = None,
         return_dict: Optional[bool] = True,
+        reference_position_ids: Optional[mx.array] = None,
+        negative_position_ids: Optional[mx.array] = None,
     ):
         
         if attention_mask is None:
@@ -399,6 +441,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
         batch_outputs = self._call_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             return_dict=True
         )
         embeddings = batch_outputs["embeddings"]  # [batch_size, hidden_size]
@@ -412,6 +455,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             ref_outputs = self._call_model(
                 input_ids=reference_input_ids,
                 attention_mask=reference_attention_mask,
+                position_ids=reference_position_ids,
                 return_dict=True
             )
             reference_embeddings = ref_outputs["embeddings"]  # [num_references, hidden_size]
@@ -425,6 +469,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
                 similarity_scores,
                 negative_input_ids,
                 negative_attention_mask,
+                negative_position_ids,
             )
             
         if not return_dict:
@@ -530,7 +575,7 @@ class ModelForSequenceClassification(RaclateBaseModel):
         labels: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
-    ) -> Dict:
+    ) :
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape
             attention_mask = mx.ones(
@@ -540,7 +585,7 @@ class ModelForSequenceClassification(RaclateBaseModel):
 
         outputs = self.model(
             input_ids, 
-            attention_mask,
+            attention_mask=attention_mask,
             position_ids=position_ids,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
@@ -579,4 +624,4 @@ class ModelForSequenceClassification(RaclateBaseModel):
         return _sanitize_backbone(weights)
 
 # TokenClassification and MaskedLM not implemented for now AR models such as Qwen3
-# Attempting to train pretrained weights would be catastrophic 
+# Attempting to train pretrained weights would be catastrophic

@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .base import (
     BaseModelArgs,
+    RotaryEmbedding,
     mean_pooling,
     normalize_embeddings,
     compute_similarity_and_loss,
@@ -143,7 +144,7 @@ class Attention(nn.Module):
             args.rope_theta
         )
 
-        self.rope = nn.RoPE(
+        self.rope = RotaryEmbedding(
             head_dim,
             traditional=args.rope_traditional,
             base=base,
@@ -156,7 +157,8 @@ class Attention(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None
+        mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, _ = x.shape
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -164,8 +166,8 @@ class Attention(nn.Module):
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        queries = self.rope(queries)
-        keys = self.rope(keys)
+        queries = self.rope(queries, position_ids=position_ids)
+        keys = self.rope(keys, position_ids=position_ids)
 
         if self.attn_logit_softcapping is None:
             output = mx.fast.scaled_dot_product_attention(
@@ -226,10 +228,11 @@ class TransformerBlock(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None
+        mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         r = x
-        h = self.self_attn(self.pre_self_attn_layernorm(x), mask)
+        h = self.self_attn(self.pre_self_attn_layernorm(x), mask, position_ids)
         h = self.post_self_attn_layernorm(h)
         h = r + self.dropout(h)
         r = h
@@ -331,7 +334,7 @@ class T5GemmaEncoder(nn.Module):
         for i, layer in enumerate(self.layers):
             is_global = self.config.layer_types[i] == "full_attention"
             layer_mask = global_mask if is_global else sliding_window_mask
-            layer_outputs = layer(hidden_states, layer_mask)
+            layer_outputs = layer(hidden_states, layer_mask, position_ids)
             hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
@@ -399,7 +402,13 @@ class Model(RaclateBaseModel):
                 dtype=self.model.embed_tokens.weight.dtype,
             )
 
-        out = self.model(input_ids, attention_mask)
+        out = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
         last_hidden_state = (
             out["last_hidden_state"] if isinstance(out, dict) else out[0]
         )
@@ -446,7 +455,12 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
         output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
     ):
-        out = self.model(input_ids, attention_mask)
+        out = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            return_dict=True,
+        )
         last_hidden_state = (
             out["last_hidden_state"] if isinstance(out, dict) else out[0]
         )
@@ -482,6 +496,8 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
         similarity_scores: Optional[mx.array] = None,  # Shape: [batch_size, num_references]
         position_ids: Optional[mx.array] = None,
         return_dict: Optional[bool] = True,
+        reference_position_ids: Optional[mx.array] = None,
+        negative_position_ids: Optional[mx.array] = None,
     ):
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape
@@ -506,7 +522,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             ref_outputs = self._call_model(
                 input_ids=reference_input_ids,
                 attention_mask=reference_attention_mask,
-                position_ids=position_ids, ### ?
+                position_ids=reference_position_ids,
                 return_dict=True
             )
             reference_embeddings = ref_outputs["embeddings"]  # [num_references, hidden_size]
@@ -520,6 +536,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
                 similarity_scores,
                 negative_input_ids,
                 negative_attention_mask,
+                negative_position_ids,
             )
          
         if not return_dict:
@@ -606,7 +623,7 @@ class ModelForSequenceClassification(RaclateBaseModel):
         labels: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
-    ) -> Dict:
+    ) :
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape
             attention_mask = mx.ones(
@@ -705,7 +722,7 @@ class ModelForMaskedLM(RaclateBaseModel):
         position_ids: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = True,
-    ) -> Dict:
+    ):
         
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape 
@@ -734,14 +751,16 @@ class ModelForMaskedLM(RaclateBaseModel):
                 ignore_index = getattr(self.config, "sparse_pred_ignore_index", -100)
                 mask_tokens = flat_labels != ignore_index
                 
-                # Only compute loss on masked tokens
-                masked_predictions = flat_predictions[mask_tokens]
-                masked_labels = flat_labels[mask_tokens]
-                
-                loss = nn.losses.cross_entropy(
-                    masked_predictions,
-                    masked_labels,
-                    reduction='mean'
+                safe_labels = mx.where(mask_tokens, flat_labels, 0)
+                token_losses = nn.losses.cross_entropy(
+                    flat_predictions,
+                    safe_labels,
+                    reduction='none'
+                )
+                valid_weights = mask_tokens.astype(token_losses.dtype)
+                loss = mx.sum(token_losses * valid_weights) / mx.maximum(
+                    mx.sum(valid_weights),
+                    1.0,
                 )
             else:
                 # Standard loss computation on all tokens
@@ -805,7 +824,7 @@ class ModelForTokenClassification(RaclateBaseModel):
         labels: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = True,
-    ) -> Dict:
+    ) :
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape
             attention_mask = mx.ones((batch_size, seq_len))
@@ -829,10 +848,19 @@ class ModelForTokenClassification(RaclateBaseModel):
 
         loss = None
         if labels is not None:
-            # Compute token classification loss
-            loss = nn.losses.cross_entropy(
-                logits.reshape(-1, self.num_labels),
-                labels.reshape(-1)
+            flat_logits = logits.reshape(-1, self.num_labels)
+            flat_labels = labels.reshape(-1)
+            valid_mask = flat_labels != -100
+            safe_labels = mx.where(valid_mask, flat_labels, 0)
+            token_losses = nn.losses.cross_entropy(
+                flat_logits,
+                safe_labels,
+                reduction="none",
+            )
+            valid_weights = valid_mask.astype(token_losses.dtype)
+            loss = mx.sum(token_losses * valid_weights) / mx.maximum(
+                mx.sum(valid_weights),
+                1.0,
             )
 
         if not return_dict:

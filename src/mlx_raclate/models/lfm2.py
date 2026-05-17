@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .base import (
     BaseModelArgs,
+    RotaryEmbedding,
     last_token_pooling,
     mean_pooling,
     normalize_embeddings,
@@ -148,7 +149,7 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.out_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.rope = nn.RoPE(
+        self.rope = RotaryEmbedding(
             self.head_dim,
             base=args.rope_theta,
             traditional=False,
@@ -158,7 +159,8 @@ class Attention(nn.Module):
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None
+        cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -172,8 +174,8 @@ class Attention(nn.Module):
         )
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        queries = self.rope(queries)
-        keys = self.rope(keys)
+        queries = self.rope(queries, position_ids=position_ids)
+        keys = self.rope(keys, position_ids=position_ids)
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -281,10 +283,16 @@ class Lfm2DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
 
         if self.is_attention_layer:
-            r = self.self_attn(self.operator_norm(x), mask=mask, cache=cache)
+            r = self.self_attn(
+                self.operator_norm(x),
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+            )
         else:
             r = self.conv(
                 self.operator_norm(x),
@@ -359,6 +367,7 @@ class Lfm2Model(nn.Module):
         self,
         input_ids: mx.array,
         attention_mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
     ):
 
         hidden_states = self.embed_tokens(input_ids)
@@ -371,7 +380,7 @@ class Lfm2Model(nn.Module):
 
         for layer, c in zip(self.layers, cache):
             mask = attn_mask if layer.is_attention_layer else conv_mask
-            layer_outputs = layer(hidden_states, mask, cache=c)
+            layer_outputs = layer(hidden_states, mask, cache=c, position_ids=position_ids)
             hidden_states = layer_outputs[0]
 
         hidden_states = self.embedding_norm(hidden_states)
@@ -404,7 +413,11 @@ class Model(RaclateBaseModel):
                 dtype=self.model.embed_tokens.weight.dtype,
             )
 
-        out = self.model(input_ids, attention_mask)
+        out = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
 
         last_hidden_state = (
             out["last_hidden_state"] if isinstance(out, dict) else out[0]
@@ -446,8 +459,18 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             nn.Linear(config.block_dim, config.out_features, bias=False),
         ]
 
-    def _call_model(self, input_ids, attention_mask=None, return_dict=True):
-        out = self.model(input_ids, attention_mask)
+    def _call_model(
+        self,
+        input_ids,
+        attention_mask=None,
+        position_ids=None,
+        return_dict=True,
+    ):
+        out = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
         last_hidden_state = (
             out["last_hidden_state"] if isinstance(out, dict) else out[0]
         )
@@ -487,6 +510,8 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
         similarity_scores: Optional[mx.array] = None,  # Shape: [batch_size, num_references]
         position_ids: Optional[mx.array] = None,
         return_dict: Optional[bool] = True,
+        reference_position_ids: Optional[mx.array] = None,
+        negative_position_ids: Optional[mx.array] = None,
     ):
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape
@@ -499,6 +524,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
         batch_outputs = self._call_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             return_dict=True
         )
         embeddings = batch_outputs["embeddings"]  # [batch_size, hidden_size]
@@ -511,6 +537,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             ref_outputs = self._call_model(
                 input_ids=reference_input_ids,
                 attention_mask=reference_attention_mask,
+                position_ids=reference_position_ids,
                 return_dict=True
             )
             reference_embeddings = ref_outputs["embeddings"]  # [num_references, hidden_size]
@@ -523,7 +550,8 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
                 self._call_model,
                 similarity_scores,
                 negative_input_ids,
-                negative_attention_mask
+                negative_attention_mask,
+                negative_position_ids,
             )
             
         if not return_dict:
@@ -620,7 +648,7 @@ class ModelForSequenceClassification(RaclateBaseModel):
         labels: Optional[mx.array] = None,
         output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
-    ) -> Dict:
+    ) :
         if attention_mask is None:
             batch_size, seq_len = input_ids.shape
             attention_mask = mx.ones(
@@ -630,7 +658,8 @@ class ModelForSequenceClassification(RaclateBaseModel):
 
         outputs = self.model(
             input_ids, 
-            attention_mask
+            attention_mask=attention_mask,
+            position_ids=position_ids,
         )
         last_hidden_state = (
             outputs["last_hidden_state"] if isinstance(outputs, dict) else outputs[0]
@@ -668,4 +697,4 @@ class ModelForSequenceClassification(RaclateBaseModel):
     
 
 # TokenClassification and MaskedLM not implemented for now AR models such as LFM2
-# Attempting to train pretrained weights would be catastrophic 
+# Attempting to train pretrained weights would be catastrophic

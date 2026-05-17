@@ -2,7 +2,12 @@ import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten
 
-from mlx_raclate.models.openai_privacy_filter import ModelArgs, ModelForTokenClassification
+from mlx_raclate.models.openai_privacy_filter import (
+    ModelArgs,
+    ModelForSequenceClassification,
+    ModelForTokenClassification,
+    OpenAIPrivacyFilterModel,
+)
 from mlx_raclate.utils.utils import _initialize_head_weights, _verify_weights
 
 
@@ -40,6 +45,14 @@ def test_openai_privacy_filter_tiny_forward():
     assert outputs["logits"].shape == (2, 4, 5)
     assert outputs["probabilities"].shape == (2, 4, 5)
     assert outputs["loss"] is not None
+
+
+def test_openai_privacy_filter_update_attention_mask_requires_dtype():
+    model = OpenAIPrivacyFilterModel(_tiny_config())
+    attention_mask = mx.array([[1, 1, 1, 0]], dtype=mx.int32)
+
+    with pytest.raises(ValueError, match="dtype must be provided"):
+        model._update_attention_mask(attention_mask, dtype=None)
 
 
 def test_openai_privacy_filter_sanitize_hf_attention_weights():
@@ -96,6 +109,25 @@ def test_openai_privacy_filter_sanitize_targets_existing_parameters():
     )
 
     assert set(sanitized) <= param_names
+
+
+def test_openai_privacy_filter_sequence_sanitize_targets_existing_parameters():
+    model = ModelForSequenceClassification(_tiny_config())
+    param_names = {name for name, _ in tree_flatten(model.parameters())}
+
+    sanitized = model.sanitize(
+        {
+            "model.layers.0.input_layernorm.weight": mx.ones((32,), dtype=mx.float32),
+            "score.weight": mx.zeros((5, 32), dtype=mx.float32),
+            "score.bias": mx.zeros((5,), dtype=mx.float32),
+            "classifier.weight": mx.zeros((5, 32), dtype=mx.float32),
+            "classifier.bias": mx.zeros((5,), dtype=mx.float32),
+        }
+    )
+
+    assert set(sanitized) <= param_names
+    assert "score.weight" in sanitized
+    assert "score.bias" not in sanitized
 
 
 def test_openai_privacy_filter_sanitize_hf_layout_loads_strictly():
