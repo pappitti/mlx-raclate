@@ -8,10 +8,9 @@ Run with: pytest tests/test_training.py -v --run-slow
 """
 
 import pytest
-import mlx.core as mx
 from datasets import Dataset as HFDataset
 
-from .model_registry import MODEL_FAMILIES, TRAINABLE_PIPELINES, BASE_MODELS
+from .model_registry import MODEL_FAMILIES, BASE_MODELS, get_trainable_pipelines
 from .test_fixtures import (
     generate_classification_dataset,
     generate_similarity_dataset,
@@ -27,7 +26,7 @@ def _get_training_params():
     """Generate pytest parameters for training tests."""
     params = []
     for family in MODEL_FAMILIES:
-        for pipeline in TRAINABLE_PIPELINES:
+        for pipeline in get_trainable_pipelines(family):
             params.append(
                 pytest.param(
                     family,

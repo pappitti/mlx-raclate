@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-import re
 from typing import Any, Dict, List, Literal, Optional
 
 import mlx.core as mx
@@ -412,6 +411,14 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             "loss": loss,
             "similarities": similarities,
             "embeddings": embeddings,
+        }
+
+    def sanitize(self, weights):
+        sanitized = _sanitize_neobert_weights(weights)
+        return {
+            key: value
+            for key, value in sanitized.items()
+            if key.startswith("model.")
         }
 
 

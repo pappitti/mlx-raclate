@@ -23,6 +23,17 @@ MODEL_FAMILIES = [
     "neobert",
 ]
 
+# Additional architecture wrappers covered by inference endpoint tests.
+INFERENCE_ONLY_MODEL_FAMILIES = [
+    "openai_privacy_filter",
+    "granite_embedding",
+    "colbert_zero",
+    "lateon",
+    "bidirectional_pplx_qwen3",
+]
+
+ALL_MODEL_FAMILIES = MODEL_FAMILIES + INFERENCE_ONLY_MODEL_FAMILIES
+
 # Pipelines that support training
 TRAINABLE_PIPELINES = [
     "text-classification",
@@ -30,6 +41,17 @@ TRAINABLE_PIPELINES = [
     "masked-lm",
     "token-classification",
 ]
+
+# Training support depends on the available local head implementations.
+TRAINABLE_PIPELINES_BY_FAMILY: Dict[str, List[str]] = {
+    "modernbert": TRAINABLE_PIPELINES,
+    "qwen3": ["text-classification", "sentence-similarity"],
+    "gemma3": TRAINABLE_PIPELINES,
+    "t5gemma": TRAINABLE_PIPELINES,
+    "lfm2": ["text-classification", "sentence-similarity"],
+    "neobert": TRAINABLE_PIPELINES,
+    "openai_privacy_filter": ["text-classification", "sentence-similarity", "token-classification"],
+}
 
 # Base models for each family (used for training tests when no pretrained head exists)
 BASE_MODELS: Dict[str, str] = {
@@ -39,6 +61,7 @@ BASE_MODELS: Dict[str, str] = {
     "t5gemma": "google/t5gemma-s-s-ul2",
     "lfm2": "LiquidAI/LFM2-350M",
     "neobert": "chandar-lab/NeoBERT",
+    "openai_privacy_filter": "openai/privacy-filter",
 }
 
 @dataclass
@@ -86,25 +109,29 @@ def _init_registry():
     _register("lfm2", "sentence-similarity", "LiquidAI/LFM2-ColBERT-350M",
               model_config={"use_late_interaction": True},
               notes="Late interaction (ColBERT-style) model")
+    
+    # OpenAI endpoints 
+    _register("openai_privacy_filter", "token-classification", "openai/privacy-filter")
+
 
     # NeoBERT endpoints (custom HF code implemented locally in mlx-raclate)
     _register("neobert", "embeddings", "chandar-lab/NeoBERT",
-              model_config={"model_type": "neobert", "classifier_pooling": "cls"},
               notes="NeoBERT encoder with RoPE, SwiGLU and pre-RMSNorm")
     _register("neobert", "masked-lm", "chandar-lab/NeoBERT",
               notes="Remote-code NeoBERTLMHead implemented locally")
 
     # Backbone-derived embedding endpoints with dedicated thin wrappers
     _register("granite_embedding", "embeddings", "ibm-granite/granite-embedding-97m-multilingual-r2",
-              model_config={"model_type": "granite_embedding", "classifier_pooling": "cls"},
               notes="ModernBERT-derived Granite embedding model with SiLU MLP and CLS pooling")
     _register("colbert_zero", "sentence-similarity", "lightonai/ColBERT-Zero",
-              model_config={"model_type": "colbert_zero", "use_late_interaction": True},
               notes="ModernBERT + PyLate dense projection + MaxSim")
     _register("lateon", "sentence-similarity", "lightonai/LateOn",
               notes="ModernBERT + PyLate residual dense stack + MaxSim; auto-detected from Dense module layout")
     _register("bidirectional_pplx_qwen3", "embeddings", "perplexity-ai/pplx-embed-v1-0.6b",
               notes="Qwen3-derived embedding model with bidirectional attention and mean pooling")
+    _register("openai_privacy_filter", "text-classification", "OpenMed/privacy-filter-nemotron")
+    
+    
     # _register("jina_embeddings_v5", "embeddings", "jinaai/jina-embeddings-v5-text-small",
     #           notes="Qwen3-derived Jina v5 text-small wrapper; task adapters require adapter loading")
 
@@ -139,14 +166,14 @@ def register_endpoint(
     Use this to add endpoints not in the curated list.
     
     Args:
-        model_family: One of MODEL_FAMILIES
+        model_family: One of ALL_MODEL_FAMILIES
         pipeline: One of PIPELINES  
         endpoint: HuggingFace model ID or local path
         model_config: Additional model configuration
         notes: Optional notes about the endpoint
     """
-    if model_family not in MODEL_FAMILIES:
-        raise ValueError(f"Unknown model family: {model_family}. Must be one of {MODEL_FAMILIES}")
+    if model_family not in ALL_MODEL_FAMILIES:
+        raise ValueError(f"Unknown model family: {model_family}. Must be one of {ALL_MODEL_FAMILIES}")
     if pipeline not in PIPELINES:
         raise ValueError(f"Unknown pipeline: {pipeline}. Must be one of {PIPELINES}")
     
@@ -165,6 +192,15 @@ def get_endpoint(model_family: str, pipeline: str) -> Optional[EndpointConfig]:
 def get_all_endpoints() -> Dict[Tuple[str, str], EndpointConfig]:
     """Get all registered endpoints."""
     return _ENDPOINT_REGISTRY.copy()
+
+def get_trainable_pipelines(model_family: str) -> List[str]:
+    """Get the trainable pipelines implemented for a model family."""
+    return TRAINABLE_PIPELINES_BY_FAMILY.get(model_family, [])
+
+
+def get_registered_model_families() -> List[str]:
+    """Get model families that currently have registered inference endpoints."""
+    return list(dict.fromkeys(model_family for model_family, _ in _ENDPOINT_REGISTRY))
 
 
 def get_inference_test_cases() -> List[Tuple[str, str, EndpointConfig]]:
@@ -202,6 +238,7 @@ def get_coverage_report() -> str:
     lines = ["=" * 60, "Model Registry Coverage Report", "=" * 60, ""]
     
     # Create a matrix
+    lines.append("Core family/pipeline matrix")
     header = "Pipeline".ljust(25) + "".join(fam[:8].center(10) for fam in MODEL_FAMILIES)
     lines.append(header)
     lines.append("-" * len(header))
@@ -225,6 +262,11 @@ def get_coverage_report() -> str:
             lines.append(f"   - ({fam}, {pipe})")
     else:
         lines.append("✓ All combinations have test endpoints")
+
+    lines.append("")
+    lines.append("Registered inference endpoint tests:")
+    for model_family, pipeline, config in get_inference_test_cases():
+        lines.append(f"   - ({model_family}, {pipeline}): {config.endpoint}")
     
     lines.append("=" * 60)
     
