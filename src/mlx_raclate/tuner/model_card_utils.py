@@ -1,5 +1,6 @@
 from typing import List, Optional
 import importlib
+import inspect
 
 # Pipeline to module mapping
 _PIPELINE_TO_MODULE = {
@@ -8,6 +9,7 @@ _PIPELINE_TO_MODULE = {
     "sentence-transformers": "sentence_similarity",  # Same module, similar code
     "embeddings": "embeddings",
     "masked-lm": "masked_lm",
+    "token-classification": "token_classification",
     "zero-shot-classification": "zero_shot",
 }
 
@@ -66,8 +68,15 @@ def get_inference_code(
                 "Make sure the tests package is installed or accessible."
             )
     
-    # Call the module's get_example_code function
-    return module.get_example_code(model_path=model_path, **kwargs)
+    # Call the module's get_example_code function. Trainer-level kwargs can include
+    # fields that only some templates understand, so keep model-card generation lenient.
+    signature = inspect.signature(module.get_example_code)
+    accepted_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in signature.parameters
+    }
+    return module.get_example_code(model_path=model_path, **accepted_kwargs)
 
 
 def get_available_pipelines() -> List[str]:

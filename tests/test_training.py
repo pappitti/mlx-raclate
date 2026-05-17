@@ -195,6 +195,26 @@ def test_ner_dataset_generation():
     assert len(data["text"]) == 10
     assert all(len(tokens) == len(labels) for tokens, labels in zip(data["text"], data["labels"]))
 
+
+def test_token_classification_dataset_columns_are_standardized():
+    """Test HF-style token-classification columns map to trainer columns."""
+    from mlx_raclate.tuner.datasets import DatasetArgs, _standardize_column_names
+
+    dataset = HFDataset.from_dict(
+        {
+            "tokens": [["John", "lives", "there"]],
+            "ner_tags": [[1, 0, 0]],
+        }
+    )
+    args = DatasetArgs(data="unused", task_type="token-classification")
+
+    standardized = _standardize_column_names(dataset, args)
+
+    assert "text" in standardized.column_names
+    assert "labels" in standardized.column_names
+    assert standardized[0]["text"] == ["John", "lives", "there"]
+    assert standardized[0]["labels"] == [1, 0, 0]
+
 def test_label_mappings_generation():
     """Test label mapping generators."""
     id2label = generate_id2label(3)
@@ -204,3 +224,19 @@ def test_label_mappings_generation():
     assert len(label2id) == 3
     assert all(str(k) in id2label for k in range(3))
     assert all(label2id[v] == int(k) for k, v in id2label.items())
+
+
+def test_training_args_runtime_memory_options():
+    """Test runtime memory knobs are exposed with expected defaults."""
+    from mlx_raclate.tuner.trainer import TrainingArgs
+
+    default_args = TrainingArgs()
+    assert default_args.grad_checkpoint is True
+    assert default_args.cache_clear_steps == 1
+
+    custom_args = TrainingArgs(
+        grad_checkpoint=False,
+        cache_clear_steps=8,
+    )
+    assert custom_args.grad_checkpoint is False
+    assert custom_args.cache_clear_steps == 8

@@ -414,21 +414,26 @@ class OpenAIPrivacyFilterExperts(nn.Module):
 
 	def __call__(self, hidden_states: mx.array, router_indices: mx.array, router_scores: mx.array) -> mx.array:
 		next_states = mx.zeros(hidden_states.shape, dtype=mx.float32)
+		token_count = hidden_states.shape[0]
+		token_indices = mx.stop_gradient(mx.arange(token_count, dtype=router_indices.dtype))
+		hidden_states = hidden_states[:, None, :].astype(mx.float32)
 
 		for slot in range(self.top_k):
-			expert_indices = router_indices[:, slot]
+			expert_indices = mx.stop_gradient(router_indices[:, slot])
 			weights = router_scores[:, slot : slot + 1].astype(mx.float32)
-			gate_up_weight = self.gate_up_proj[expert_indices].astype(mx.float32)
-			gate_up = mx.matmul(
-				hidden_states[:, None, :].astype(mx.float32),
-				gate_up_weight,
+			gate_up = mx.gather_mm(
+				hidden_states,
+				self.gate_up_proj,
+				lhs_indices=token_indices,
+				rhs_indices=expert_indices,
 			).squeeze(1)
 			gate_up = gate_up + self.gate_up_proj_bias[expert_indices].astype(mx.float32)
 			gated_output = self._apply_gate(gate_up)
-			down_weight = self.down_proj[expert_indices].astype(mx.float32)
-			expert_output = mx.matmul(
+			expert_output = mx.gather_mm(
 				gated_output[:, None, :].astype(mx.float32),
-				down_weight,
+				self.down_proj,
+				lhs_indices=token_indices,
+				rhs_indices=expert_indices,
 			).squeeze(1)
 			expert_output = expert_output + self.down_proj_bias[expert_indices].astype(mx.float32)
 			next_states = next_states + expert_output * weights
@@ -448,10 +453,10 @@ class OpenAIPrivacyFilterTopKRouter(nn.Module):
 			hidden_states.astype(mx.float32),
 			self.weight.astype(mx.float32).T,
 		) + self.bias.astype(mx.float32)
-		sorted_indices = mx.argsort(logits, axis=-1)[..., -self.top_k :]
-		top_values = mx.take_along_axis(logits, sorted_indices, axis=-1)
+		top_indices = mx.argpartition(logits, kth=-self.top_k, axis=-1)[..., -self.top_k :]
+		top_values = mx.take_along_axis(logits, top_indices, axis=-1)
 		router_scores = mx.softmax(top_values, axis=-1) / self.top_k
-		return logits, router_scores, sorted_indices
+		return logits, router_scores, mx.stop_gradient(top_indices)
 
 
 class OpenAIPrivacyFilterMLP(nn.Module):
