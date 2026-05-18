@@ -200,13 +200,13 @@ def _prepare_split(
         remove_columns=dataset.column_names,
         features=features,
         keep_in_memory=False,
-        desc=f"Tokenizing {split} with OpenAI tokenizer and aligning spans",
+        desc=f"Tokenizing {split} with model tokenizer and aligning spans",
     )
 
 
 def _write_metadata(output_dir: Path, args, train_dataset, validation_dataset) -> None:
     ontology = {
-        "name": "openai_nemotron_company_person_v1",
+        "name": "nemotron_company_person_v1",
         "model": args.model,
         "source_dataset": "nvidia/Nemotron-PII",
         "max_length": args.max_length,
@@ -240,7 +240,7 @@ def _optional_positive_int(value: str) -> Optional[int]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Prepare an OpenAI-tokenized Nemotron PII dataset for token classification."
+        description="Prepare a model-tokenized Nemotron PII dataset for token classification."
     )
     parser.add_argument("--model", default="openai/privacy-filter")
     parser.add_argument("--output-dir", default="data/nemotron_openai_tokenized_v1")
@@ -272,7 +272,7 @@ def main():
     validation_dataset.to_parquet(str(output_dir / "validation.parquet"))
     _write_metadata(output_dir, args, train_dataset, validation_dataset)
 
-    print(f"Saved OpenAI-tokenized Nemotron dataset to {output_dir}")
+    print(f"Saved model-tokenized Nemotron dataset to {output_dir}")
     print(f"Labels: {len(LABELS)}")
     print(f"Train rows: {len(train_dataset)}")
     print(f"Validation rows: {len(validation_dataset)}")

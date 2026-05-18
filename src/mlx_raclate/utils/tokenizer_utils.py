@@ -287,7 +287,7 @@ class TokenizerWrapper:
 
 
 def _match(a, b):
-    if type(a) != type(b):
+    if type(a) is not type(b):
         return False
     if isinstance(a, dict):
         return len(a) == len(b) and all(k in b and _match(a[k], b[k]) for k in a)
@@ -347,7 +347,10 @@ def load_tokenizer(model_path, tokenizer_config_extra={}):
             elif _is_bpe_decoder(tokenizer_content["decoder"]):
                 detokenizer_class = BPEStreamingDetokenizer
 
+    tokenizer_config = {"trust_remote_code": False}
+    tokenizer_config.update(tokenizer_config_extra)
+
     return TokenizerWrapper(
-        AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra),
+        AutoTokenizer.from_pretrained(model_path, **tokenizer_config),
         detokenizer_class,
     )

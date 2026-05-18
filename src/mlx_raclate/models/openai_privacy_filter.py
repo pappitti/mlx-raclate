@@ -94,6 +94,8 @@ class ModelArgs(BaseModelArgs):
 	def __post_init__(self):
 		if self.num_experts is not None:
 			self.num_local_experts = self.num_experts
+		else:
+			self.num_experts = self.num_local_experts
 
 		if self.experts_per_token is not None:
 			self.num_experts_per_tok = self.experts_per_token

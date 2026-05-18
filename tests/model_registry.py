@@ -11,7 +11,16 @@ additional endpoints via pytest fixtures.
 
 from typing import Dict, Tuple, Optional, List
 from dataclasses import dataclass, field
-from mlx_raclate.utils.utils import PIPELINES
+
+PIPELINES = [
+    "embeddings",
+    "masked-lm",
+    "text-classification",
+    "token-classification",
+    "sentence-transformers",
+    "zero-shot-classification",
+    "sentence-similarity",
+]
 
 # Model families supported by the library
 MODEL_FAMILIES = [

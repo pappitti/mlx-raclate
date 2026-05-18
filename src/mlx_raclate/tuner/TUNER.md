@@ -271,6 +271,7 @@ Controls the hyperparameters and runtime configuration.
 | `save_steps` | `1000` | Frequency of saving model checkpoints (in steps). |
 | `logging_steps` | `100` | Frequency of logging metrics to console/files. |
 | `eval_batch_size` | `4` | Batch size used during evaluation/testing. |
+| `eval_strategy` | `"end"` | When to run validation: `"end"` for the final epoch only, `"epoch"` after every epoch, or `"no"` to skip validation during training. |
 | `resume_from_step`| `0` | Step to resume training from. If this is after the last warmup step (either declared or calculated via warmup_ratio), warmup will be ignored. |  
 | `grad_checkpoint` | `True` | Whether to wrap transformer layers in MLX gradient checkpointing to reduce activation memory. |
 | `cache_clear_steps` | `1` | Clear MLX cache every N optimizer updates. `1` is safest for large/MoE models; higher values can improve speed but may increase process footprint. |

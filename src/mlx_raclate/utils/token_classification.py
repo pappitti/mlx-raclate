@@ -508,6 +508,388 @@ def decode_token_classification_batch(
     return decoded
 
 
+def bioes_tags_to_spans(
+    labels: Sequence[str],
+    outside_label: str = "O",
+) -> List[Dict[str, Any]]:
+    """Decode BIO/BIOES token labels into token-indexed entity spans."""
+    spans: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+
+    def flush_current():
+        nonlocal current
+        if current is None:
+            return
+        spans.append(current)
+        current = None
+
+    for token_index, label in enumerate(labels):
+        if label == outside_label:
+            flush_current()
+            continue
+
+        prefix, entity_group = _split_bioes_label(label)
+        if prefix is None:
+            flush_current()
+            spans.append(
+                {
+                    "entity_group": label,
+                    "start": token_index,
+                    "end": token_index + 1,
+                }
+            )
+            continue
+
+        if prefix == "S":
+            flush_current()
+            spans.append(
+                {
+                    "entity_group": entity_group,
+                    "start": token_index,
+                    "end": token_index + 1,
+                }
+            )
+            continue
+
+        if prefix == "B":
+            flush_current()
+            current = {
+                "entity_group": entity_group,
+                "start": token_index,
+                "end": token_index + 1,
+            }
+            continue
+
+        if current is None or current["entity_group"] != entity_group:
+            flush_current()
+            current = {
+                "entity_group": entity_group,
+                "start": token_index,
+                "end": token_index + 1,
+            }
+        else:
+            current["end"] = token_index + 1
+
+        if prefix == "E":
+            flush_current()
+
+    flush_current()
+    return spans
+
+
+def compute_token_classification_metrics(
+    predictions,
+    references,
+    *,
+    id2label: Optional[Mapping[Any, str]] = None,
+    ignore_index: int = -100,
+    outside_label: str = "O",
+    labels: Optional[Sequence[Any]] = None,
+    include_outside_in_macro: bool = False,
+) -> Dict[str, Any]:
+    """
+    Compute token and exact-boundary metrics for token classification.
+
+    `predictions` and `references` should be batched sequences of label ids or
+    label names. Positions with `reference == ignore_index` are skipped.
+    Boundary F1 decodes BIO/BIOES labels and requires entity type plus token
+    start/end boundaries to match exactly.
+    """
+    prediction_sequences = _to_list(predictions)
+    reference_sequences = _to_list(references)
+    _validate_parallel_label_sequences(prediction_sequences, reference_sequences)
+
+    token_pairs = _filtered_token_label_pairs(
+        prediction_sequences,
+        reference_sequences,
+        id2label=id2label,
+        ignore_index=ignore_index,
+    )
+    total_tokens = len(token_pairs)
+    correct_tokens = sum(1 for predicted, expected in token_pairs if predicted == expected)
+    token_accuracy = correct_tokens / total_tokens if total_tokens else 0.0
+
+    token_labels = _metric_label_set(
+        token_pairs=token_pairs,
+        labels=labels,
+        id2label=id2label,
+        outside_label=outside_label,
+        include_outside=include_outside_in_macro,
+    )
+    token_scores = _precision_recall_f1_from_pairs(token_pairs, token_labels)
+
+    predicted_spans, reference_spans = _span_sets_from_label_sequences(
+        prediction_sequences,
+        reference_sequences,
+        id2label=id2label,
+        ignore_index=ignore_index,
+        outside_label=outside_label,
+    )
+    boundary_labels = _boundary_metric_label_set(
+        predicted_spans,
+        reference_spans,
+        labels=labels,
+        id2label=id2label,
+        outside_label=outside_label,
+    )
+    boundary_scores = _precision_recall_f1_from_spans(
+        predicted_spans,
+        reference_spans,
+        boundary_labels,
+    )
+
+    return {
+        "token_accuracy": token_accuracy,
+        "token_correct": correct_tokens,
+        "token_total": total_tokens,
+        "token_precision_macro": token_scores["precision_macro"],
+        "token_recall_macro": token_scores["recall_macro"],
+        "token_f1_macro": token_scores["f1_macro"],
+        "token_precision_micro": token_scores["precision_micro"],
+        "token_recall_micro": token_scores["recall_micro"],
+        "token_f1_micro": token_scores["f1_micro"],
+        "token_f1_by_label": token_scores["f1_by_label"],
+        "boundary_precision_macro": boundary_scores["precision_macro"],
+        "boundary_recall_macro": boundary_scores["recall_macro"],
+        "boundary_f1_macro": boundary_scores["f1_macro"],
+        "boundary_precision_micro": boundary_scores["precision_micro"],
+        "boundary_recall_micro": boundary_scores["recall_micro"],
+        "boundary_f1_micro": boundary_scores["f1_micro"],
+        "boundary_f1_by_label": boundary_scores["f1_by_label"],
+        "macro_bf1": boundary_scores["f1_macro"],
+        "micro_bf1": boundary_scores["f1_micro"],
+        "predicted_spans": len(predicted_spans),
+        "reference_spans": len(reference_spans),
+    }
+
+
+def _validate_parallel_label_sequences(predictions, references) -> None:
+    if len(predictions) != len(references):
+        raise ValueError("predictions and references must have the same batch size")
+
+    for index, (prediction, reference) in enumerate(zip(predictions, references)):
+        if len(prediction) != len(reference):
+            raise ValueError(
+                f"predictions and references differ in sequence length at batch index {index}"
+            )
+
+
+def _is_ignored_label(label, ignore_index: int) -> bool:
+    if label is None:
+        return True
+    return label == ignore_index or str(label) == str(ignore_index)
+
+
+def _label_to_name(label, id2label: Optional[Mapping[Any, str]]) -> str:
+    if id2label is None:
+        return str(label)
+
+    if label in id2label:
+        return id2label[label]
+
+    label_key = str(label)
+    if label_key in id2label:
+        return id2label[label_key]
+
+    try:
+        int_key = int(label)
+    except (TypeError, ValueError):
+        return str(label)
+
+    if int_key in id2label:
+        return id2label[int_key]
+
+    return str(label)
+
+
+def _filtered_token_label_pairs(
+    predictions,
+    references,
+    *,
+    id2label: Optional[Mapping[Any, str]],
+    ignore_index: int,
+) -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+    for prediction_sequence, reference_sequence in zip(predictions, references):
+        for predicted, expected in zip(prediction_sequence, reference_sequence):
+            if _is_ignored_label(expected, ignore_index):
+                continue
+            pairs.append((
+                _label_to_name(predicted, id2label),
+                _label_to_name(expected, id2label),
+            ))
+    return pairs
+
+
+def _metric_label_set(
+    *,
+    token_pairs: Optional[Sequence[Tuple[str, str]]] = None,
+    span_sets: Optional[Tuple[set, set]] = None,
+    labels: Optional[Sequence[Any]],
+    id2label: Optional[Mapping[Any, str]],
+    outside_label: str,
+    include_outside: bool,
+) -> List[str]:
+    if labels is not None:
+        label_set = {_label_to_name(label, id2label) for label in labels}
+    else:
+        label_set = set()
+        if token_pairs is not None:
+            for predicted, expected in token_pairs:
+                label_set.add(predicted)
+                label_set.add(expected)
+        if span_sets is not None:
+            for spans in span_sets:
+                label_set.update(span[1] for span in spans)
+
+    if not include_outside:
+        label_set.discard(outside_label)
+    return sorted(label_set)
+
+
+def _boundary_metric_label_set(
+    predicted_spans: set,
+    reference_spans: set,
+    *,
+    labels: Optional[Sequence[Any]],
+    id2label: Optional[Mapping[Any, str]],
+    outside_label: str,
+) -> List[str]:
+    if labels is None:
+        label_set = {
+            span[1]
+            for spans in (predicted_spans, reference_spans)
+            for span in spans
+        }
+        return sorted(label_set)
+
+    label_set = set()
+    for label in labels:
+        label_name = _label_to_name(label, id2label)
+        if label_name == outside_label:
+            continue
+        prefix, entity_group = _split_bioes_label(label_name)
+        label_set.add(entity_group if prefix is not None else label_name)
+    return sorted(label_set)
+
+
+def _precision_recall_f1(tp: int, fp: int, fn: int) -> Tuple[float, float, float]:
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return precision, recall, f1
+
+
+def _average_prf(per_label: Mapping[str, Tuple[int, int, int]]) -> Dict[str, Any]:
+    precisions = []
+    recalls = []
+    f1s = []
+    f1_by_label = {}
+    total_tp = total_fp = total_fn = 0
+
+    for label, (tp, fp, fn) in per_label.items():
+        precision, recall, f1 = _precision_recall_f1(tp, fp, fn)
+        precisions.append(precision)
+        recalls.append(recall)
+        f1s.append(f1)
+        f1_by_label[label] = f1
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+
+    micro_precision, micro_recall, micro_f1 = _precision_recall_f1(
+        total_tp,
+        total_fp,
+        total_fn,
+    )
+    label_count = len(per_label)
+    return {
+        "precision_macro": sum(precisions) / label_count if label_count else 0.0,
+        "recall_macro": sum(recalls) / label_count if label_count else 0.0,
+        "f1_macro": sum(f1s) / label_count if label_count else 0.0,
+        "precision_micro": micro_precision,
+        "recall_micro": micro_recall,
+        "f1_micro": micro_f1,
+        "f1_by_label": f1_by_label,
+    }
+
+
+def _precision_recall_f1_from_pairs(
+    token_pairs: Sequence[Tuple[str, str]],
+    labels: Sequence[str],
+) -> Dict[str, Any]:
+    per_label = {label: [0, 0, 0] for label in labels}
+    for predicted, expected in token_pairs:
+        if predicted == expected:
+            if expected in per_label:
+                per_label[expected][0] += 1
+            continue
+        if predicted in per_label:
+            per_label[predicted][1] += 1
+        if expected in per_label:
+            per_label[expected][2] += 1
+
+    return _average_prf({
+        label: (counts[0], counts[1], counts[2])
+        for label, counts in per_label.items()
+    })
+
+
+def _span_sets_from_label_sequences(
+    predictions,
+    references,
+    *,
+    id2label: Optional[Mapping[Any, str]],
+    ignore_index: int,
+    outside_label: str,
+) -> Tuple[set, set]:
+    predicted_spans = set()
+    reference_spans = set()
+
+    for sequence_index, (prediction_sequence, reference_sequence) in enumerate(zip(predictions, references)):
+        predicted_labels = []
+        reference_labels = []
+        for predicted, expected in zip(prediction_sequence, reference_sequence):
+            if _is_ignored_label(expected, ignore_index):
+                continue
+            predicted_labels.append(_label_to_name(predicted, id2label))
+            reference_labels.append(_label_to_name(expected, id2label))
+
+        for span in bioes_tags_to_spans(predicted_labels, outside_label=outside_label):
+            predicted_spans.add((
+                sequence_index,
+                span["entity_group"],
+                span["start"],
+                span["end"],
+            ))
+        for span in bioes_tags_to_spans(reference_labels, outside_label=outside_label):
+            reference_spans.add((
+                sequence_index,
+                span["entity_group"],
+                span["start"],
+                span["end"],
+            ))
+
+    return predicted_spans, reference_spans
+
+
+def _precision_recall_f1_from_spans(
+    predicted_spans: set,
+    reference_spans: set,
+    labels: Sequence[str],
+) -> Dict[str, Any]:
+    per_label = {}
+    for label in labels:
+        predicted_for_label = {span for span in predicted_spans if span[1] == label}
+        reference_for_label = {span for span in reference_spans if span[1] == label}
+        true_positive = len(predicted_for_label & reference_for_label)
+        false_positive = len(predicted_for_label - reference_for_label)
+        false_negative = len(reference_for_label - predicted_for_label)
+        per_label[label] = (true_positive, false_positive, false_negative)
+
+    return _average_prf(per_label)
+
+
 def _to_list(value):
     if hasattr(value, "tolist"):
         return value.tolist()

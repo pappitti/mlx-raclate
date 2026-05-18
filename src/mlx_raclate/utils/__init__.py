@@ -1,5 +1,7 @@
 from .token_classification import (
 	VITERBI_CALIBRATION_FILE,
+	bioes_tags_to_spans,
+	compute_token_classification_metrics,
 	default_viterbi_calibration,
 	decode_bioes_spans,
 	decode_token_classification_batch,
@@ -15,6 +17,8 @@ from .token_classification import (
 
 __all__ = [
 	"VITERBI_CALIBRATION_FILE",
+	"bioes_tags_to_spans",
+	"compute_token_classification_metrics",
 	"default_viterbi_calibration",
 	"decode_bioes_spans",
 	"decode_token_classification_batch",
