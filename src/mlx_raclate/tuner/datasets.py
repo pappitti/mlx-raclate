@@ -98,12 +98,22 @@ def _standardize_column_names(dataset: HFDataset, args: DatasetArgs) -> HFDatase
     if mapping:
         dataset = dataset.rename_columns(mapping)
 
-    keep_columns = {"text", "text_pair", "label", "labels", "negative"}
+    keep_columns = {
+        "input_ids",
+        "attention_mask",
+        "position_ids",
+        "token_type_ids",
+        "text",
+        "text_pair",
+        "label",
+        "labels",
+        "negative",
+    }
     existing_columns = set(dataset.column_names)
     columns_to_select = list(keep_columns.intersection(existing_columns))
     
-    # Check if we have at least 'text'
-    if "text" not in columns_to_select:
+    # Check if we have a usable model input column.
+    if "text" not in columns_to_select and "input_ids" not in columns_to_select:
         print(f"Warning: Standard 'text' column not found in dataset columns: {dataset.column_names}")
     
     dataset = dataset.select_columns(columns_to_select)

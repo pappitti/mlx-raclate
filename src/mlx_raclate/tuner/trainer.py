@@ -18,6 +18,7 @@ from mlx.utils import tree_flatten, tree_map
 
 from .collators import DataCollator
 from .utils import EMBEDDING_LAYER_NAMES, build_schedule
+from mlx_raclate.utils.token_classification import save_viterbi_calibration
 from mlx_raclate.tuner.model_card_utils import get_code_for_trained_model
 
 
@@ -610,6 +611,12 @@ class Trainer:
         
         with open(save_path / "metrics.json", "w") as f:
             json.dump(metrics, f, indent=2)
+
+        if self.task_type == "token-classification":
+            save_viterbi_calibration(
+                save_path,
+                getattr(self.model, "viterbi_calibration", None),
+            )
         
         # Push to Hub (PLACEHOLDER)
         if self.args.push_to_hub:

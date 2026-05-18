@@ -1,6 +1,6 @@
 import mlx.core as mx
 import numpy as np
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
 @dataclass
@@ -77,7 +77,7 @@ class DataCollatorForSequenceClassification(DataCollator):
             labels = features["label"]
             # On-the-fly String to ID conversion
             if self.label2id and len(labels) > 0 and isinstance(labels[0], str):
-                labels = [self.label2id.get(l, -1) for l in labels] # Default to -1 if missing
+                labels = [self.label2id.get(label, -1) for label in labels] # Default to -1 if missing
             
             # Detect regression (float) vs classification (int)
             if len(labels) > 0 and isinstance(labels[0], float):
@@ -99,7 +99,45 @@ class DataCollatorForTokenClassification(DataCollator):
     label_all_tokens: bool = False 
     label2id: Optional[Dict[str, int]] = None
 
+    def _collate_pretokenized(self, features: Dict[str, List[Any]]) -> Dict[str, mx.array]:
+        input_ids = features["input_ids"]
+        labels = features["labels"]
+        attention_mask = features.get("attention_mask")
+
+        max_len = min(max(len(ids) for ids in input_ids), self.max_length)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id or 0
+
+        batch_size = len(input_ids)
+        padded_input_ids = np.full((batch_size, max_len), pad_token_id, dtype=np.int32)
+        padded_attention_mask = np.zeros((batch_size, max_len), dtype=np.int32)
+        padded_labels = np.full((batch_size, max_len), self.label_pad_token_id, dtype=np.int32)
+
+        for i, ids in enumerate(input_ids):
+            seq_len = min(len(ids), max_len)
+            padded_input_ids[i, :seq_len] = ids[:seq_len]
+
+            if attention_mask is None:
+                padded_attention_mask[i, :seq_len] = 1
+            else:
+                padded_attention_mask[i, :seq_len] = attention_mask[i][:seq_len]
+
+            label_seq = labels[i]
+            if self.label2id and len(label_seq) > 0 and isinstance(label_seq[0], str):
+                label_seq = [self.label2id.get(label, self.label_pad_token_id) for label in label_seq]
+            padded_labels[i, : min(len(label_seq), max_len)] = label_seq[:max_len]
+
+        return {
+            "input_ids": mx.array(padded_input_ids, dtype=mx.int32),
+            "attention_mask": mx.array(padded_attention_mask, dtype=mx.int32),
+            "labels": mx.array(padded_labels, dtype=mx.int32),
+        }
+
     def __call__(self, features: Dict[str, List[Any]]) -> Dict[str, mx.array]:
+        if "input_ids" in features:
+            return self._collate_pretokenized(features)
+
         texts = features["text"] 
         labels = features["labels"] # Note: usually plural 'labels' list of list
 
@@ -128,7 +166,7 @@ class DataCollatorForTokenClassification(DataCollator):
             # On-the-fly conversion for list of strings (to avoid memory issues with dataset.map)
             current_labels = label_seq
             if self.label2id and len(label_seq) > 0 and isinstance(label_seq[0], str):
-                current_labels = [self.label2id.get(l, self.label_pad_token_id) for l in label_seq]
+                current_labels = [self.label2id.get(label, self.label_pad_token_id) for label in label_seq]
 
             # word_ids returns a list mapping each token to its original word index
             # e.g., [None, 0, 1, 1, 2, None] for "[CLS] My name is John [SEP]"
@@ -269,8 +307,10 @@ class DataCollatorForSentenceSimilarity(DataCollator):
 
         # Tokenize Negative (Sentence C) -> 'negative_input_ids'
         neg_key = None
-        if "negative" in features: neg_key = "negative"
-        elif "text_negative" in features: neg_key = "text_negative"
+        if "negative" in features:
+            neg_key = "negative"
+        elif "text_negative" in features:
+            neg_key = "text_negative"
             
         if neg_key:
             out_n = self.tokenizer(

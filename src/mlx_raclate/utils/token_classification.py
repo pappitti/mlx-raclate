@@ -1,8 +1,11 @@
+import json
 import math
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 _INVALID_PATH_SCORE = -1e12
+VITERBI_CALIBRATION_FILE = "viterbi_calibration.json"
 VITERBI_BIAS_KEYS = (
     "transition_bias_background_stay",
     "transition_bias_background_to_start",
@@ -15,6 +18,64 @@ VITERBI_BIAS_KEYS = (
 
 def zero_viterbi_transition_biases() -> Dict[str, float]:
     return {key: 0.0 for key in VITERBI_BIAS_KEYS}
+
+
+def default_viterbi_calibration(operating_point: str = "default") -> Dict[str, Any]:
+    return {
+        "operating_points": {
+            operating_point: {
+                "biases": zero_viterbi_transition_biases(),
+            }
+        }
+    }
+
+
+def viterbi_transition_biases_from_calibration(
+    calibration: Optional[Mapping[str, Any]],
+    operating_point: str = "default",
+) -> Dict[str, float]:
+    if calibration is None:
+        return zero_viterbi_transition_biases()
+
+    operating_points = calibration.get("operating_points")
+    if not isinstance(operating_points, Mapping):
+        raise ValueError("Viterbi calibration must contain an 'operating_points' mapping")
+
+    if operating_point not in operating_points:
+        raise ValueError(f"Viterbi calibration operating point not found: {operating_point}")
+
+    operating_point_config = operating_points[operating_point]
+    if not isinstance(operating_point_config, Mapping):
+        raise ValueError(f"Viterbi calibration operating point {operating_point!r} must be a mapping")
+
+    biases = operating_point_config.get("biases", {})
+    if not isinstance(biases, Mapping):
+        raise ValueError(f"Viterbi calibration operating point {operating_point!r} has invalid biases")
+
+    return _resolve_viterbi_transition_biases(biases)
+
+
+def load_viterbi_calibration(path_or_hf_repo: str | Path) -> Optional[Dict[str, Any]]:
+    from mlx_raclate.utils.utils import get_model_path
+
+    model_path = get_model_path(str(path_or_hf_repo))
+    calibration_path = model_path / VITERBI_CALIBRATION_FILE
+    if not calibration_path.exists():
+        return None
+
+    with open(calibration_path) as f:
+        return json.load(f)
+
+
+def save_viterbi_calibration(
+    output_dir: str | Path,
+    calibration: Optional[Mapping[str, Any]] = None,
+) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = dict(calibration or default_viterbi_calibration())
+    with open(output_dir / VITERBI_CALIBRATION_FILE, "w") as f:
+        json.dump(payload, f, indent=2)
 
 
 def _resolve_viterbi_transition_biases(

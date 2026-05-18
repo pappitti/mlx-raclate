@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Optional
 
 from mlx_raclate.utils.token_classification import (
     postprocess_token_classification_output,
+    viterbi_transition_biases_from_calibration,
 )
 
 
@@ -37,6 +38,9 @@ def run_inference(
     
     max_length = getattr(model.config, "max_position_embeddings", 512)
     id2label = getattr(model.config, "id2label", None)
+    transition_biases = viterbi_transition_biases_from_calibration(
+        getattr(model, "viterbi_calibration", None)
+    )
     
     # Tokenize
     tokens = tokenizer._tokenizer(
@@ -66,6 +70,7 @@ def run_inference(
         id2label=id2label,
         texts=texts,
         offsets=None if offset_mapping is None else offset_mapping.tolist(),
+        transition_biases=transition_biases,
     )
 
     predictions = processed["predictions"]
@@ -82,7 +87,10 @@ def run_inference(
 
 
 _EXAMPLE_CODE_TEMPLATE = '''from mlx_raclate.utils.utils import load
-from mlx_raclate.utils.token_classification import postprocess_token_classification_output
+from mlx_raclate.utils.token_classification import (
+    postprocess_token_classification_output,
+    viterbi_transition_biases_from_calibration,
+)
 
 # Load model and tokenizer
 model, tokenizer = load(
@@ -115,12 +123,16 @@ outputs = model(
 # Get predictions
 logits = outputs["logits"]
 id2label = model.config.id2label
+transition_biases = viterbi_transition_biases_from_calibration(
+    getattr(model, "viterbi_calibration", None)
+)
 processed = postprocess_token_classification_output(
     logits=logits,
     probabilities=outputs["probabilities"],
     id2label=id2label,
     texts=texts,
     offsets=offset_mapping.tolist(),
+    transition_biases=transition_biases,
 )
 
 # Process and print grouped spans

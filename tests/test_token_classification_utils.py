@@ -1,9 +1,12 @@
 import pytest
 
 from mlx_raclate.utils.token_classification import (
+    default_viterbi_calibration,
     decode_bioes_spans,
     decode_token_classification_batch,
     postprocess_token_classification_output,
+    save_viterbi_calibration,
+    viterbi_transition_biases_from_calibration,
     viterbi_decode_bioes_ids,
 )
 
@@ -118,6 +121,18 @@ def test_viterbi_decode_bioes_ids_applies_transition_biases():
     )
 
     assert decoded == [0, 3]
+
+
+def test_viterbi_calibration_roundtrips_transition_biases(tmp_path):
+    calibration = default_viterbi_calibration()
+    calibration["operating_points"]["default"]["biases"]["transition_bias_background_to_start"] = 3.0
+
+    biases = viterbi_transition_biases_from_calibration(calibration)
+    assert biases["transition_bias_background_to_start"] == 3.0
+    assert biases["transition_bias_background_stay"] == 0.0
+
+    save_viterbi_calibration(tmp_path, calibration)
+    assert (tmp_path / "viterbi_calibration.json").exists()
 
 
 def test_postprocess_token_classification_output_decodes_predictions_and_spans():
