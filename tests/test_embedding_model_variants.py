@@ -98,6 +98,7 @@ def _assert_token_classification_loss_handles_ignore_index(model):
     labels = mx.array([[0, -100, 1]], dtype=mx.int32)
     outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
     assert outputs["loss"] is not None
+    assert outputs["logits"].shape[:2] == input_ids.shape
     assert float(outputs["loss"].item()) > 0.0
 
     ignored_labels = mx.array([[-100, -100, -100]], dtype=mx.int32)

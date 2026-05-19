@@ -660,6 +660,7 @@ class ModelForSequenceClassification(RaclateBaseModel):
 
         return {
             "loss": loss,
+            "logits": logits,
             "probabilities": processed_logits,
             "hidden_states": outputs.get("hidden_states", None),
         }
@@ -868,6 +869,7 @@ class ModelForTokenClassification(RaclateBaseModel):
 
         return {
             "loss": loss,
+            "logits": logits,
             "probabilities": processed_logits,
             "hidden_states": outputs.get("hidden_states", None),
         }

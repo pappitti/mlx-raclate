@@ -1,10 +1,12 @@
 # server.py
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Union, Dict
 import uvicorn
 import gc
 import mlx.core as mx
+from mlx_raclate.utils.token_classification import postprocess_token_classification_output
 from mlx_raclate.utils.utils import PIPELINES, load
 
 app = FastAPI(
@@ -13,12 +15,36 @@ app = FastAPI(
     version="0.1.0"
 )
 
+LOCAL_DEMO_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?$"
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["null"],
+    allow_origin_regex=LOCAL_DEMO_ORIGIN_REGEX,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # TODO:
 # Separate Services: For complete isolation, run each pipeline type as a separate FastAPI service and use a lightweight API gateway to route requests.
 # Worker Pool Architecture: Implement a worker pool where each worker specializes in a specific pipeline, and a dispatcher routes requests to the appropriate worker.
 
 
 model_cache = {}
+
+
+def _to_python_list(value):
+    if value is None:
+        return None
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return value
+
+
+def _item(value):
+    if hasattr(value, "item"):
+        return value.item()
+    return value
 
 def get_model(model_name: str, pipeline_name: str, config_file: Optional[Dict] = None):
     """
@@ -156,6 +182,68 @@ async def predict(request: PredictionRequest):
                 batch_results.append(row)
 
         result = {"predictions": batch_results}
+
+    # -------------------------------------------------------------------------
+    # Pipeline: Token Classification (NER / Privacy Filtering)
+    # -------------------------------------------------------------------------
+    elif request.pipeline == "token-classification":
+        inputs = tokenizer._tokenizer(
+            texts,
+            return_tensors="mlx",
+            padding=True,
+            truncation=True,
+            max_length=max_len,
+            return_offsets_mapping=True,
+        )
+        offset_mapping = inputs.pop("offset_mapping", None)
+        offsets = _to_python_list(offset_mapping)
+
+        outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask", None),
+            return_dict=True,
+        )
+
+        logits = outputs.get("logits")
+        probabilities = outputs.get("probabilities", None)
+        if logits is None:
+            if probabilities is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Token classification model output did not include "
+                        "'logits' or 'probabilities'. If this is an embedding "
+                        "model, use pipeline='embeddings'."
+                    ),
+                )
+            logits = probabilities
+
+        id2label = getattr(model.config, "id2label", None)
+        processed = postprocess_token_classification_output(
+            logits=logits,
+            probabilities=probabilities,
+            id2label=id2label,
+            texts=texts,
+            offsets=offsets,
+        )
+
+        input_ids = inputs["input_ids"]
+        for sequence_index, prediction_list in enumerate(processed["predictions"]):
+            for token_index, prediction in enumerate(prediction_list):
+                token_id = int(_item(input_ids[sequence_index][token_index]))
+                prediction["token"] = tokenizer.decode([token_id])
+                if offsets is not None and token_index < len(offsets[sequence_index]):
+                    start, end = offsets[sequence_index][token_index]
+                    prediction["start"] = int(start)
+                    prediction["end"] = int(end)
+
+        result = {
+            "predictions": processed["predictions"],
+            "grouped_spans": processed["grouped_spans"],
+            "entities": processed["grouped_spans"],
+            "label_names": processed["label_names"],
+            "id2label": id2label,
+        }
 
     # -------------------------------------------------------------------------
     # Pipeline: Sentence Similarity (Dense & Late Interaction)
