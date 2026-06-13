@@ -45,28 +45,7 @@ def get_inference_code(
         Formatted Python code string ready for inclusion in a model card.
 
     """
-    if pipeline not in _PIPELINE_TO_MODULE:
-        raise ValueError(
-            f"Unknown pipeline: {pipeline}. "
-            f"Supported pipelines: {list(_PIPELINE_TO_MODULE.keys())}"
-        )
-    
-    module_name = _PIPELINE_TO_MODULE[pipeline]
-    
-    # Try importing from tests.inference_examples first (development)
-    # Fall back to relative import if tests not available
-    try:
-        module = importlib.import_module(f"tests.inference_examples.{module_name}")
-    except ImportError:
-        # If running from within the library, try relative path
-        try:
-            import tests.inference_examples
-            module = getattr(tests.inference_examples, module_name)
-        except (ImportError, AttributeError):
-            raise ImportError(
-                f"Could not import inference example module for {pipeline}. "
-                "Make sure the tests package is installed or accessible."
-            )
+    module = _load_inference_example_module(pipeline)
     
     # Call the module's get_example_code function. Trainer-level kwargs can include
     # fields that only some templates understand, so keep model-card generation lenient.
@@ -77,6 +56,50 @@ def get_inference_code(
         if key in signature.parameters
     }
     return module.get_example_code(model_path=model_path, **accepted_kwargs)
+
+
+def get_transformers_inference_code(
+    pipeline: str,
+    model_path: str = "{{MODEL_PATH}}",
+    **kwargs,
+) -> Optional[str]:
+    """Get optional Transformers inference example code for a model card."""
+    module = _load_inference_example_module(pipeline)
+    if not hasattr(module, "get_transformers_example_code"):
+        return None
+
+    signature = inspect.signature(module.get_transformers_example_code)
+    accepted_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in signature.parameters
+    }
+    return module.get_transformers_example_code(model_path=model_path, **accepted_kwargs)
+
+
+def _load_inference_example_module(pipeline: str):
+    if pipeline not in _PIPELINE_TO_MODULE:
+        raise ValueError(
+            f"Unknown pipeline: {pipeline}. "
+            f"Supported pipelines: {list(_PIPELINE_TO_MODULE.keys())}"
+        )
+
+    module_name = _PIPELINE_TO_MODULE[pipeline]
+
+    # Try importing from tests.inference_examples first (development)
+    # Fall back to relative import if tests not available
+    try:
+        return importlib.import_module(f"tests.inference_examples.{module_name}")
+    except ImportError:
+        # If running from within the library, try relative path
+        try:
+            import tests.inference_examples
+            return getattr(tests.inference_examples, module_name)
+        except (ImportError, AttributeError):
+            raise ImportError(
+                f"Could not import inference example module for {pipeline}. "
+                "Make sure the tests package is installed or accessible."
+            )
 
 
 def get_available_pipelines() -> List[str]:
@@ -104,7 +127,7 @@ def generate_model_card_section(
     """
     code = get_inference_code(pipeline=pipeline, model_path=model_path, **kwargs)
     
-    return f"""## {title}
+    section = f"""## {title}
 
 This model can be used with [mlx-raclate](https://github.com/pappitti/mlx-raclate) for native inference on Apple Silicon.
 
@@ -112,6 +135,23 @@ This model can be used with [mlx-raclate](https://github.com/pappitti/mlx-raclat
 {code}
 ```
 """
+    transformers_code = get_transformers_inference_code(
+        pipeline=pipeline,
+        model_path=model_path,
+        **kwargs,
+    )
+    if transformers_code:
+        section += f"""
+## Usage with Transformers
+
+With `transformers>=5.8.1`, this checkpoint uses the standard Hugging Face `openai_privacy_filter` architecture. `AutoModelForTokenClassification` returns token logits; the helper below greedily decodes BIOES labels into character spans.
+
+```python
+{transformers_code}
+```
+"""
+
+    return section
 
 
 def get_code_for_trained_model(

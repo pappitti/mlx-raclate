@@ -94,6 +94,8 @@ class ModelArgs(BaseModelArgs):
 	def __post_init__(self):
 		if self.num_experts is not None:
 			self.num_local_experts = self.num_experts
+		else:
+			self.num_experts = self.num_local_experts
 
 		if self.experts_per_token is not None:
 			self.num_experts_per_tok = self.experts_per_token
@@ -605,6 +607,30 @@ def _split_qkv(value: mx.array, config: ModelArgs) -> Tuple[mx.array, mx.array, 
 	)
 
 
+def _head_param_matches_config(target: str, value: mx.array, config: ModelArgs) -> bool:
+	if target == "score.weight":
+		return value.shape[0] == config.num_labels
+	if target == "score.bias":
+		return value.shape[0] == config.num_labels
+	return True
+
+
+def _add_head_param(
+	sanitized: Dict[str, Any],
+	target: str,
+	value: mx.array,
+	config: ModelArgs,
+) -> None:
+	if _head_param_matches_config(target, value, config):
+		sanitized[target] = value
+		return
+
+	print(
+		f"[INFO] Skipping mismatched OpenAI privacy-filter head parameter {target}: "
+		f"checkpoint {value.shape} does not match num_labels={config.num_labels}"
+	)
+
+
 def _sanitize_weights(
 	weights: Dict[str, Any],
 	include_head: bool,
@@ -694,15 +720,25 @@ def _sanitize_weights(
 			continue
 
 		if include_head and key.startswith("score."):
-			sanitized[key] = value
+			_add_head_param(sanitized, key, value, config)
 			continue
 
 		if include_head and key.startswith("classifier."):
-			sanitized[f"score.{key.removeprefix('classifier.')}"] = value
+			_add_head_param(
+				sanitized,
+				f"score.{key.removeprefix('classifier.')}",
+				value,
+				config,
+			)
 			continue
 
 		if include_head and key.startswith("unembedding."):
-			sanitized[f"score.{key.removeprefix('unembedding.')}"] = value
+			_add_head_param(
+				sanitized,
+				f"score.{key.removeprefix('unembedding.')}",
+				value,
+				config,
+			)
 			continue
 
 	for layer_key, gate_weight in gate_proj_weights.items():

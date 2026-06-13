@@ -581,6 +581,11 @@ def load_model(
     
     # Instantiate the model (random init)
     model = model_class(model_args)
+    calibration_file = model_path / "viterbi_calibration.json"
+    if calibration_file.exists():
+        with open(calibration_file) as f:
+            model.viterbi_calibration = json.load(f)
+
     # Use set_dtype to update all floating-point parameters recursively.
     # The default predicate ensures we don't accidentally cast integer params.
     model.set_dtype(target_dtype)

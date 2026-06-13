@@ -216,6 +216,106 @@ def test_token_classification_dataset_columns_are_standardized():
     assert standardized[0]["labels"] == [1, 0, 0]
 
 
+def test_token_classification_pretokenized_columns_are_preserved():
+    """Test pretokenized token-classification columns survive standardization."""
+    from mlx_raclate.tuner.datasets import DatasetArgs, _standardize_column_names
+
+    dataset = HFDataset.from_dict(
+        {
+            "input_ids": [[10, 11]],
+            "attention_mask": [[1, 1]],
+            "labels": [[0, 1]],
+            "unused": ["drop me"],
+        }
+    )
+    args = DatasetArgs(data="unused", task_type="token-classification")
+
+    standardized = _standardize_column_names(dataset, args)
+
+    assert set(standardized.column_names) == {"input_ids", "attention_mask", "labels"}
+    assert standardized[0]["input_ids"] == [10, 11]
+    assert standardized[0]["labels"] == [0, 1]
+
+
+def test_pretokenized_token_classification_collator_pads_inputs():
+    """Test pretokenized token-classification batches are padded directly."""
+    from mlx_raclate.tuner.collators import DataCollatorForTokenClassification
+
+    class DummyTokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+
+    collator = DataCollatorForTokenClassification(
+        tokenizer=DummyTokenizer(),
+        max_length=4,
+    )
+
+    batch = collator(
+        {
+            "input_ids": [[10, 11, 12], [20]],
+            "attention_mask": [[1, 1, 1], [1]],
+            "labels": [[1, 2, 3], [4]],
+        }
+    )
+
+    assert batch["input_ids"].tolist() == [[10, 11, 12], [20, 0, 0]]
+    assert batch["attention_mask"].tolist() == [[1, 1, 1], [1, 0, 0]]
+    assert batch["labels"].tolist() == [[1, 2, 3], [4, -100, -100]]
+
+
+def test_token_classification_checkpoint_saves_viterbi_calibration(tmp_path):
+    """Test token-classification checkpoints include Viterbi calibration metadata."""
+    import json
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    from mlx_raclate.tuner.trainer import Trainer
+
+    class DummyModel:
+        config = SimpleNamespace(model_type="dummy")
+        viterbi_calibration = {
+            "operating_points": {
+                "default": {
+                    "biases": {
+                        "transition_bias_background_stay": 0.0,
+                        "transition_bias_background_to_start": 2.0,
+                        "transition_bias_inside_to_continue": 0.0,
+                        "transition_bias_inside_to_end": 0.0,
+                        "transition_bias_end_to_background": 0.0,
+                        "transition_bias_end_to_start": 0.0,
+                    }
+                }
+            }
+        }
+
+        def get_hf_transformers_arch(self):
+            return "DummyForTokenClassification"
+
+        def parameters(self):
+            return {"weight": mx.zeros((1,), dtype=mx.float32)}
+
+    class DummyTokenizer:
+        def save_pretrained(self, path):
+            return None
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.output_dir = tmp_path
+    trainer.global_step = 7
+    trainer.model = DummyModel()
+    trainer.tokenizer = DummyTokenizer()
+    trainer.task_type = "token-classification"
+    trainer.args = SimpleNamespace(push_to_hub=False, save_total_limit=None)
+
+    trainer._save_checkpoint({"loss": 1.0})
+
+    calibration_path = tmp_path / "checkpoint-7" / "viterbi_calibration.json"
+    with open(calibration_path) as f:
+        calibration = json.load(f)
+
+    assert calibration["operating_points"]["default"]["biases"]["transition_bias_background_to_start"] == 2.0
+
+
 def test_label_mappings_generation():
     """Test label mapping generators."""
     id2label = generate_id2label(3)

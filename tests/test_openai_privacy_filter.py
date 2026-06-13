@@ -111,6 +111,22 @@ def test_openai_privacy_filter_sanitize_targets_existing_parameters():
     assert set(sanitized) <= param_names
 
 
+def test_openai_privacy_filter_sanitize_drops_mismatched_head():
+    config = _tiny_config()
+    model = ModelForTokenClassification(config)
+
+    weights = dict(tree_flatten(model.parameters()))
+    weights["score.weight"] = mx.zeros((config.num_labels - 1, config.hidden_size), dtype=mx.float32)
+    weights["score.bias"] = mx.zeros((config.num_labels - 1,), dtype=mx.float32)
+    sanitized = model.sanitize(weights)
+
+    assert "score.weight" not in sanitized
+    assert "score.bias" not in sanitized
+    _verify_weights(model, sanitized, train_mode=True)
+    _initialize_head_weights(model, sanitized, model.config, target_dtype=mx.float32)
+    model.load_weights(list(sanitized.items()))
+
+
 def test_openai_privacy_filter_sequence_sanitize_targets_existing_parameters():
     model = ModelForSequenceClassification(_tiny_config())
     param_names = {name for name, _ in tree_flatten(model.parameters())}

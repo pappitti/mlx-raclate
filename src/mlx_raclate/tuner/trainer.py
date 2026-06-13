@@ -18,6 +18,10 @@ from mlx.utils import tree_flatten, tree_map
 
 from .collators import DataCollator
 from .utils import EMBEDDING_LAYER_NAMES, build_schedule
+from mlx_raclate.utils.token_classification import (
+    compute_token_classification_metrics,
+    save_viterbi_calibration,
+)
 from mlx_raclate.tuner.model_card_utils import get_code_for_trained_model
 
 
@@ -99,6 +103,7 @@ class TrainingArgs:
         grad_checkpoint: bool = True,
         cache_clear_steps: int = 1,
         push_to_hub: bool = False,
+        eval_strategy: str = "end",
     ):
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
@@ -121,6 +126,7 @@ class TrainingArgs:
         self.grad_checkpoint = grad_checkpoint ### mat not be necessary but helps anticipating hardware constraints
         self.cache_clear_steps = cache_clear_steps
         self.push_to_hub = push_to_hub 
+        self.eval_strategy = eval_strategy
 
 class Trainer:
     """
@@ -147,6 +153,8 @@ class Trainer:
         self.task_type = task_type
 
         self.args = training_args
+        if training_args.eval_strategy not in {"no", "epoch", "end"}:
+            raise ValueError("eval_strategy must be one of: 'no', 'epoch', 'end'")
         # Adjust logging and saving steps based on gradient accumulation
         if training_args.logging_steps % training_args.gradient_accumulation_steps != 0:
             closest_multiple = (training_args.logging_steps // training_args.gradient_accumulation_steps) * training_args.gradient_accumulation_steps
@@ -400,13 +408,19 @@ class Trainer:
             self.epoch = epoch
             print(f"\nEpoch {epoch + 1}/{self.args.num_train_epochs}")
             self._train_epoch()
-            
-            if self.eval_dataset is not None:
+
+            is_final_epoch = epoch == self.args.num_train_epochs - 1
+            should_evaluate = (
+                self.eval_dataset is not None
+                and self.args.eval_strategy != "no"
+                and (self.args.eval_strategy == "epoch" or is_final_epoch)
+            )
+
+            if should_evaluate:
                 print(f"Evaluating after epoch {self.epoch + 1}...")
                 metrics = self.evaluate()
                 self._save_checkpoint(metrics)
             else:
-                # Save checkpoint even if no eval dataset is provided
                 print(f"Saving checkpoint after epoch {self.epoch + 1} without evaluation...")
                 self._save_checkpoint({})
 
@@ -521,6 +535,8 @@ class Trainer:
         self.model.eval()
         total_loss = 0
         n_steps = 0
+        token_predictions = []
+        token_references = []
         
         for raw_batch in self._create_batches(self.eval_dataset, self.args.eval_batch_size):
             batch = self.data_collator(raw_batch)
@@ -528,12 +544,71 @@ class Trainer:
             loss = mx.mean(outputs["loss"])
             total_loss += loss.item()
             n_steps += 1
+            self._collect_token_classification_predictions(
+                outputs,
+                batch,
+                token_predictions,
+                token_references,
+            )
             mx.clear_cache()
         
         metrics = {"eval_loss": total_loss / n_steps}
+        metrics.update(self._build_token_classification_eval_metrics(
+            token_predictions,
+            token_references,
+            prefix="eval",
+        ))
         print(f"\nEvaluation metrics: {metrics}")
         
         return metrics
+
+    def _collect_token_classification_predictions(
+        self,
+        outputs,
+        batch,
+        predictions,
+        references,
+    ):
+        if self.task_type != "token-classification" or "labels" not in batch:
+            return
+
+        scores = outputs.get("logits", outputs.get("probabilities"))
+        if scores is None:
+            return
+
+        predictions.extend(mx.argmax(scores, axis=-1).tolist())
+        references.extend(batch["labels"].tolist())
+
+    def _build_token_classification_eval_metrics(
+        self,
+        predictions,
+        references,
+        prefix: str,
+    ) -> Dict[str, float]:
+        if self.task_type != "token-classification" or not predictions:
+            return {}
+
+        metrics = compute_token_classification_metrics(
+            predictions,
+            references,
+            id2label=getattr(self.model.config, "id2label", None),
+        )
+        scalar_keys = (
+            "token_accuracy",
+            "token_f1_macro",
+            "token_f1_micro",
+            "boundary_f1_macro",
+            "boundary_f1_micro",
+            "macro_bf1",
+            "micro_bf1",
+            "predicted_spans",
+            "reference_spans",
+        )
+        return {
+            f"{prefix}_{key}": metrics[key]
+            for key in scalar_keys
+            if key in metrics
+        }
     
     def test(self, test_dataset=None):
         """
@@ -547,6 +622,8 @@ class Trainer:
         self.model.eval()
         total_loss = 0
         n_steps = 0
+        token_predictions = []
+        token_references = []
         
         # Use provided test dataset or fall back to eval dataset
         dataset_to_test = test_dataset or self.eval_dataset
@@ -560,8 +637,19 @@ class Trainer:
             loss = mx.mean(outputs["loss"])
             total_loss += loss.item()
             n_steps += 1
+            self._collect_token_classification_predictions(
+                outputs,
+                batch,
+                token_predictions,
+                token_references,
+            )
             mx.clear_cache()
         metrics = {"eval_loss": total_loss / n_steps}
+        metrics.update(self._build_token_classification_eval_metrics(
+            token_predictions,
+            token_references,
+            prefix="eval",
+        ))
         
         # Save test results
         results_path = self.output_dir / "test_results.json"
@@ -610,6 +698,12 @@ class Trainer:
         
         with open(save_path / "metrics.json", "w") as f:
             json.dump(metrics, f, indent=2)
+
+        if self.task_type == "token-classification":
+            save_viterbi_calibration(
+                save_path,
+                getattr(self.model, "viterbi_calibration", None),
+            )
         
         # Push to Hub (PLACEHOLDER)
         if self.args.push_to_hub:
