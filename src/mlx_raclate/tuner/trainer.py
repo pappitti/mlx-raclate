@@ -1,6 +1,8 @@
 import time
 import json
 import gc
+import ctypes
+import platform
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +18,64 @@ from mlx.utils import tree_flatten, tree_map
 
 from .collators import DataCollator
 from .utils import EMBEDDING_LAYER_NAMES, build_schedule
+from mlx_raclate.utils.token_classification import (
+    compute_token_classification_metrics,
+    save_viterbi_calibration,
+)
 from mlx_raclate.tuner.model_card_utils import get_code_for_trained_model
+
+
+def _get_process_footprint_gb() -> Optional[float]:
+    """Return macOS phys_footprint, which is closer to Activity Monitor memory."""
+    if platform.system() != "Darwin":
+        return None
+
+    class TaskVMInfo(ctypes.Structure):
+        _fields_ = [
+            ("virtual_size", ctypes.c_uint64),
+            ("region_count", ctypes.c_int32),
+            ("page_size", ctypes.c_int32),
+            ("resident_size", ctypes.c_uint64),
+            ("resident_size_peak", ctypes.c_uint64),
+            ("device", ctypes.c_uint64),
+            ("device_peak", ctypes.c_uint64),
+            ("internal", ctypes.c_uint64),
+            ("internal_peak", ctypes.c_uint64),
+            ("external", ctypes.c_uint64),
+            ("external_peak", ctypes.c_uint64),
+            ("reusable", ctypes.c_uint64),
+            ("reusable_peak", ctypes.c_uint64),
+            ("purgeable_volatile_pmap", ctypes.c_uint64),
+            ("purgeable_volatile_resident", ctypes.c_uint64),
+            ("purgeable_volatile_virtual", ctypes.c_uint64),
+            ("compressed", ctypes.c_uint64),
+            ("compressed_peak", ctypes.c_uint64),
+            ("compressed_lifetime", ctypes.c_uint64),
+            ("phys_footprint", ctypes.c_uint64),
+        ]
+
+    try:
+        libsystem = ctypes.CDLL("/usr/lib/libSystem.dylib")
+        task_info = libsystem.task_info
+        task_info.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        task_info.restype = ctypes.c_int
+        mach_task_self = libsystem.mach_task_self
+        mach_task_self.restype = ctypes.c_uint32
+
+        info = TaskVMInfo()
+        count = ctypes.c_uint32(ctypes.sizeof(info) // ctypes.sizeof(ctypes.c_int32))
+        if task_info(mach_task_self(), 22, ctypes.byref(info), ctypes.byref(count)) != 0:
+            return None
+    except Exception:
+        return None
+
+    return info.phys_footprint / 1e9
+
 
 @dataclass
 class TrainingArgs:
@@ -42,7 +101,9 @@ class TrainingArgs:
         output_dir: str = "outputs",
         save_total_limit: Optional[int] = None,
         grad_checkpoint: bool = True,
+        cache_clear_steps: int = 1,
         push_to_hub: bool = False,
+        eval_strategy: str = "end",
     ):
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
@@ -63,7 +124,9 @@ class TrainingArgs:
         self.output_dir = output_dir
         self.save_total_limit = save_total_limit
         self.grad_checkpoint = grad_checkpoint ### mat not be necessary but helps anticipating hardware constraints
+        self.cache_clear_steps = cache_clear_steps
         self.push_to_hub = push_to_hub 
+        self.eval_strategy = eval_strategy
 
 class Trainer:
     """
@@ -90,6 +153,8 @@ class Trainer:
         self.task_type = task_type
 
         self.args = training_args
+        if training_args.eval_strategy not in {"no", "epoch", "end"}:
+            raise ValueError("eval_strategy must be one of: 'no', 'epoch', 'end'")
         # Adjust logging and saving steps based on gradient accumulation
         if training_args.logging_steps % training_args.gradient_accumulation_steps != 0:
             closest_multiple = (training_args.logging_steps // training_args.gradient_accumulation_steps) * training_args.gradient_accumulation_steps
@@ -343,21 +408,27 @@ class Trainer:
             self.epoch = epoch
             print(f"\nEpoch {epoch + 1}/{self.args.num_train_epochs}")
             self._train_epoch()
-            
-            if self.eval_dataset is not None:
+
+            is_final_epoch = epoch == self.args.num_train_epochs - 1
+            should_evaluate = (
+                self.eval_dataset is not None
+                and self.args.eval_strategy != "no"
+                and (self.args.eval_strategy == "epoch" or is_final_epoch)
+            )
+
+            if should_evaluate:
                 print(f"Evaluating after epoch {self.epoch + 1}...")
                 metrics = self.evaluate()
                 self._save_checkpoint(metrics)
             else:
-                # Save checkpoint even if no eval dataset is provided
                 print(f"Saving checkpoint after epoch {self.epoch + 1} without evaluation...")
                 self._save_checkpoint({})
 
     def _train_epoch(self):
         """Training logic for one epoch."""
         self.model.train()
-        running_loss = 0
-        running_grad_norm = 0.0
+        running_loss = mx.array(0.0)
+        running_grad_norm = mx.array(0.0)
         n_steps = 0
         start_time = time.time()
         
@@ -390,8 +461,7 @@ class Trainer:
             else:
                 accumulated_grads = tree_map(lambda x, y: x + y, accumulated_grads, grads)
             
-            # depending on hardware and model size, we may want to avoid syncing here
-            running_loss += loss.item() # running_loss += loss to avoid sync
+            running_loss = running_loss + mx.stop_gradient(loss)
 
             # Update Optimizer if Accumulation Done
             if n_steps % steps_to_accumulate == 0:
@@ -402,7 +472,7 @@ class Trainer:
 
                 # Apply updates
                 grad_norm = self.step_update(accumulated_grads)
-                running_grad_norm += grad_norm.item()
+                running_grad_norm = running_grad_norm + mx.stop_gradient(grad_norm)
 
                 # Reset
                 accumulated_grads = None
@@ -411,9 +481,9 @@ class Trainer:
                 mx.eval(self.model.state, self.optimizer.state)
             
                 if self.global_step >= self.next_log_step:
-                    # if running_loss is mx.array (see comment on hardware above), convert to float
-                    if isinstance(running_loss, mx.array):
-                        running_loss = running_loss.item()
+                    mx.eval(running_loss, running_grad_norm)
+                    running_loss = running_loss.item()
+                    running_grad_norm = running_grad_norm.item()
 
                     avg_loss = running_loss / max(n_steps, 1)
                     avg_grad_norm = running_grad_norm / (max(n_steps, 1) / steps_to_accumulate)
@@ -428,29 +498,35 @@ class Trainer:
                         current_lr = current_lr.item()
 
                     mem_gb = mx.get_active_memory() / 1e9
+                    footprint_gb = _get_process_footprint_gb()
                     elapsed = time.time() - start_time
                     steps_per_sec = n_steps / elapsed
+                    footprint_text = (
+                        f" | Footprint: {footprint_gb:.1f}GB"
+                        if footprint_gb is not None
+                        else ""
+                    )
                     
                     print(
-                        f"Step {self.global_step} | Loss: {avg_loss:.4f} | LR: {current_lr:.2e} | GradNorm: {avg_grad_norm:.2f} | Mem: {mem_gb:.1f}GB | Speed: {steps_per_sec:.2f} steps/s"
+                        f"Step {self.global_step} | Loss: {avg_loss:.4f} | LR: {current_lr:.2e} | GradNorm: {avg_grad_norm:.2f} | MLX active: {mem_gb:.1f}GB{footprint_text} | Speed: {steps_per_sec:.2f} steps/s"
                     )
                     
                     # Reset window counters
                     self.next_log_step += self.logging_steps
-                    running_loss = 0.0
-                    running_grad_norm = 0.0
+                    running_loss = mx.array(0.0)
+                    running_grad_norm = mx.array(0.0)
                     n_steps = 0
                     start_time = time.time()
 
                     if self.global_step >= self.next_save_step:
                         print("Saving checkpoint...")
-                        self._save_checkpoint({"step": self.global_step, "step_loss": avg_loss, "grad_norm": avg_grad_norm, "learning_rate": current_lr, "memory_gb": mem_gb, "steps_per_sec": steps_per_sec})
+                        self._save_checkpoint({"step": self.global_step, "step_loss": avg_loss, "grad_norm": avg_grad_norm, "learning_rate": current_lr, "memory_gb": mem_gb, "footprint_gb": footprint_gb, "steps_per_sec": steps_per_sec})
                         self.next_save_step += self.save_steps
             
-                # May not be optimal from a speed perspective but MLX is very aggressive in terms of memory caching 
-                # Like for the utils/server, we force garbage collection here to avoid OOMs on large models
-                gc.collect()
-                mx.clear_cache()
+                # MLX can hold onto large cached allocations, but clearing every step is slow.
+                if self.args.cache_clear_steps and self.global_step % self.args.cache_clear_steps == 0:
+                    gc.collect()
+                    mx.clear_cache()
         
         return 0.0 # placeholder 
     
@@ -459,6 +535,8 @@ class Trainer:
         self.model.eval()
         total_loss = 0
         n_steps = 0
+        token_predictions = []
+        token_references = []
         
         for raw_batch in self._create_batches(self.eval_dataset, self.args.eval_batch_size):
             batch = self.data_collator(raw_batch)
@@ -466,12 +544,71 @@ class Trainer:
             loss = mx.mean(outputs["loss"])
             total_loss += loss.item()
             n_steps += 1
+            self._collect_token_classification_predictions(
+                outputs,
+                batch,
+                token_predictions,
+                token_references,
+            )
             mx.clear_cache()
         
         metrics = {"eval_loss": total_loss / n_steps}
+        metrics.update(self._build_token_classification_eval_metrics(
+            token_predictions,
+            token_references,
+            prefix="eval",
+        ))
         print(f"\nEvaluation metrics: {metrics}")
         
         return metrics
+
+    def _collect_token_classification_predictions(
+        self,
+        outputs,
+        batch,
+        predictions,
+        references,
+    ):
+        if self.task_type != "token-classification" or "labels" not in batch:
+            return
+
+        scores = outputs.get("logits", outputs.get("probabilities"))
+        if scores is None:
+            return
+
+        predictions.extend(mx.argmax(scores, axis=-1).tolist())
+        references.extend(batch["labels"].tolist())
+
+    def _build_token_classification_eval_metrics(
+        self,
+        predictions,
+        references,
+        prefix: str,
+    ) -> Dict[str, float]:
+        if self.task_type != "token-classification" or not predictions:
+            return {}
+
+        metrics = compute_token_classification_metrics(
+            predictions,
+            references,
+            id2label=getattr(self.model.config, "id2label", None),
+        )
+        scalar_keys = (
+            "token_accuracy",
+            "token_f1_macro",
+            "token_f1_micro",
+            "boundary_f1_macro",
+            "boundary_f1_micro",
+            "macro_bf1",
+            "micro_bf1",
+            "predicted_spans",
+            "reference_spans",
+        )
+        return {
+            f"{prefix}_{key}": metrics[key]
+            for key in scalar_keys
+            if key in metrics
+        }
     
     def test(self, test_dataset=None):
         """
@@ -485,6 +622,8 @@ class Trainer:
         self.model.eval()
         total_loss = 0
         n_steps = 0
+        token_predictions = []
+        token_references = []
         
         # Use provided test dataset or fall back to eval dataset
         dataset_to_test = test_dataset or self.eval_dataset
@@ -498,8 +637,19 @@ class Trainer:
             loss = mx.mean(outputs["loss"])
             total_loss += loss.item()
             n_steps += 1
+            self._collect_token_classification_predictions(
+                outputs,
+                batch,
+                token_predictions,
+                token_references,
+            )
             mx.clear_cache()
         metrics = {"eval_loss": total_loss / n_steps}
+        metrics.update(self._build_token_classification_eval_metrics(
+            token_predictions,
+            token_references,
+            prefix="eval",
+        ))
         
         # Save test results
         results_path = self.output_dir / "test_results.json"
@@ -548,6 +698,12 @@ class Trainer:
         
         with open(save_path / "metrics.json", "w") as f:
             json.dump(metrics, f, indent=2)
+
+        if self.task_type == "token-classification":
+            save_viterbi_calibration(
+                save_path,
+                getattr(self.model, "viterbi_calibration", None),
+            )
         
         # Push to Hub (PLACEHOLDER)
         if self.args.push_to_hub:
@@ -593,11 +749,7 @@ def upload_to_hub(
         hf_path (str): Path to the original Hugging Face model.
         task_type (str): Type of task the model was trained on.
     """
-    import os
-
     from huggingface_hub import HfApi, ModelCard, logging
-
-    from . import __version__
 
     model_path = Path(path)
 

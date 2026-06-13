@@ -111,6 +111,22 @@ def test_openai_privacy_filter_sanitize_targets_existing_parameters():
     assert set(sanitized) <= param_names
 
 
+def test_openai_privacy_filter_sanitize_drops_mismatched_head():
+    config = _tiny_config()
+    model = ModelForTokenClassification(config)
+
+    weights = dict(tree_flatten(model.parameters()))
+    weights["score.weight"] = mx.zeros((config.num_labels - 1, config.hidden_size), dtype=mx.float32)
+    weights["score.bias"] = mx.zeros((config.num_labels - 1,), dtype=mx.float32)
+    sanitized = model.sanitize(weights)
+
+    assert "score.weight" not in sanitized
+    assert "score.bias" not in sanitized
+    _verify_weights(model, sanitized, train_mode=True)
+    _initialize_head_weights(model, sanitized, model.config, target_dtype=mx.float32)
+    model.load_weights(list(sanitized.items()))
+
+
 def test_openai_privacy_filter_sequence_sanitize_targets_existing_parameters():
     model = ModelForSequenceClassification(_tiny_config())
     param_names = {name for name, _ in tree_flatten(model.parameters())}
@@ -139,6 +155,135 @@ def test_openai_privacy_filter_sanitize_hf_layout_loads_strictly():
     hf_weights["model.rotary_emb.inv_freq"] = mx.zeros((4,), dtype=mx.float32)
 
     sanitized = model.sanitize(hf_weights)
+    model.load_weights(list(sanitized.items()))
+
+
+def test_openai_privacy_filter_sanitize_split_expert_layout_loads_strictly():
+    config = _tiny_config()
+    model = ModelForTokenClassification(config)
+    hf_weights = {
+        name: mx.zeros(value.shape, dtype=value.dtype)
+        for name, value in tree_flatten(model.parameters())
+    }
+
+    expert_prefix = "model.layers.0.mlp.experts"
+    for suffix in ("gate_up_proj", "gate_up_proj_bias", "down_proj", "down_proj_bias"):
+        hf_weights.pop(f"{expert_prefix}.{suffix}")
+
+    hf_weights[f"{expert_prefix}.gate_proj.weight"] = mx.zeros(
+        (config.num_local_experts, config.hidden_size, config.intermediate_size),
+        dtype=mx.float32,
+    )
+    hf_weights[f"{expert_prefix}.up_proj.weight"] = mx.zeros(
+        (config.num_local_experts, config.hidden_size, config.intermediate_size),
+        dtype=mx.float32,
+    )
+    hf_weights[f"{expert_prefix}.gate_proj.bias"] = mx.zeros(
+        (config.num_local_experts, config.intermediate_size),
+        dtype=mx.float32,
+    )
+    hf_weights[f"{expert_prefix}.up_proj.bias"] = mx.zeros(
+        (config.num_local_experts, config.intermediate_size),
+        dtype=mx.float32,
+    )
+    hf_weights[f"{expert_prefix}.down_proj.weight"] = mx.zeros(
+        (config.num_local_experts, config.intermediate_size, config.hidden_size),
+        dtype=mx.float32,
+    )
+    hf_weights[f"{expert_prefix}.down_proj.bias"] = mx.zeros(
+        (config.num_local_experts, config.hidden_size),
+        dtype=mx.float32,
+    )
+
+    sanitized = model.sanitize(hf_weights)
+    assert f"{expert_prefix}.gate_up_proj" in sanitized
+    assert f"{expert_prefix}.gate_up_proj_bias" in sanitized
+    assert f"{expert_prefix}.down_proj" in sanitized
+    assert f"{expert_prefix}.down_proj_bias" in sanitized
+    model.load_weights(list(sanitized.items()))
+
+
+def test_openai_privacy_filter_sanitize_block_layout_loads_strictly():
+    config = _tiny_config()
+    model = ModelForTokenClassification(config)
+    hf_weights = {
+        name: mx.zeros(value.shape, dtype=value.dtype)
+        for name, value in tree_flatten(model.parameters())
+    }
+
+    layer_prefix = "model.layers.0"
+    block_prefix = "block.0"
+    for suffix in (
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.q_proj.bias",
+        "self_attn.k_proj.weight",
+        "self_attn.k_proj.bias",
+        "self_attn.v_proj.weight",
+        "self_attn.v_proj.bias",
+        "self_attn.o_proj.weight",
+        "self_attn.o_proj.bias",
+        "self_attn.sinks",
+        "mlp.router.weight",
+        "mlp.router.bias",
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.gate_up_proj_bias",
+        "mlp.experts.down_proj",
+        "mlp.experts.down_proj_bias",
+    ):
+        hf_weights.pop(f"{layer_prefix}.{suffix}")
+    hf_weights.pop("model.embed_tokens.weight")
+    hf_weights.pop("model.norm.weight")
+    hf_weights.pop("score.weight")
+    hf_weights.pop("score.bias")
+
+    q_dim = config.num_attention_heads * config.head_dim
+    kv_dim = config.num_key_value_heads * config.head_dim
+    hf_weights["embedding.weight"] = mx.zeros((config.vocab_size, config.hidden_size), dtype=mx.float32)
+    hf_weights["norm.scale"] = mx.ones((config.hidden_size,), dtype=mx.float32)
+    hf_weights["unembedding.weight"] = mx.zeros((config.num_labels, config.hidden_size), dtype=mx.float32)
+    hf_weights["unembedding.bias"] = mx.zeros((config.num_labels,), dtype=mx.float32)
+    hf_weights[f"{block_prefix}.attn.qkv.weight"] = mx.zeros(
+        (q_dim + 2 * kv_dim, config.hidden_size),
+        dtype=mx.float32,
+    )
+    hf_weights[f"{block_prefix}.attn.qkv.bias"] = mx.zeros((q_dim + 2 * kv_dim,), dtype=mx.float32)
+    hf_weights[f"{block_prefix}.attn.out.weight"] = mx.zeros((config.hidden_size, q_dim), dtype=mx.float32)
+    hf_weights[f"{block_prefix}.attn.out.bias"] = mx.zeros((config.hidden_size,), dtype=mx.float32)
+    hf_weights[f"{block_prefix}.attn.sinks"] = mx.zeros((config.num_attention_heads,), dtype=mx.float32)
+    hf_weights[f"{block_prefix}.attn.norm.scale"] = mx.ones((config.hidden_size,), dtype=mx.float32)
+    hf_weights[f"{block_prefix}.mlp.norm.scale"] = mx.ones((config.hidden_size,), dtype=mx.float32)
+    hf_weights[f"{block_prefix}.mlp.gate.weight"] = mx.zeros(
+        (config.num_local_experts, config.hidden_size),
+        dtype=mx.float32,
+    )
+    hf_weights[f"{block_prefix}.mlp.gate.bias"] = mx.zeros((config.num_local_experts,), dtype=mx.float32)
+    hf_weights[f"{block_prefix}.mlp.swiglu.weight"] = mx.zeros(
+        (config.num_local_experts, config.hidden_size, 2 * config.intermediate_size),
+        dtype=mx.float32,
+    )
+    hf_weights[f"{block_prefix}.mlp.swiglu.bias"] = mx.zeros(
+        (config.num_local_experts, 2 * config.intermediate_size),
+        dtype=mx.float32,
+    )
+    hf_weights[f"{block_prefix}.mlp.out.weight"] = mx.zeros(
+        (config.num_local_experts, config.intermediate_size, config.hidden_size),
+        dtype=mx.float32,
+    )
+    hf_weights[f"{block_prefix}.mlp.out.bias"] = mx.zeros(
+        (config.num_local_experts, config.hidden_size),
+        dtype=mx.float32,
+    )
+
+    sanitized = model.sanitize(hf_weights)
+    assert f"{layer_prefix}.self_attn.q_proj.weight" in sanitized
+    assert f"{layer_prefix}.self_attn.k_proj.weight" in sanitized
+    assert f"{layer_prefix}.self_attn.v_proj.weight" in sanitized
+    assert "model.embed_tokens.weight" in sanitized
+    assert "model.norm.weight" in sanitized
+    assert "score.weight" in sanitized
+    assert "score.bias" in sanitized
     model.load_weights(list(sanitized.items()))
 
 

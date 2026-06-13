@@ -71,6 +71,7 @@ DEFAULT_WARMUP_STEPS : int = 0
 DEFAULT_SAVE_STEPS : int = 5000
 DEFAULT_LOGGING_STEPS : int = 64
 DEFAULT_EVAL_BATCH_SIZE : int = 8
+DEFAULT_CACHE_CLEAR_STEPS : int = 1
 
 def init_args():
     parser = argparse.ArgumentParser(description="Train or evaluate a classification model using MLX Raclate.")
@@ -81,6 +82,9 @@ def init_args():
     parser.add_argument("--label_field", type=str, default=None, help="Name of the label field in the dataset (if different from default).")
     parser.add_argument("--negative_field", type=str, default=None, help="Name of the negative samples field in the dataset (if applicable and different from default).")
     parser.add_argument("--create_test", action='store_true', help="Set this flag to create a test split, if not already present in the dataset, out of the training set (validation set not affected).")
+    parser.add_argument("--train_limit", type=int, default=None, help="Limit the number of training examples after loading and split creation.")
+    parser.add_argument("--validation_limit", type=int, default=None, help="Limit the number of validation examples after loading and split creation.")
+    parser.add_argument("--test_limit", type=int, default=None, help="Limit the number of test examples after loading and split creation.")
 
     # Trainer / End Model Init Params
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help="Path to the pre-trained model or model identifier from a model hub.")
@@ -111,7 +115,10 @@ def init_args():
     parser.add_argument("--save_steps", type=int, default=DEFAULT_SAVE_STEPS, help="Number of steps between model checkpoints.")
     parser.add_argument("--eval_batch_size", type=int, default=DEFAULT_EVAL_BATCH_SIZE, help="Batch size for evaluation.")
     parser.add_argument("--output_dir", type=str, default=None, help="Directory to save model checkpoints and logs.")
+    parser.add_argument("--no_grad_checkpoint", dest="grad_checkpoint", action="store_false", help="Disable MLX gradient checkpointing.")
+    parser.add_argument("--cache_clear_steps", type=int, default=DEFAULT_CACHE_CLEAR_STEPS, help="Clear the MLX cache every N optimizer updates. Use 0 to disable explicit cache clearing.")
     parser.set_defaults(train=True)
+    parser.set_defaults(grad_checkpoint=True)
     return parser.parse_args()
 
 def main():
@@ -124,6 +131,9 @@ def main():
     label_field : str = args.label_field
     negative_field : str = args.negative_field
     create_test : bool = args.create_test
+    train_limit : int = args.train_limit
+    validation_limit : int = args.validation_limit
+    test_limit : int = args.test_limit
 
     # Trainer / End Model Params
     model_path : str = args.model_path 
@@ -151,6 +161,8 @@ def main():
     max_length : int = args.max_length
     freeze_embeddings : bool = args.freeze_embeddings
     max_grad_norm : float = args.max_grad_norm
+    grad_checkpoint : bool = args.grad_checkpoint
+    cache_clear_steps : int = args.cache_clear_steps
 
     print(f"Training Mode : {train}")
 
@@ -167,7 +179,10 @@ def main():
         text_pair_field=text_pair_field,
         label_field=label_field,
         negative_field=negative_field,
-        test=create_test
+        test=create_test,
+        train_limit=train_limit,
+        validation_limit=validation_limit,
+        test_limit=test_limit,
     )
     
     train_dataset, valid_dataset, test_dataset, id2label, label2id = load_dataset(dataset_args)
@@ -222,7 +237,8 @@ def main():
         eval_batch_size=eval_batch_size,
         output_dir=output_dir,
         save_total_limit=None,
-        grad_checkpoint=True,
+        grad_checkpoint=grad_checkpoint,
+        cache_clear_steps=cache_clear_steps,
         push_to_hub=False,
     )
 

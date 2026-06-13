@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import math
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -93,6 +94,8 @@ class ModelArgs(BaseModelArgs):
 	def __post_init__(self):
 		if self.num_experts is not None:
 			self.num_local_experts = self.num_experts
+		else:
+			self.num_experts = self.num_local_experts
 
 		if self.experts_per_token is not None:
 			self.num_experts_per_tok = self.experts_per_token
@@ -336,7 +339,7 @@ class OpenAIPrivacyFilterAttention(nn.Module):
 					value_chunk,
 					scale=1.0,
 					mask=mask_chunk,
-					sinks=self.sinks,
+					sinks=self.sinks.astype(query_chunk.dtype),
 				)
 			)
 
@@ -413,21 +416,26 @@ class OpenAIPrivacyFilterExperts(nn.Module):
 
 	def __call__(self, hidden_states: mx.array, router_indices: mx.array, router_scores: mx.array) -> mx.array:
 		next_states = mx.zeros(hidden_states.shape, dtype=mx.float32)
+		token_count = hidden_states.shape[0]
+		token_indices = mx.stop_gradient(mx.arange(token_count, dtype=router_indices.dtype))
+		hidden_states = hidden_states[:, None, :].astype(mx.float32)
 
 		for slot in range(self.top_k):
-			expert_indices = router_indices[:, slot]
+			expert_indices = mx.stop_gradient(router_indices[:, slot])
 			weights = router_scores[:, slot : slot + 1].astype(mx.float32)
-			gate_up_weight = self.gate_up_proj[expert_indices].astype(mx.float32)
-			gate_up = mx.matmul(
-				hidden_states[:, None, :].astype(mx.float32),
-				gate_up_weight,
+			gate_up = mx.gather_mm(
+				hidden_states,
+				self.gate_up_proj,
+				lhs_indices=token_indices,
+				rhs_indices=expert_indices,
 			).squeeze(1)
 			gate_up = gate_up + self.gate_up_proj_bias[expert_indices].astype(mx.float32)
 			gated_output = self._apply_gate(gate_up)
-			down_weight = self.down_proj[expert_indices].astype(mx.float32)
-			expert_output = mx.matmul(
+			expert_output = mx.gather_mm(
 				gated_output[:, None, :].astype(mx.float32),
-				down_weight,
+				self.down_proj,
+				lhs_indices=token_indices,
+				rhs_indices=expert_indices,
 			).squeeze(1)
 			expert_output = expert_output + self.down_proj_bias[expert_indices].astype(mx.float32)
 			next_states = next_states + expert_output * weights
@@ -447,10 +455,10 @@ class OpenAIPrivacyFilterTopKRouter(nn.Module):
 			hidden_states.astype(mx.float32),
 			self.weight.astype(mx.float32).T,
 		) + self.bias.astype(mx.float32)
-		sorted_indices = mx.argsort(logits, axis=-1)[..., -self.top_k :]
-		top_values = mx.take_along_axis(logits, sorted_indices, axis=-1)
+		top_indices = mx.argpartition(logits, kth=-self.top_k, axis=-1)[..., -self.top_k :]
+		top_values = mx.take_along_axis(logits, top_indices, axis=-1)
 		router_scores = mx.softmax(top_values, axis=-1) / self.top_k
-		return logits, router_scores, sorted_indices
+		return logits, router_scores, mx.stop_gradient(top_indices)
 
 
 class OpenAIPrivacyFilterMLP(nn.Module):
@@ -589,11 +597,122 @@ class OpenAIPrivacyFilterModel(nn.Module):
 		}
 
 
-def _sanitize_weights(weights: Dict[str, Any], include_head: bool) -> Dict[str, Any]:
+def _split_qkv(value: mx.array, config: ModelArgs) -> Tuple[mx.array, mx.array, mx.array]:
+	q_dim = config.num_attention_heads * config.head_dim
+	kv_dim = config.num_key_value_heads * config.head_dim
+	return (
+		value[:q_dim],
+		value[q_dim : q_dim + kv_dim],
+		value[q_dim + kv_dim : q_dim + 2 * kv_dim],
+	)
+
+
+def _head_param_matches_config(target: str, value: mx.array, config: ModelArgs) -> bool:
+	if target == "score.weight":
+		return value.shape[0] == config.num_labels
+	if target == "score.bias":
+		return value.shape[0] == config.num_labels
+	return True
+
+
+def _add_head_param(
+	sanitized: Dict[str, Any],
+	target: str,
+	value: mx.array,
+	config: ModelArgs,
+) -> None:
+	if _head_param_matches_config(target, value, config):
+		sanitized[target] = value
+		return
+
+	print(
+		f"[INFO] Skipping mismatched OpenAI privacy-filter head parameter {target}: "
+		f"checkpoint {value.shape} does not match num_labels={config.num_labels}"
+	)
+
+
+def _sanitize_weights(
+	weights: Dict[str, Any],
+	include_head: bool,
+	config: ModelArgs,
+) -> Dict[str, Any]:
 	sanitized: Dict[str, Any] = {}
+	gate_proj_weights: Dict[str, mx.array] = {}
+	up_proj_weights: Dict[str, mx.array] = {}
+	gate_proj_biases: Dict[str, mx.array] = {}
+	up_proj_biases: Dict[str, mx.array] = {}
 
 	for key, value in weights.items():
 		if "position_ids" in key or key.endswith("rotary_emb.inv_freq"):
+			continue
+
+		layer_match = re.match(
+			r"model\.layers\.(\d+)\.mlp\.experts\.(gate_proj|up_proj|down_proj)\.(weight|bias)$",
+			key,
+		)
+		if layer_match:
+			layer_id, proj_name, param_name = layer_match.groups()
+			layer_key = f"model.layers.{layer_id}.mlp.experts"
+			if proj_name == "gate_proj":
+				if param_name == "weight":
+					gate_proj_weights[layer_key] = value
+				else:
+					gate_proj_biases[layer_key] = value
+			elif proj_name == "up_proj":
+				if param_name == "weight":
+					up_proj_weights[layer_key] = value
+				else:
+					up_proj_biases[layer_key] = value
+			elif proj_name == "down_proj":
+				target = f"{layer_key}.down_proj" if param_name == "weight" else f"{layer_key}.down_proj_bias"
+				sanitized[target] = value
+			continue
+
+		block_match = re.match(r"block\.(\d+)\.(.+)$", key)
+		if block_match:
+			layer_id, suffix = block_match.groups()
+			prefix = f"model.layers.{layer_id}"
+
+			if suffix == "attn.qkv.weight":
+				q, k, v = _split_qkv(value, config)
+				sanitized[f"{prefix}.self_attn.q_proj.weight"] = q
+				sanitized[f"{prefix}.self_attn.k_proj.weight"] = k
+				sanitized[f"{prefix}.self_attn.v_proj.weight"] = v
+			elif suffix == "attn.qkv.bias":
+				q, k, v = _split_qkv(value, config)
+				sanitized[f"{prefix}.self_attn.q_proj.bias"] = q
+				sanitized[f"{prefix}.self_attn.k_proj.bias"] = k
+				sanitized[f"{prefix}.self_attn.v_proj.bias"] = v
+			elif suffix == "attn.out.weight":
+				sanitized[f"{prefix}.self_attn.o_proj.weight"] = value
+			elif suffix == "attn.out.bias":
+				sanitized[f"{prefix}.self_attn.o_proj.bias"] = value
+			elif suffix == "attn.sinks":
+				sanitized[f"{prefix}.self_attn.sinks"] = value
+			elif suffix == "attn.norm.scale":
+				sanitized[f"{prefix}.input_layernorm.weight"] = value
+			elif suffix == "mlp.norm.scale":
+				sanitized[f"{prefix}.post_attention_layernorm.weight"] = value
+			elif suffix == "mlp.gate.weight":
+				sanitized[f"{prefix}.mlp.router.weight"] = value
+			elif suffix == "mlp.gate.bias":
+				sanitized[f"{prefix}.mlp.router.bias"] = value
+			elif suffix == "mlp.swiglu.weight":
+				sanitized[f"{prefix}.mlp.experts.gate_up_proj"] = value
+			elif suffix == "mlp.swiglu.bias":
+				sanitized[f"{prefix}.mlp.experts.gate_up_proj_bias"] = value
+			elif suffix == "mlp.out.weight":
+				sanitized[f"{prefix}.mlp.experts.down_proj"] = value
+			elif suffix == "mlp.out.bias":
+				sanitized[f"{prefix}.mlp.experts.down_proj_bias"] = value
+			continue
+
+		if key == "embedding.weight":
+			sanitized["model.embed_tokens.weight"] = value
+			continue
+
+		if key == "norm.scale":
+			sanitized["model.norm.weight"] = value
 			continue
 
 		if key.startswith("model."):
@@ -601,16 +720,42 @@ def _sanitize_weights(weights: Dict[str, Any], include_head: bool) -> Dict[str, 
 			continue
 
 		if include_head and key.startswith("score."):
-			sanitized[key] = value
+			_add_head_param(sanitized, key, value, config)
 			continue
 
 		if include_head and key.startswith("classifier."):
-			sanitized[f"score.{key.removeprefix('classifier.')}"] = value
+			_add_head_param(
+				sanitized,
+				f"score.{key.removeprefix('classifier.')}",
+				value,
+				config,
+			)
 			continue
 
 		if include_head and key.startswith("unembedding."):
-			sanitized[f"score.{key.removeprefix('unembedding.')}"] = value
+			_add_head_param(
+				sanitized,
+				f"score.{key.removeprefix('unembedding.')}",
+				value,
+				config,
+			)
 			continue
+
+	for layer_key, gate_weight in gate_proj_weights.items():
+		up_weight = up_proj_weights.get(layer_key)
+		if up_weight is not None:
+			sanitized[f"{layer_key}.gate_up_proj"] = mx.concatenate(
+				[gate_weight, up_weight],
+				axis=-1,
+			)
+
+	for layer_key, gate_bias in gate_proj_biases.items():
+		up_bias = up_proj_biases.get(layer_key)
+		if up_bias is not None:
+			sanitized[f"{layer_key}.gate_up_proj_bias"] = mx.concatenate(
+				[gate_bias, up_bias],
+				axis=-1,
+			)
 
 	if include_head and "score.weight" in sanitized and "score.bias" not in sanitized:
 		sanitized["score.bias"] = mx.zeros((sanitized["score.weight"].shape[0],), dtype=sanitized["score.weight"].dtype)
@@ -669,7 +814,7 @@ class Model(RaclateBaseModel):
 		}
 
 	def sanitize(self, weights):
-		sanitized = _sanitize_weights(weights, include_head=False)
+		sanitized = _sanitize_weights(weights, include_head=False, config=self.config)
 		# getting rid the dropout and score weights
 		return {
 			key: value
@@ -779,7 +924,7 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
 		}
 
 	def sanitize(self, weights):
-		sanitized = _sanitize_weights(weights, include_head=False)
+		sanitized = _sanitize_weights(weights, include_head=False, config=self.config)
 		# getting rid the dropout and score weights
 		return {
 			key: value
@@ -879,7 +1024,7 @@ class ModelForSequenceClassification(RaclateBaseModel):
 		}
 
 	def sanitize(self, weights):
-		sanitized = _sanitize_weights(weights, include_head=True)
+		sanitized = _sanitize_weights(weights, include_head=True, config=self.config)
 		return {
 			key: value
 			for key, value in sanitized.items()
@@ -964,4 +1109,4 @@ class ModelForTokenClassification(RaclateBaseModel):
 		}
 
 	def sanitize(self, weights):
-		return _sanitize_weights(weights, include_head=True)
+		return _sanitize_weights(weights, include_head=True, config=self.config)

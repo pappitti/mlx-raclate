@@ -8,7 +8,7 @@ This trainer supports standard dense retrieval, classification, and masked langu
 
 *   **Apple Silicon Native:** Fully optimized for M-series chips using MLX.
 *   **Full Training:**  Full fine-tuning of pretrained models (_see supported architectures below_). LORA fine-tuning is not supported (yet). The library allows transfer learning, meaning that existing heads can be stripped out of pretrained models (and new heads can be added to base models for specific tasks)
-*   **Memory Efficiency:** Built-in support for **Gradient Accumulation** and **Gradient Checkpointing** to train larger batches/models on limited Unified Memory.
+*   **Memory Efficiency:** Built-in support for **Gradient Accumulation**, **Gradient Checkpointing**, and configurable MLX cache clearing to train larger batches/models on limited Unified Memory.
 *   **Flexible Schedulers:** Linear, Cosine, and Constant learning rate schedules with warmup.
 *   **Smart Collators:** Task-specific data collators that handle padding, masking, and chat templates automatically.
 *   **Embedding Freezing:** Option to freeze embedding layers to speed up fine-tuning or prevent catastrophic forgetting.
@@ -53,7 +53,7 @@ Perform domain adaptation on raw text.
 ### 4. Token Classification (NER/POS)
 Named Entity Recognition and Part-of-Speech tagging.
 *   **Task Type:** `token-classification`
-*   **Features:** Handles label alignment for sub-word tokens automatically.
+*   **Features:** Handles label alignment for sub-word tokens automatically. The trainer is label-scheme agnostic: BIO, BIOES/BILOU, flat tags, or integer class ids all work as long as there is one label per input word.
 
 
 ## Data Preparation
@@ -69,7 +69,7 @@ The trainer looks for specific column names.
 | **Pairs (Sim.)** | `text`, `text_pair` | Anchor and Positive/Candidate. |
 | **Triplets** | `text`, `text_pair`, `negative` | Anchor, Positive, Hard Negative. |
 | **MLM** | `text` | Raw text for masking. |
-| **NER** | `tokens`, `labels` | Pre-tokenized words and aligned tags. |
+| **NER** | `text`, `labels` | Pre-tokenized words and aligned tags. HF-style `tokens`/`ner_tags` columns are automatically renamed to `text`/`labels`. |
 
 *Note: For Sentence Similarity, if a `label` column is present with floats, the trainer switches to Regression/MSE loss (e.g., for scored Bi-Encoders).*
 
@@ -229,10 +229,13 @@ Used to configure how data is loaded and mapped.
 | :--- | :--- | :--- | :--- |
 | `data` | `str` | *Required* | Local path or HF identifier of the dataset. |
 | `task_type` | `str` | *Required* | The type of task (e.g., `text-classification`). |
-| `text_field` | `str` | `None` | Name of the text input column. |
+| `text_field` | `str` | `"text"` | Name of the text input column. |
 | `text_pair_field`| `str` | `None` | Name of the second text input column (for pairs). |
-| `label_field` | `str` | `None` | Name of the label/target column. |
+| `label_field` | `str` | `"label"` | Name of the label/target column. |
 | `negative_field`| `str` | `None` | Name of the negative samples column. |
+| `train_limit` | `int` | `None` | Optional cap on training examples after loading and split creation. |
+| `validation_limit` | `int` | `None` | Optional cap on validation examples after loading and split creation. |
+| `test_limit` | `int` | `None` | Optional cap on test examples after loading and split creation. |
 | `test` | `bool` | `False` | If True, creates a test split from the training set if one doesn't exist. |   
 
 Note : use load_dataset("dataset_path") from `datasets.py` to fetch the dataset splits and the label2id dictionary.
@@ -264,13 +267,16 @@ Controls the hyperparameters and runtime configuration.
 #### Checkpointing & Logging
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
-| `output_dir` | `None` | Directory to save checkpoints and logs. Defaults to a timestamped folder. |
+| `output_dir` | `"outputs"` | Directory name under `trained_models/` for checkpoints and logs. |
 | `save_steps` | `1000` | Frequency of saving model checkpoints (in steps). |
-| `logging_steps` | `16` | Frequency of logging metrics to console/files. |
+| `logging_steps` | `100` | Frequency of logging metrics to console/files. |
 | `eval_batch_size` | `4` | Batch size used during evaluation/testing. |
+| `eval_strategy` | `"end"` | When to run validation: `"end"` for the final epoch only, `"epoch"` after every epoch, or `"no"` to skip validation during training. |
 | `resume_from_step`| `0` | Step to resume training from. If this is after the last warmup step (either declared or calculated via warmup_ratio), warmup will be ignored. |  
+| `grad_checkpoint` | `True` | Whether to wrap transformer layers in MLX gradient checkpointing to reduce activation memory. |
+| `cache_clear_steps` | `1` | Clear MLX cache every N optimizer updates. `1` is safest for large/MoE models; higher values can improve speed but may increase process footprint. |
 
-Gradient checkpointing is enabled by default due to RAM constraints of consumer hardware.
+Gradient checkpointing is enabled by default due to RAM constraints of consumer hardware. MLX cache clearing is also aggressive by default because unified-memory footprint can be much larger than `mx.get_active_memory()` for some architectures.
 
 ### Model Config
 
@@ -302,4 +308,3 @@ The main class that orchestrates the training.
 
 *   `train()`: Starts the training loop.
 *   `test(dataset)`: Runs evaluation on the provided dataset.
-

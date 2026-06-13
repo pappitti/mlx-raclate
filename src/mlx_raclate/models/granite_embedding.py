@@ -207,6 +207,9 @@ class ModelForSentenceSimilarity(RaclateBaseModel):
             "embeddings": embeddings,
         }
 
+    def sanitize(self, weights):
+        return _sanitize_modernbert_backbone(weights)
+
 
 class ModelForSentenceTransformers(ModelForSentenceSimilarity):
     pass
