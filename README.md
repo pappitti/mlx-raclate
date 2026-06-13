@@ -41,6 +41,10 @@ uv sync
 *   **Gemma3 Embedding**: (e.g., `google/embeddinggemma-300m`)
 *   **T5Gemma Encoder**: stripping out the decoder part of T5Gemma models (e.g, `google/t5gemma-2b-2b-ul2`)
 *   **OpenAI Privacy Filter**: bidirectional token classification for PII detection (e.g., `OpenMed/privacy-filter-nemotron-mlx`)
+*   **Colbert Zero**: (e.g., `lightonai/ColBERT-Zero`)
+*   **LateOn**: (e.g., `lightonai/LateOn`)
+*   **Perplexity Embed**: Qwen3 architecture adapted for bidirectional attention (e.g `perplexity-ai/pplx-embed-v1-0.6b`, `PITTI/pplx-embed-0.6b-nemotron`)
+*   **NeoBERT**: (e.g., `chandar-lab/NeoBERT`)
 
 ## Inference: Quick Start
 
