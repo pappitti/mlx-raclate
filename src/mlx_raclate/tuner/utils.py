@@ -9,6 +9,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 EMBEDDING_LAYER_NAMES = {
     "gemma3_text": ["embed_tokens"],
     "lfm2": ["embed_tokens"],
+    "lfm2_bidirectional": ["embed_tokens"],
     "neobert": ["encoder"],
     "qwen3": ["embed_tokens"],
     "t5gemma_encoder": ["embed_tokens"],

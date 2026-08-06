@@ -29,6 +29,7 @@ MODEL_FAMILIES = [
     "gemma3",
     "t5gemma",
     "lfm2",
+    "lfm2_bidirectional",
     "neobert",
 ]
 
@@ -58,6 +59,7 @@ TRAINABLE_PIPELINES_BY_FAMILY: Dict[str, List[str]] = {
     "gemma3": TRAINABLE_PIPELINES,
     "t5gemma": TRAINABLE_PIPELINES,
     "lfm2": ["text-classification", "sentence-similarity"],
+    "lfm2_bidirectional": ["masked-lm", "sentence-similarity"],
     "neobert": TRAINABLE_PIPELINES,
     "openai_privacy_filter": ["text-classification", "sentence-similarity", "token-classification"],
 }
@@ -69,6 +71,7 @@ BASE_MODELS: Dict[str, str] = {
     "gemma3": "google/embeddinggemma-300m",
     "t5gemma": "google/t5gemma-s-s-ul2",
     "lfm2": "LiquidAI/LFM2-350M",
+    "lfm2_bidirectional": "LiquidAI/LFM2.5-Encoder-350M",
     "neobert": "chandar-lab/NeoBERT",
     "openai_privacy_filter": "openai/privacy-filter",
 }
@@ -118,6 +121,16 @@ def _init_registry():
     _register("lfm2", "sentence-similarity", "LiquidAI/LFM2-ColBERT-350M",
               model_config={"use_late_interaction": True},
               notes="Late interaction (ColBERT-style) model")
+
+    # Bidirectional LFM2.5 endpoints (auto-routed from architectures/auto_map)
+    _register("lfm2_bidirectional", "embeddings", "LiquidAI/LFM2.5-Embedding-350M",
+              notes="Bidirectional LFM2.5 with non-causal short-conv and CLS pooling")
+    _register("lfm2_bidirectional", "sentence-transformers", "LiquidAI/LFM2.5-Embedding-350M",
+              notes="Sentence Transformers checkpoint with CLS pooling")
+    _register("lfm2_bidirectional", "sentence-similarity", "LiquidAI/LFM2.5-Embedding-350M",
+              notes="Dense bidirectional LFM2.5 retrieval model")
+    _register("lfm2_bidirectional", "masked-lm", "LiquidAI/LFM2.5-Encoder-350M",
+              notes="Bidirectional LFM2.5 encoder with tied masked-LM head")
     
     # OpenAI endpoints 
     _register("openai_privacy_filter", "token-classification", "openai/privacy-filter")

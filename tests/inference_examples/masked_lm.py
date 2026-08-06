@@ -1,5 +1,5 @@
 import mlx.core as mx
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 def run_inference(
     model_path: str,
@@ -32,6 +32,11 @@ def run_inference(
         model_config=config,
         pipeline="masked-lm"
     )
+
+    # Accept the common example spelling even when a checkpoint uses a
+    # model-specific mask token such as LFM2.5's <|mask|>.
+    if tokenizer.mask_token and tokenizer.mask_token != "[MASK]":
+        text = text.replace("[MASK]", tokenizer.mask_token)
     
     # Tokenize
     tokens = tokenizer.encode(text)

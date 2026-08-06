@@ -1,7 +1,5 @@
-from functools import cache
-import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Literal
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -253,6 +251,8 @@ class MLP(nn.Module):
 
 
 class Lfm2DecoderLayer(nn.Module):
+    short_conv_class = ShortConv
+
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
         if args.full_attn_idxs :
@@ -265,7 +265,7 @@ class Lfm2DecoderLayer(nn.Module):
         if self.is_attention_layer:
             self.self_attn = Attention(args)
         else:
-            self.conv = ShortConv(args, layer_idx)
+            self.conv = self.short_conv_class(args, layer_idx)
         
         self.feed_forward = MLP(
             dim=args.block_dim,
@@ -304,6 +304,8 @@ class Lfm2DecoderLayer(nn.Module):
         return (out,)
 
 class Lfm2Model(nn.Module):
+    decoder_layer_class = Lfm2DecoderLayer
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -311,7 +313,8 @@ class Lfm2Model(nn.Module):
         self.num_hidden_layers = args.num_hidden_layers
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Lfm2DecoderLayer(args, layer_idx=i) for i in range(args.num_hidden_layers)
+            self.decoder_layer_class(args, layer_idx=i)
+            for i in range(args.num_hidden_layers)
         ]
 
         self.embedding_norm = nn.RMSNorm(args.hidden_size, eps=args.norm_eps)

@@ -37,6 +37,7 @@ uv sync
 
 *   **ModernBERT**: (e.g., `answerdotai/ModernBERT-base`)
 *   **LFM2**: Liquid Foundation Models (e.g., `LiquidAI/LFM2-350M`, `LiquidAI/LFM2-ColBERT-350M`)
+*   **Bidirectional LFM2.5**: Encoder and dense retrieval variants with non-causal short convolution (e.g., `LiquidAI/LFM2.5-Encoder-350M`, `LiquidAI/LFM2.5-Embedding-350M`)
 *   **Qwen3 Embedding**: (e.g., `Qwen/Qwen3-Embedding-0.6B`)
 *   **Gemma3 Embedding**: (e.g., `google/embeddinggemma-300m`)
 *   **T5Gemma Encoder**: stripping out the decoder part of T5Gemma models (e.g, `google/t5gemma-2b-2b-ul2`)

@@ -23,6 +23,7 @@ The trainer supports a variety of modern architectures supporting long context (
 *   **Gemma 3**: MLX implementation of `google/embeddinggemma-300m` (2k context window) which leverages the gemma3 text variant architecture with a few tweaks. As per the official embeddinggemma3 architecture, the attention mask is set to causal or bi-directional based on a config parameter (`use_bidirectional_attn` or `use_bidirectional_attention`). Therefore, it is possible to switch between encoder and decoder mode, and standard gemma3_text models (32k context window) are also supported. 
 *   **T5Gemma-Encoder**: MLX implementation of `google/t5gemma-b-b-ul2`, but only keeping the encoder weights at initialization (the encoder config is merged into the main model config)
 *   **LFM2**: MLX implementation of `LiquidAI/LFM2-350M` (Causal/AR) which also supports `LiquidAI/LFM2-ColBERT-350M` when model config file includes `use_late_interaction=True`. These models have a context window of 128k tokens. In training mode, 128k tokens exceeds the RAM capacity of most Apple hardware. _See parameters below to cap sequences to a more reasonable length during training_
+*   **Bidirectional LFM2.5**: MLX implementation of `LiquidAI/LFM2.5-Encoder-350M` for masked-LM training and `LiquidAI/LFM2.5-Embedding-350M` for CLS-pooled dense retrieval. The loader detects LiquidAI's `Lfm2Bidirectional*` architecture metadata automatically.
 
 
 ## Supported Tasks & Pipelines

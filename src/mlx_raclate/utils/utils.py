@@ -54,6 +54,10 @@ MODEL_REMAPPING = {
     "phi-msft": "phixtral"
 }
 
+MODEL_ARCH_TO_PIPELINE_MAPPING = {
+    "Lfm2BidirectionalModel": "embeddings",
+}
+
 MAX_FILE_SIZE_GB = 5
 
 class ModelNotFoundError(Exception):
@@ -102,11 +106,38 @@ def _get_pipeline_from_config(arch : str):
     Returns:
         str: The pipeline type.
     """
+    if arch in MODEL_ARCH_TO_PIPELINE_MAPPING:
+        return MODEL_ARCH_TO_PIPELINE_MAPPING[arch]
     if arch is not None:
         for k,v in HF_ARCH_TO_PIPELINE_MAPPING.items():
             if k in arch:
                 return v
     return None  
+
+
+def _uses_lfm2_bidirectional_architecture(config: dict) -> bool:
+    architectures = config.get("architectures") or []
+    if any("Lfm2Bidirectional" in architecture for architecture in architectures):
+        return True
+
+    auto_map = config.get("auto_map") or {}
+    return any(
+        "Lfm2Bidirectional" in str(mapped_class)
+        or "modeling_lfm2_bidirectional" in str(mapped_class)
+        for mapped_class in auto_map.values()
+    )
+
+
+def _remap_lfm2_bidirectional_model_type(
+    config: dict,
+    explicit_model_type: bool = False,
+) -> None:
+    if (
+        not explicit_model_type
+        and config.get("model_type") == "lfm2"
+        and _uses_lfm2_bidirectional_architecture(config)
+    ):
+        config["model_type"] = "lfm2_bidirectional"
 
 
 def _get_classes(config: dict, pipeline: Optional[str] = 'masked-lm'):
@@ -441,6 +472,7 @@ def load_model(
         config.update(encoder_config)
     explicit_model_type = "model_type" in model_config
     config.update(model_config)
+    _remap_lfm2_bidirectional_model_type(config, explicit_model_type)
 
     if is_sentence_transformer:
         config["sentence_transformers_config"] = sentence_transformers_config
