@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .base import (
     BaseModelArgs,
+    GradientCheckpointingMixin,
     RotaryEmbedding,
     last_token_pooling,
     mean_pooling,
@@ -303,7 +304,7 @@ class Lfm2DecoderLayer(nn.Module):
         out = h + self.feed_forward(self.ffn_norm(h))
         return (out,)
 
-class Lfm2Model(nn.Module):
+class Lfm2Model(GradientCheckpointingMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -380,7 +381,13 @@ class Lfm2Model(nn.Module):
 
         for layer, c in zip(self.layers, cache):
             mask = attn_mask if layer.is_attention_layer else conv_mask
-            layer_outputs = layer(hidden_states, mask, cache=c, position_ids=position_ids)
+            layer_outputs = self._call_checkpointed_layer(
+                layer,
+                hidden_states,
+                mask,
+                cache=c,
+                position_ids=position_ids,
+            )
             hidden_states = layer_outputs[0]
 
         hidden_states = self.embedding_norm(hidden_states)

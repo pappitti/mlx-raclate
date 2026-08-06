@@ -419,7 +419,7 @@ def main() -> None:
     parser.add_argument("--model", default="perplexity-ai/pplx-embed-v1-0.6b")
     parser.add_argument(
         "--output-dir",
-        default="data/NER-Finance-CRM/bioes_pplx_embed_v1_0_6b",
+        default="data/NER-Finance-CRM/bioes_pplx_embed_v1_0.6b",
     )
     parser.add_argument("--max-length", type=_positive_int, default=32768)
     parser.add_argument("--validation-fraction", type=_fraction, default=0.15)

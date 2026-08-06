@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from .base import (
     BaseModelArgs,
+    GradientCheckpointingMixin,
     RaclateBaseModel,
     RotaryEmbedding,
     last_token_pooling,
@@ -215,7 +216,7 @@ class TransformerBlock(nn.Module):
         return (hidden_states,)
 
 
-class Qwen3Model(nn.Module):
+class Qwen3Model(GradientCheckpointingMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
@@ -273,7 +274,12 @@ class Qwen3Model(nn.Module):
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
-            layer_outputs = layer(hidden_states, attention_mask, position_ids)
+            layer_outputs = self._call_checkpointed_layer(
+                layer,
+                hidden_states,
+                attention_mask,
+                position_ids,
+            )
             hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)

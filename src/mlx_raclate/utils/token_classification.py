@@ -648,14 +648,20 @@ def compute_token_classification_metrics(
         "token_precision_micro": token_scores["precision_micro"],
         "token_recall_micro": token_scores["recall_micro"],
         "token_f1_micro": token_scores["f1_micro"],
+        "token_precision_by_label": token_scores["precision_by_label"],
+        "token_recall_by_label": token_scores["recall_by_label"],
         "token_f1_by_label": token_scores["f1_by_label"],
+        "token_counts_by_label": token_scores["counts_by_label"],
         "boundary_precision_macro": boundary_scores["precision_macro"],
         "boundary_recall_macro": boundary_scores["recall_macro"],
         "boundary_f1_macro": boundary_scores["f1_macro"],
         "boundary_precision_micro": boundary_scores["precision_micro"],
         "boundary_recall_micro": boundary_scores["recall_micro"],
         "boundary_f1_micro": boundary_scores["f1_micro"],
+        "boundary_precision_by_label": boundary_scores["precision_by_label"],
+        "boundary_recall_by_label": boundary_scores["recall_by_label"],
         "boundary_f1_by_label": boundary_scores["f1_by_label"],
+        "boundary_counts_by_label": boundary_scores["counts_by_label"],
         "macro_bf1": boundary_scores["f1_macro"],
         "micro_bf1": boundary_scores["f1_micro"],
         "predicted_spans": len(predicted_spans),
@@ -784,7 +790,10 @@ def _average_prf(per_label: Mapping[str, Tuple[int, int, int]]) -> Dict[str, Any
     precisions = []
     recalls = []
     f1s = []
+    precision_by_label = {}
+    recall_by_label = {}
     f1_by_label = {}
+    counts_by_label = {}
     total_tp = total_fp = total_fn = 0
 
     for label, (tp, fp, fn) in per_label.items():
@@ -792,7 +801,15 @@ def _average_prf(per_label: Mapping[str, Tuple[int, int, int]]) -> Dict[str, Any
         precisions.append(precision)
         recalls.append(recall)
         f1s.append(f1)
+        precision_by_label[label] = precision
+        recall_by_label[label] = recall
         f1_by_label[label] = f1
+        counts_by_label[label] = {
+            "true_positives": tp,
+            "false_positives": fp,
+            "false_negatives": fn,
+            "support": tp + fn,
+        }
         total_tp += tp
         total_fp += fp
         total_fn += fn
@@ -810,7 +827,10 @@ def _average_prf(per_label: Mapping[str, Tuple[int, int, int]]) -> Dict[str, Any
         "precision_micro": micro_precision,
         "recall_micro": micro_recall,
         "f1_micro": micro_f1,
+        "precision_by_label": precision_by_label,
+        "recall_by_label": recall_by_label,
         "f1_by_label": f1_by_label,
+        "counts_by_label": counts_by_label,
     }
 
 

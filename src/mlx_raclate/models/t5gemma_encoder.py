@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .base import (
     BaseModelArgs,
+    GradientCheckpointingMixin,
     RotaryEmbedding,
     mean_pooling,
     normalize_embeddings,
@@ -241,7 +242,7 @@ class TransformerBlock(nn.Module):
         out = r + self.dropout(out)
         return (out,)
 
-class T5GemmaEncoder(nn.Module):
+class T5GemmaEncoder(GradientCheckpointingMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
@@ -334,7 +335,9 @@ class T5GemmaEncoder(nn.Module):
         for i, layer in enumerate(self.layers):
             is_global = self.config.layer_types[i] == "full_attention"
             layer_mask = global_mask if is_global else sliding_window_mask
-            layer_outputs = layer(hidden_states, layer_mask, position_ids)
+            layer_outputs = self._call_checkpointed_layer(
+                layer, hidden_states, layer_mask, position_ids
+            )
             hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)

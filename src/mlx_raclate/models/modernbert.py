@@ -5,8 +5,9 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import (
-    BaseModelArgs, 
-    RaclateBaseModel, 
+    BaseModelArgs,
+    GradientCheckpointingMixin,
+    RaclateBaseModel,
     RotaryEmbedding,
     compute_similarity_and_loss, 
     mean_pooling, 
@@ -253,7 +254,7 @@ class ModernBertEncoderLayer(nn.Module):
         return (hidden_states,)  
 
 
-class ModernBertModel(nn.Module):
+class ModernBertModel(GradientCheckpointingMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
@@ -262,7 +263,6 @@ class ModernBertModel(nn.Module):
             ModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)
         ]
         self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
-        self.gradient_checkpointing = False 
 
     def get_input_embeddings(self) -> ModernBertEmbeddings:
         return self.embeddings.tok_embeddings
@@ -347,7 +347,8 @@ class ModernBertModel(nn.Module):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            layer_outputs = encoder_layer(
+            layer_outputs = self._call_checkpointed_layer(
+                encoder_layer,
                 hidden_states,
                 attention_mask=attention_mask,
                 sliding_window_mask=sliding_window_mask,

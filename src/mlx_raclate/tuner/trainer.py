@@ -307,40 +307,23 @@ class Trainer:
         self._save_config()
 
     def _apply_grad_checkpointing(self):
-        """
-        Apply gradient checkpointing to the model's forward pass to reduce memory usage.
-        Uses MLX's checkpoint mechanism to save memory during backpropagation.
-        """
-        def checkpoint_fn(module):
-            original_call = module.__call__
+        """Enable module-aware checkpointing on supported model backbones."""
+        enable_checkpointing = getattr(self.model, "set_gradient_checkpointing", None)
+        if enable_checkpointing is None:
+            raise ValueError(
+                f"{type(self.model).__name__} does not expose gradient checkpointing."
+            )
 
-            def checkpointed_call(self, **kwargs):
-                # Let MLX handle the parameter management, just checkpoint the function call
-                return mx.checkpoint(original_call)(self, **kwargs)
+        checkpointed_backbones = enable_checkpointing(True)
+        if checkpointed_backbones == 0:
+            raise ValueError(
+                f"{type(self.model).__name__} has no checkpoint-compatible backbone."
+            )
 
-            module.__call__ = checkpointed_call
-        
-        layers = None
-        
-        # Handling various model architectures
-        if hasattr(self.model, "layers"): 
-            layers = self.model.layers
-        elif hasattr(self.model, "model"):
-            if hasattr(self.model.model, "layers"): 
-                layers = self.model.model.layers
-            elif hasattr(self.model.model, "encoder"): # Others TBC
-                if hasattr(self.model.model.encoder, "layers"):
-                    layers = self.model.model.encoder.layers
-
-        if layers is None:
-            print("WARNING: Could not find layers to checkpoint. Memory will explode.")
-            return
-
-        print(f"Checkpointing {len(layers)} layers.")
-        for layer in layers:
-            checkpoint_fn(layer)
-
-        ### TODO : optionally checkpoint other layers  (head, classifier) 
+        print(
+            "Gradient checkpointing enabled for "
+            f"{checkpointed_backbones} backbone(s)."
+        )
 
 
     def _compute_loss(self, batch_inputs): 
@@ -595,9 +578,17 @@ class Trainer:
         )
         scalar_keys = (
             "token_accuracy",
+            "token_precision_macro",
+            "token_recall_macro",
             "token_f1_macro",
+            "token_precision_micro",
+            "token_recall_micro",
             "token_f1_micro",
+            "boundary_precision_macro",
+            "boundary_recall_macro",
             "boundary_f1_macro",
+            "boundary_precision_micro",
+            "boundary_recall_micro",
             "boundary_f1_micro",
             "macro_bf1",
             "micro_bf1",

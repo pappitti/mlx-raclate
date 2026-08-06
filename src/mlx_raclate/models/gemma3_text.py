@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .base import (
     BaseModelArgs,
+    GradientCheckpointingMixin,
     RotaryEmbedding,
     mean_pooling,
     last_token_pooling,
@@ -269,7 +270,7 @@ class TransformerBlock(nn.Module):
         return (out,)
 
 
-class Gemma3Model(nn.Module):
+class Gemma3Model(GradientCheckpointingMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
@@ -361,7 +362,9 @@ class Gemma3Model(nn.Module):
                 # Fallback to pattern
                 is_global = (i + 1) % self.config.sliding_pattern == 0
             layer_mask = global_mask if is_global else sliding_window_mask
-            layer_outputs = layer(hidden_states, layer_mask, position_ids)
+            layer_outputs = self._call_checkpointed_layer(
+                layer, hidden_states, layer_mask, position_ids
+            )
             hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)

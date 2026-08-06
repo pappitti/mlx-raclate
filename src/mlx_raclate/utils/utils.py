@@ -92,6 +92,15 @@ def _determine_model_dtype(config: dict, loaded_weights: dict) -> mx.Dtype:
 
     return mx.float32
 
+
+def _cast_floating_weights(weights: dict, target_dtype: mx.Dtype) -> dict:
+    """Cast checkpoint floating-point arrays without changing integer state."""
+    for key, value in weights.items():
+        if mx.issubdtype(value.dtype, mx.floating) and value.dtype != target_dtype:
+            weights[key] = value.astype(target_dtype)
+    return weights
+
+
 def _get_pipeline_from_config(arch : str):
     """
     Retrieve the pipeline type based on the model configuration.
@@ -589,6 +598,10 @@ def load_model(
     # Use set_dtype to update all floating-point parameters recursively.
     # The default predicate ensures we don't accidentally cast integer params.
     model.set_dtype(target_dtype)
+
+    # Loading an FP32 array replaces a BF16 destination parameter in MLX; cast
+    # the checkpoint itself so the requested precision survives load_weights().
+    weights = _cast_floating_weights(weights, target_dtype)
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)

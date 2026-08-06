@@ -109,6 +109,36 @@ def test_compute_token_classification_metrics_reports_accuracy_and_macro_bf1():
         "location": 0.0,
         "person": 1.0,
     }
+    assert metrics["boundary_precision_by_label"] == {
+        "email": 0.0,
+        "location": 0.0,
+        "person": 1.0,
+    }
+    assert metrics["boundary_recall_by_label"] == {
+        "email": 0.0,
+        "location": 0.0,
+        "person": 1.0,
+    }
+    assert metrics["boundary_counts_by_label"] == {
+        "email": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "support": 1,
+        },
+        "location": {
+            "true_positives": 0,
+            "false_positives": 1,
+            "false_negatives": 1,
+            "support": 1,
+        },
+        "person": {
+            "true_positives": 1,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "support": 1,
+        },
+    }
 
 
 def test_compute_token_classification_metrics_ignores_label_pad_tokens():
