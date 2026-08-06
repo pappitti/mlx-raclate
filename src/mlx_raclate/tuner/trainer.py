@@ -3,6 +3,7 @@ import json
 import gc
 import ctypes
 import platform
+import warnings
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,7 @@ import mlx.nn as nn
 import mlx.optimizers
 from datasets import Dataset as HFDataset
 
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from .collators import DataCollator
 from .utils import EMBEDDING_LAYER_NAMES, MultiPrecisionAdamW, build_schedule
@@ -86,6 +87,7 @@ class TrainingArgs:
         eval_batch_size: int = 4,
         max_length: int = 512,
         resume_from_step: int = 0,
+        resume_from_checkpoint: Optional[str] = None,
         num_train_epochs: int = 2,
         learning_rate: float = 3e-5,
         weight_decay: float = 0.01,
@@ -111,6 +113,7 @@ class TrainingArgs:
         self.eval_batch_size = eval_batch_size
         self.max_length = max_length
         self.resume_from_step = resume_from_step
+        self.resume_from_checkpoint = resume_from_checkpoint
         self.num_train_epochs = num_train_epochs
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -176,8 +179,11 @@ class Trainer:
             self.save_steps = training_args.save_steps
 
         self.resume_from_step = training_args.resume_from_step
-        # TODO : handle resuming from checkpoint (load model + optimizer state)
-        # For now, no optimizer state loading
+        self.resume_from_checkpoint = training_args.resume_from_checkpoint
+        if self.resume_from_step and self.resume_from_checkpoint:
+            raise ValueError(
+                "Use either resume_from_step or resume_from_checkpoint, not both."
+            )
 
         self.train_dataset = train_dataset
         self.use_chat_template = use_chat_template
@@ -230,20 +236,17 @@ class Trainer:
                 
             # Effective steps considering gradient accumulation
             num_update_steps_per_epoch = max(steps_per_epoch // training_args.gradient_accumulation_steps, 1)
-            resumed_update_steps = self.resume_from_step // training_args.gradient_accumulation_steps
             total_update_steps = num_update_steps_per_epoch * training_args.num_train_epochs
+            resumed_update_steps = self.resume_from_step // training_args.gradient_accumulation_steps
             if resumed_update_steps >= total_update_steps:
                 raise ValueError("resume_from_step is greater than total training steps. Steps = dataset_size / batch_size * num_epochs")
-            max_steps = max(total_update_steps - resumed_update_steps, 0)
+            max_steps = total_update_steps
 
             if training_args.warmup_steps > 0:
                 warmup_steps = training_args.warmup_steps
             else:
                 warmup_steps = int(max_steps * training_args.warmup_ratio)
 
-            if self.resume_from_step and warmup_steps <= (self.resume_from_step// training_args.gradient_accumulation_steps):
-                warmup_steps = 0
-            
             decay_steps = max_steps - warmup_steps
             
             scheduler_type = training_args.lr_scheduler_type # e.g. "constant", "cosine_decay"
@@ -296,11 +299,35 @@ class Trainer:
         self.output_dir = Path("trained_models") / training_args.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Setup training state and output directory
+        # Setup training state. Checkpoint restore happens after optimizer
+        # construction so its nested master weights and moments can be loaded.
         self.global_step = 0
         self.epoch = 0
-        self.next_save_step = self.resume_from_step + self.save_steps
-        self.next_log_step = self.resume_from_step + self.logging_steps
+        self.start_epoch = 0
+        self.resume_microbatches_in_epoch = 0
+        self.microbatches_in_epoch = 0
+        if self.resume_from_checkpoint:
+            self._restore_checkpoint_state(Path(self.resume_from_checkpoint))
+        elif self.resume_from_step:
+            microbatches_per_epoch = (
+                len(self.train_dataset) + self.args.batch_size - 1
+            ) // self.args.batch_size
+            self.global_step = self.resume_from_step
+            self.start_epoch, self.resume_microbatches_in_epoch = divmod(
+                self.resume_from_step, microbatches_per_epoch
+            )
+            warnings.warn(
+                "resume_from_step skips data but cannot restore Adam moments. "
+                "Prefer resume_from_checkpoint for a numerically continuous run.",
+                stacklevel=2,
+            )
+
+        self.next_save_step = (
+            (self.global_step // self.save_steps) + 1
+        ) * self.save_steps
+        self.next_log_step = (
+            (self.global_step // self.logging_steps) + 1
+        ) * self.logging_steps
 
         # Capture state that needs updating (random state for Dropout, etc.)
         self.state = [self.model.state, self.optimizer.state, mx.random.state]
@@ -379,6 +406,54 @@ class Trainer:
             f"{checkpointed_backbones} backbone(s)."
         )
 
+    def _restore_checkpoint_state(self, checkpoint_path: Path) -> None:
+        """Restore optimizer and loop position from a complete checkpoint."""
+        trainer_state_path = checkpoint_path / "trainer_state.json"
+        optimizer_state_path = checkpoint_path / "optimizer.safetensors"
+        required_paths = (
+            checkpoint_path / "model.safetensors",
+            trainer_state_path,
+            optimizer_state_path,
+        )
+        missing = [str(path) for path in required_paths if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"Checkpoint {checkpoint_path} is incomplete; missing: "
+                + ", ".join(missing)
+            )
+
+        with open(trainer_state_path) as file:
+            trainer_state = json.load(file)
+
+        optimizer_weights = mx.load(str(optimizer_state_path))
+        self.optimizer.state = tree_unflatten(list(optimizer_weights.items()))
+        self.optimizer.init(self.model.trainable_parameters())
+        mx.eval(self.optimizer.state)
+
+        self.global_step = int(trainer_state["global_step"])
+        self.start_epoch = int(trainer_state["completed_epochs"])
+        self.epoch = self.start_epoch
+        self.resume_microbatches_in_epoch = int(
+            trainer_state.get("microbatches_in_epoch", 0)
+        )
+        if self.resume_microbatches_in_epoch:
+            self.start_epoch = int(trainer_state["epoch"])
+            self.epoch = self.start_epoch
+
+        restored_optimizer_step = int(self.optimizer.step.item())
+        expected_optimizer_step = int(trainer_state["optimizer_step"])
+        if restored_optimizer_step != expected_optimizer_step:
+            raise ValueError(
+                "Optimizer state step does not match trainer_state.json: "
+                f"{restored_optimizer_step} != {expected_optimizer_step}"
+            )
+        print(
+            f"Resuming from {checkpoint_path}: epoch {self.start_epoch + 1}, "
+            f"microbatch {self.resume_microbatches_in_epoch}, "
+            f"global step {self.global_step}, optimizer step "
+            f"{restored_optimizer_step}."
+        )
+
 
     def _compute_loss(self, batch_inputs): 
         """Compute the loss for training"""
@@ -441,10 +516,16 @@ class Trainer:
         """Main training loop."""
         print("Starting training...")
         
-        for epoch in range(self.args.num_train_epochs):
+        for epoch in range(self.start_epoch, self.args.num_train_epochs):
             self.epoch = epoch
             print(f"\nEpoch {epoch + 1}/{self.args.num_train_epochs}")
-            self._train_epoch()
+            skip_microbatches = (
+                self.resume_microbatches_in_epoch
+                if epoch == self.start_epoch
+                else 0
+            )
+            self._train_epoch(skip_microbatches=skip_microbatches)
+            self.resume_microbatches_in_epoch = 0
 
             is_final_epoch = epoch == self.args.num_train_epochs - 1
             should_evaluate = (
@@ -456,12 +537,12 @@ class Trainer:
             if should_evaluate:
                 print(f"Evaluating after epoch {self.epoch + 1}...")
                 metrics = self.evaluate()
-                self._save_checkpoint(metrics)
+                self._save_checkpoint(metrics, completed_epoch=True)
             else:
                 print(f"Saving checkpoint after epoch {self.epoch + 1} without evaluation...")
-                self._save_checkpoint({})
+                self._save_checkpoint({}, completed_epoch=True)
 
-    def _train_epoch(self):
+    def _train_epoch(self, skip_microbatches: int = 0):
         """Training logic for one epoch."""
         self.model.train()
         running_loss = mx.array(0.0)
@@ -477,13 +558,20 @@ class Trainer:
         # ensures different shuffling each epoch
         current_seed = 42 + self.epoch 
 
-        for raw_batch in self._create_batches(self.train_dataset, self.args.batch_size, shuffle=True, seed=current_seed):
-            
-            self.global_step += 1
-
-            # Skip steps if resuming from a specific step
-            if self.global_step <= self.resume_from_step:
+        self.microbatches_in_epoch = skip_microbatches
+        for batch_index, raw_batch in enumerate(
+            self._create_batches(
+                self.train_dataset,
+                self.args.batch_size,
+                shuffle=True,
+                seed=current_seed,
+            )
+        ):
+            if batch_index < skip_microbatches:
                 continue
+
+            self.global_step += 1
+            self.microbatches_in_epoch += 1
 
             # HF Dataset slicing returns a Dict of lists: {'text': ['a', 'b'], 'label': [0, 1]}
             # Convert HF Columnar batch (Dict[str, List]) to MLX batch (Dict[str, mx.array])
@@ -714,16 +802,59 @@ class Trainer:
         
         return metrics
     
-    def _save_checkpoint(self, metrics: Dict[str, float]):
+    def _save_checkpoint(
+        self,
+        metrics: Dict[str, float],
+        *,
+        completed_epoch: bool = False,
+    ):
         save_path = self.output_dir / f"checkpoint-{self.global_step}"
-        save_path.mkdir(exist_ok=True)
+        save_path.mkdir(parents=True, exist_ok=True)
 
         hf_transformers_arch = self.model.get_hf_transformers_arch()
         if hf_transformers_arch:
             self.model.config.architectures = [hf_transformers_arch]
 
+        # Save the recoverable checkpoint payload before generating optional
+        # documentation. A missing README must never discard a completed epoch.
         with open(save_path / "config.json", "w") as f:
             json.dump(self.model.config.__dict__, f, indent=2)
+
+        self.tokenizer.save_pretrained(save_path)
+
+        weights = dict(tree_flatten(self.model.parameters()))
+        if hasattr(self.model, "decoder"):
+            print("Removing tied decoder weights from checkpoint...")
+            weights.pop("decoder.weight", None)
+        mx.save_safetensors(str(save_path / "model.safetensors"), weights)
+
+        with open(save_path / "metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
+
+        if self.task_type == "token-classification":
+            save_viterbi_calibration(
+                save_path,
+                getattr(self.model, "viterbi_calibration", None),
+            )
+
+        if hasattr(self, "optimizer"):
+            mx.eval(self.optimizer.state)
+            optimizer_weights = dict(tree_flatten(self.optimizer.state))
+            mx.save_safetensors(
+                str(save_path / "optimizer.safetensors"),
+                optimizer_weights,
+            )
+            trainer_state = {
+                "global_step": self.global_step,
+                "optimizer_step": int(self.optimizer.step.item()),
+                "epoch": self.epoch,
+                "completed_epochs": self.epoch + 1 if completed_epoch else self.epoch,
+                "microbatches_in_epoch": (
+                    0 if completed_epoch else self.microbatches_in_epoch
+                ),
+            }
+            with open(save_path / "trainer_state.json", "w") as f:
+                json.dump(trainer_state, f, indent=2)
 
         model_card_kwargs = {
             "pipeline": self.task_type,
@@ -735,25 +866,15 @@ class Trainer:
         if hasattr(self.model.config, "is_regression"):
             model_card_kwargs["is_regression"] = self.model.config.is_regression
 
-        card_text = get_code_for_trained_model(**model_card_kwargs)
-        with open(save_path / "README.md", "w") as f:
-            f.write(card_text)
-
-        self.tokenizer.save_pretrained(save_path)
-        
-        weights = dict(tree_flatten(self.model.parameters()))
-        if hasattr(self.model, "decoder") :
-            print("Removing tied decoder weights from checkpoint...")
-            weights.pop("decoder.weight", None)
-        mx.save_safetensors(str(save_path / "model.safetensors"), weights)
-        
-        with open(save_path / "metrics.json", "w") as f:
-            json.dump(metrics, f, indent=2)
-
-        if self.task_type == "token-classification":
-            save_viterbi_calibration(
-                save_path,
-                getattr(self.model, "viterbi_calibration", None),
+        try:
+            card_text = get_code_for_trained_model(**model_card_kwargs)
+            with open(save_path / "README.md", "w") as f:
+                f.write(card_text)
+        except Exception as error:
+            card_text = ""
+            warnings.warn(
+                f"Checkpoint saved, but README generation failed: {error}",
+                stacklevel=2,
             )
         
         # Push to Hub (PLACEHOLDER)

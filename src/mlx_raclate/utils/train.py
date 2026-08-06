@@ -113,6 +113,7 @@ def init_args():
     parser.add_argument("--warmup_steps", type=int, default=DEFAULT_WARMUP_STEPS, help="Number of warmup steps for learning rate scheduler (if set, steps override ratio).")
     parser.add_argument("--max_grad_norm", type=float, default=1, help="Maximum gradient norm for gradient clipping (Default: 1).")
     parser.add_argument("--resume_from_step", type=int, default=0, help="Step number to resume training from (if applicable). Will override warmup if steps are after warmup period.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume model, optimizer, scheduler, and epoch position from a complete Raclate checkpoint.")
     # Other Training Params
     parser.add_argument("--logging_steps", type=int, default=DEFAULT_LOGGING_STEPS, help="Number of steps between logging training metrics.")
     parser.add_argument("--save_steps", type=int, default=DEFAULT_SAVE_STEPS, help="Number of steps between model checkpoints.")
@@ -165,11 +166,17 @@ def main():
     save_steps : int = args.save_steps
     eval_batch_size : int = args.eval_batch_size
     resume_from_step : int = args.resume_from_step
+    resume_from_checkpoint : str = args.resume_from_checkpoint
     max_length : int = args.max_length
     freeze_embeddings : bool = args.freeze_embeddings
     max_grad_norm : float = args.max_grad_norm
     grad_checkpoint : bool = args.grad_checkpoint
     cache_clear_steps : int = args.cache_clear_steps
+
+    if resume_from_step and resume_from_checkpoint:
+        raise ValueError("Use either --resume_from_step or --resume_from_checkpoint, not both.")
+    if resume_from_checkpoint:
+        model_path = resume_from_checkpoint
 
     print(f"Training Mode : {train}")
 
@@ -234,6 +241,7 @@ def main():
         multi_precision=multi_precision,
         max_length= max_length if max_length else model.config.max_position_embeddings,
         resume_from_step=resume_from_step, # warmup will be ingnored if before this step and schedulers will only start after
+        resume_from_checkpoint=resume_from_checkpoint,
         num_train_epochs=num_train_epochs,
         learning_rate=learning_rate, 
         weight_decay=weight_decay,
