@@ -59,11 +59,16 @@ class RaclateBaseModel(nn.Module):
         if new_num_tokens == old_num_tokens:
             return old_embeddings
 
+        embedding_dtype = old_embeddings.weight.dtype
+
         # Create new embeddings
         new_embeddings = nn.Embedding(new_num_tokens, old_embedding_dim)
         
         # Initialize new weights (e.g. Normal)
-        new_embeddings.weight = mx.random.normal(shape=(new_num_tokens, old_embedding_dim)) * 0.02
+        new_embeddings.weight = mx.random.normal(
+            shape=(new_num_tokens, old_embedding_dim),
+            dtype=embedding_dtype,
+        ) * mx.array(0.02, dtype=embedding_dtype)
         
         # We copy up to the min size to handle both expansion and shrinking (though usually expansion)
         n = min(old_num_tokens, new_num_tokens)
@@ -86,6 +91,8 @@ class RaclateBaseModel(nn.Module):
 
 @dataclass
 class BaseModelArgs:
+    dtype: str = "auto"
+
     @classmethod
     def from_dict(cls, params):
         return cls(

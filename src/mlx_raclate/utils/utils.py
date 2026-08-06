@@ -5,6 +5,7 @@ import glob
 import importlib
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple, Type, Union
 
@@ -29,18 +30,15 @@ PIPELINES = [
     "sentence-similarity"
 ]
 
-# Map common string representations to MLX dtypes
+# Map accepted model-config spellings to a canonical name and MLX dtype.
 STR_TO_DTYPE = {
-    "float32": mx.float32,
-    "fp32": mx.float32,
-    "float16": mx.float16,
-    "fp16": mx.float16,
-    "half": mx.float16,
-    "bfloat16": mx.bfloat16,
-    "bf16": mx.bfloat16,
-    # Less common but possible
-    "float64": mx.float32, # Map double to single precision (usually sufficient)
-    "double": mx.float32,
+    "float32": ("float32", mx.float32),
+    "fp32": ("float32", mx.float32),
+    "float16": ("float16", mx.float16),
+    "fp16": ("float16", mx.float16),
+    "half": ("float16", mx.float16),
+    "bfloat16": ("bfloat16", mx.bfloat16),
+    "bf16": ("bfloat16", mx.bfloat16),
 }
 
 HF_ARCH_TO_PIPELINE_MAPPING = {
@@ -61,44 +59,131 @@ class ModelNotFoundError(Exception):
         self.message = message
         super().__init__(self.message)
 
+@dataclass(frozen=True)
+class ModelDTypePolicy:
+    name: str
+    config_name: str
+    dtype: mx.Dtype
+    cast_checkpoint: bool
+    source: str
+
+
+def _canonical_dtype(dtype: mx.Dtype) -> str:
+    for canonical, candidate in STR_TO_DTYPE.values():
+        if dtype == candidate:
+            return canonical
+    raise ValueError(f"Unsupported floating-point dtype in checkpoint: {dtype}")
+
+
+def _infer_checkpoint_dtype(loaded_weights: dict) -> tuple[mx.Dtype, bool]:
+    dtype_sizes = {}
+    for value in loaded_weights.values():
+        if not mx.issubdtype(value.dtype, mx.floating):
+            continue
+        _canonical_dtype(value.dtype)
+        dtype_sizes[value.dtype] = dtype_sizes.get(value.dtype, 0) + value.size
+
+    if not dtype_sizes:
+        return mx.float32, False
+    return max(dtype_sizes, key=dtype_sizes.get), len(dtype_sizes) > 1
+
+
+def _resolve_model_dtype(config: dict, loaded_weights: dict) -> ModelDTypePolicy:
+    """Resolve model-config dtype, preferring canonical dtype over torch_dtype."""
+    if config.get("dtype") is not None:
+        requested = config["dtype"]
+        source = "dtype"
+    elif config.get("quantization") is not None:
+        # Quantized MLX configs often retain the pre-conversion torch_dtype;
+        # the packed checkpoint is the reliable source for auxiliary tensors.
+        requested = "auto"
+        source = "checkpoint"
+    elif config.get("torch_dtype") is not None:
+        requested = config["torch_dtype"]
+        source = "torch_dtype"
+    else:
+        requested = "auto"
+        source = "checkpoint"
+
+    if not isinstance(requested, str):
+        raise TypeError(
+            "Model config dtype must be a string such as 'bfloat16' or 'auto', "
+            f"got {type(requested).__name__}."
+        )
+
+    normalized = requested.lower()
+    if normalized == "auto":
+        inferred, is_mixed = _infer_checkpoint_dtype(loaded_weights)
+        canonical = _canonical_dtype(inferred)
+        return ModelDTypePolicy(
+            name=canonical,
+            config_name="auto" if is_mixed else canonical,
+            dtype=inferred,
+            cast_checkpoint=False,
+            source="checkpoint",
+        )
+
+    if normalized not in STR_TO_DTYPE:
+        supported = ", ".join(sorted(STR_TO_DTYPE))
+        raise ValueError(
+            f"Unsupported model dtype '{requested}'. Supported values: auto, {supported}."
+        )
+
+    canonical, dtype = STR_TO_DTYPE[normalized]
+    return ModelDTypePolicy(
+        name=canonical,
+        config_name=canonical,
+        dtype=dtype,
+        cast_checkpoint=True,
+        source=source,
+    )
+
+
 def _determine_model_dtype(config: dict, loaded_weights: dict) -> mx.Dtype:
-    """
-    Robustly determine the target dtype for the model.
-    1. If 'quantization' is in config -> Default to float16 (Standard MLX format).
-    2. Else check config['torch_dtype']. 
-    3. Else 'auto' -> infer from loaded weights.
-    """
-    # MLX Quantized Models
-    # If the model is quantized, the non-quantized layers (norms, etc.) 
-    # should usually be float16. We ignore torch_dtype here because 
-    # converted configs often retain the original model's 'float32' tag.
-    if config.get("quantization", None) is not None:
-        return mx.float16
-
-    # Check Torch Config
-    dtype_entry = config.get("torch_dtype", config.get("dtype", "auto"))
-    
-    if isinstance(dtype_entry, str):
-        dtype_entry = dtype_entry.lower()
-        if dtype_entry in STR_TO_DTYPE:
-            return STR_TO_DTYPE[dtype_entry]
-            
-        if dtype_entry == "auto":
-            # Infer from the first float-like weight we found
-            for v in loaded_weights.values():
-                if v.dtype in [mx.float16, mx.bfloat16]:
-                    return v.dtype
-            return mx.float32
-
-    return mx.float32
+    """Backward-compatible dtype-only view of the resolved model policy."""
+    return _resolve_model_dtype(config, loaded_weights).dtype
 
 
-def _cast_floating_weights(weights: dict, target_dtype: mx.Dtype) -> dict:
-    """Cast checkpoint floating-point arrays without changing integer state."""
+def _align_checkpoint_dtypes(
+    weights: dict,
+    model: nn.Module,
+    *,
+    cast_floating: bool,
+) -> dict:
+    """Align explicit floating checkpoint overrides to destination parameters."""
+    if not cast_floating:
+        return weights
+
+    parameters = dict(tree_flatten(model.parameters()))
     for key, value in weights.items():
-        if mx.issubdtype(value.dtype, mx.floating) and value.dtype != target_dtype:
-            weights[key] = value.astype(target_dtype)
+        destination = parameters.get(key)
+        if destination is None or not mx.issubdtype(value.dtype, mx.floating):
+            continue
+        if not mx.issubdtype(destination.dtype, mx.floating):
+            continue
+        if value.dtype != destination.dtype:
+            weights[key] = value.astype(destination.dtype)
     return weights
+
+
+def _validate_explicit_model_dtype(
+    model: nn.Module,
+    dtype_policy: ModelDTypePolicy,
+) -> None:
+    if not dtype_policy.cast_checkpoint:
+        return
+
+    mismatched = [
+        f"{key}={value.dtype}"
+        for key, value in tree_flatten(model.parameters())
+        if mx.issubdtype(value.dtype, mx.floating)
+        and value.dtype != dtype_policy.dtype
+    ]
+    if mismatched:
+        raise RuntimeError(
+            f"Model dtype policy '{dtype_policy.name}' was not applied to: "
+            + ", ".join(mismatched[:5])
+        )
 
 
 def _get_pipeline_from_config(arch : str):
@@ -167,7 +252,7 @@ def _get_classes(config: dict, pipeline: Optional[str] = 'masked-lm'):
     return arch.Model, arch.ModelArgs
 
 
-def _initialize_head_weights(model: nn.Module, loaded_weights: dict, config: Any, target_dtype: mx.Dtype = mx.float32):
+def _initialize_head_weights(model: nn.Module, loaded_weights: dict, config: Any):
     """
     If we are in training mode and missing head weights, we generate them 
     using the specific distribution required (e.g., Normal 0.02) rather 
@@ -188,25 +273,26 @@ def _initialize_head_weights(model: nn.Module, loaded_weights: dict, config: Any
         if key not in loaded_weights:
             # And it belongs to a prediction head
             if any(x in key for x in head_keywords):
+                parameter_dtype = param.dtype
                 
                 # Initialize Biases to Zero
                 if "bias" in key:
-                    print(f"[INFO] Initializing missing bias {key} to Zeros ({target_dtype})")
-                    loaded_weights[key] = mx.zeros(param.shape, dtype=target_dtype)
+                    print(f"[INFO] Initializing missing bias {key} to Zeros ({parameter_dtype})")
+                    loaded_weights[key] = mx.zeros(param.shape, dtype=parameter_dtype)
                 
                 # 2. Initialize Weights
                 elif "weight" in key:
                     # Norm weights (Gamma) should be 1.0
                     if "norm" in key:
-                         print(f"[INFO] Initializing missing normalization weight {key} to Ones ({target_dtype})")
-                         loaded_weights[key] = mx.ones(param.shape, dtype=target_dtype)
+                         print(f"[INFO] Initializing missing normalization weight {key} to Ones ({parameter_dtype})")
+                         loaded_weights[key] = mx.ones(param.shape, dtype=parameter_dtype)
                     # Other weights to Normal (std=0.02)
                     else:
-                        print(f"[INFO] Initializing missing weight {key} with Normal(0.0, {initializer_range})  ({target_dtype})")
+                        print(f"[INFO] Initializing missing weight {key} with Normal(0.0, {initializer_range})  ({parameter_dtype})")
                         loaded_weights[key] = mx.random.normal(
                             param.shape, 
                             scale=initializer_range, 
-                            dtype=target_dtype
+                            dtype=parameter_dtype
                         )
                     
                 initialized_count += 1
@@ -384,6 +470,35 @@ def _load_adapter_weights(
         for key, value in adapter_weights.items():
             adapter_key = key if key.startswith("adapter.") else f"adapter.{key}"
             weights[adapter_key] = value
+
+
+def _prepare_quantized_modules(
+    model: nn.Module,
+    weights: dict,
+    quantization_config: dict,
+) -> None:
+    """Create quantized module parameter structures before loading weights."""
+    quantization_config = copy.deepcopy(quantization_config)
+    layer_overrides = quantization_config.pop("layers", {})
+    supported_keys = {"group_size", "bits", "mode", "quantize_input"}
+
+    # Backward compatibility for configs that stored layer paths alongside the
+    # global quantization arguments.
+    for key in list(quantization_config):
+        if key not in supported_keys:
+            layer_overrides[key] = quantization_config.pop(key)
+
+    def class_predicate(path, module):
+        if f"{path}.scales" not in weights:
+            return False
+        override = layer_overrides.get(path)
+        return override if override is not None else hasattr(module, "to_quantized")
+
+    nn.quantize(
+        model,
+        **quantization_config,
+        class_predicate=class_predicate,
+    )
 
 
 def load_model(
@@ -582,8 +697,12 @@ def load_model(
     #         adapter_name=adapter_task,
     #     )
 
-    target_dtype = _determine_model_dtype(config, weights)
-    print(f"[INFO] Model initialized with precision: {target_dtype}")
+    dtype_policy = _resolve_model_dtype(config, weights)
+    config["dtype"] = dtype_policy.config_name
+    print(
+        "[INFO] Model parameter dtype: "
+        f"{dtype_policy.dtype} (source: {dtype_policy.source})"
+    )
 
     model_class, model_args_class = get_model_classes(config=config, pipeline=pipeline)
     model_args = model_args_class.from_dict(config)
@@ -597,34 +716,29 @@ def load_model(
 
     # Use set_dtype to update all floating-point parameters recursively.
     # The default predicate ensures we don't accidentally cast integer params.
-    model.set_dtype(target_dtype)
-
-    # Loading an FP32 array replaces a BF16 destination parameter in MLX; cast
-    # the checkpoint itself so the requested precision survives load_weights().
-    weights = _cast_floating_weights(weights, target_dtype)
+    model.set_dtype(dtype_policy.dtype)
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
-    
+
+    if (quantization := config.get("quantization")) is not None:
+        _prepare_quantized_modules(model, weights, quantization)
+
+    weights = _align_checkpoint_dtypes(
+        weights,
+        model,
+        cast_floating=dtype_policy.cast_checkpoint,
+    )
+
     _verify_weights(model, weights, train_mode=train)
 
     if train:
-        _initialize_head_weights(model, weights, model_args, target_dtype=target_dtype)
+        _initialize_head_weights(model, weights, model_args)
 
     model.load_weights(list(weights.items()))
 
-    if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may not have everything quantized
-        def class_predicate(p, m):
-            if not hasattr(m, "to_quantized"):
-                return False
-            return f"{p}.scales" in weights
-
-        nn.quantize(
-            model,
-            **quantization,
-            class_predicate=class_predicate,
-        )
+    model.config.dtype = dtype_policy.config_name
+    _validate_explicit_model_dtype(model, dtype_policy)
 
     if not lazy:
         mx.eval(model.parameters())
@@ -724,7 +838,7 @@ def quantize_model(
     # Add any custom quantization parameters to the config as we go
     def _class_predicate(p, m):
         bool_or_params = quant_predicate(p, m, config)
-        quantized_config["quantization"][p] = bool_or_params
+        quantized_config["quantization"].setdefault("layers", {})[p] = bool_or_params
         return bool_or_params
 
     nn.quantize(

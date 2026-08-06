@@ -17,7 +17,7 @@ from datasets import Dataset as HFDataset
 from mlx.utils import tree_flatten, tree_map
 
 from .collators import DataCollator
-from .utils import EMBEDDING_LAYER_NAMES, build_schedule
+from .utils import EMBEDDING_LAYER_NAMES, MultiPrecisionAdamW, build_schedule
 from mlx_raclate.utils.token_classification import (
     compute_token_classification_metrics,
     save_viterbi_calibration,
@@ -104,6 +104,8 @@ class TrainingArgs:
         cache_clear_steps: int = 1,
         push_to_hub: bool = False,
         eval_strategy: str = "end",
+        multi_precision: bool = True,
+        gradient_accumulation_dtype: str = "float32",
     ):
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
@@ -127,6 +129,12 @@ class TrainingArgs:
         self.cache_clear_steps = cache_clear_steps
         self.push_to_hub = push_to_hub 
         self.eval_strategy = eval_strategy
+        self.multi_precision = multi_precision
+        if gradient_accumulation_dtype not in {"float32", "model"}:
+            raise ValueError(
+                "gradient_accumulation_dtype must be 'float32' or 'model'"
+            )
+        self.gradient_accumulation_dtype = gradient_accumulation_dtype
 
 class Trainer:
     """
@@ -186,11 +194,31 @@ class Trainer:
                 print(f"Warning: No embedding layer names defined for model type {model.config.model_type}. Using common names (embed_tokens, embeddings).")
                 model.model.freeze(keys=["embed_tokens", "embeddings"])
         
+        parameter_dtypes = {
+            parameter.dtype
+            for _, parameter in tree_flatten(model.trainable_parameters())
+            if mx.issubdtype(parameter.dtype, mx.floating)
+        }
+        low_precision_training = bool(
+            parameter_dtypes.intersection({mx.float16, mx.bfloat16})
+        )
+        self._cast_optimizer_gradients_to_model_dtype = False
+
         # Initialize optimizer
         if optimizer is not None:
             self.optimizer = optimizer
+            if low_precision_training:
+                print(
+                    "WARNING: A custom optimizer was supplied for a low-precision "
+                    "model; it is responsible for master-weight precision."
+                )
         elif training_args.lr_scheduler_type=="constant" and not (training_args.warmup_steps or training_args.warmup_ratio):
-            self.optimizer = mlx.optimizers.AdamW(
+            optimizer_class = (
+                MultiPrecisionAdamW
+                if low_precision_training and training_args.multi_precision
+                else mlx.optimizers.AdamW
+            )
+            self.optimizer = optimizer_class(
                 learning_rate=training_args.learning_rate,
                 weight_decay=training_args.weight_decay
             )
@@ -243,9 +271,25 @@ class Trainer:
 
             lr_schedule = build_schedule(schedule_config)
 
-            self.optimizer = mlx.optimizers.AdamW(
+            optimizer_class = (
+                MultiPrecisionAdamW
+                if low_precision_training and training_args.multi_precision
+                else mlx.optimizers.AdamW
+            )
+            self.optimizer = optimizer_class(
                 learning_rate=lr_schedule,
                 weight_decay=training_args.weight_decay
+            )
+
+        if low_precision_training and not training_args.multi_precision:
+            self._cast_optimizer_gradients_to_model_dtype = optimizer is None
+            print(
+                "WARNING: Low-precision parameters are being optimized without "
+                "FP32 master weights; small updates may round away."
+            )
+        elif isinstance(self.optimizer, MultiPrecisionAdamW):
+            print(
+                "Using MultiPrecisionAdamW with FP32 master weights and moments."
             )
 
         # Setup output directory
@@ -285,7 +329,10 @@ class Trainer:
             # Flatten gradients to compute norm
             flattened_grads = tree_flatten(accumulated_grads)
 
-            squares = [mx.sum(mx.square(g[1])) for g in flattened_grads]
+            squares = [
+                mx.sum(mx.square(gradient.astype(mx.float32)))
+                for _, gradient in flattened_grads
+            ]
             total_norm = mx.sqrt(mx.sum(mx.array(squares)))
 
             # Conputing clipping coeff
@@ -294,6 +341,13 @@ class Trainer:
 
             # Gradient clipping
             accumulated_grads = tree_map(lambda g: g * scale, accumulated_grads)
+
+            if self._cast_optimizer_gradients_to_model_dtype:
+                accumulated_grads = tree_map(
+                    lambda gradient, parameter: gradient.astype(parameter.dtype),
+                    accumulated_grads,
+                    self.model.trainable_parameters(),
+                )
 
             self.optimizer.update(self.model, accumulated_grads)
 
@@ -438,6 +492,12 @@ class Trainer:
 
             # Calculate Grads
             loss, grads = self.step_calc(batch)
+
+            if self.args.gradient_accumulation_dtype == "float32":
+                grads = tree_map(
+                    lambda gradient: gradient.astype(mx.float32),
+                    grads,
+                )
 
             if accumulated_grads is None:
                 accumulated_grads = grads

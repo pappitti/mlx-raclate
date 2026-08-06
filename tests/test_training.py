@@ -334,10 +334,16 @@ def test_training_args_runtime_memory_options():
     default_args = TrainingArgs()
     assert default_args.grad_checkpoint is True
     assert default_args.cache_clear_steps == 1
+    assert default_args.multi_precision is True
+    assert default_args.gradient_accumulation_dtype == "float32"
 
     custom_args = TrainingArgs(
         grad_checkpoint=False,
         cache_clear_steps=8,
+        multi_precision=False,
+        gradient_accumulation_dtype="model",
     )
     assert custom_args.grad_checkpoint is False
     assert custom_args.cache_clear_steps == 8
+    assert custom_args.multi_precision is False
+    assert custom_args.gradient_accumulation_dtype == "model"

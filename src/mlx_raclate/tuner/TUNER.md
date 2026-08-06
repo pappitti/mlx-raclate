@@ -289,6 +289,8 @@ Controls the hyperparameters and runtime configuration.
 | :--- | :--- | :--- |
 | `batch_size` | `2` | The physical batch size per device/step. Reduce to 1 on Macbooks with limited RAM if training on long context. |
 | `gradient_accumulation_steps` | `8` | Number of steps to accumulate gradients before updating weights. |
+| `gradient_accumulation_dtype` | `"float32"` | Accumulation precision: `"float32"` is recommended for FP16/BF16 models; `"model"` uses the gradient dtype. |
+| `multi_precision` | `True` | Keep FP32 master weights and AdamW moments when fully training an FP16/BF16 model. |
 | `num_train_epochs` | `2` | Total number of training epochs. |
 | `max_length` | `512` | Max sequence length. If `None`, uses model's default config. |
 | `freeze_embeddings` | `False` | If `True`, freezes the embedding layer to save memory/compute. |
@@ -326,6 +328,7 @@ When loading a pretrained model, you can create a model_config dictionary with n
 | :--- | :--- | :--- | :--- |
 | `is_regression` | `bool` | `False` | For text-classification tasks, whether the classification is a regression |
 | `use_late_interaction`| `bool` | `False` | For sentence similarity tasks, whether late interaction (MaxSim) should be used instead of cosine similarity |
+| `dtype` | `str` | `"auto"` | Persisted model parameter dtype: `"auto"`, `"float32"`, `"float16"`, or `"bfloat16"`. Canonical `dtype` takes precedence over legacy `torch_dtype`. |
 
 ## Trainer
 
