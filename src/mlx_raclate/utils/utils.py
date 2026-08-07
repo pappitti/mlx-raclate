@@ -442,6 +442,42 @@ def _load_sentence_transformer_dense_layers(
     return dense_layers
 
 
+def _load_sentence_transformer_pooling_mode(
+    model_path: Path,
+    sentence_transformer_modules: list,
+) -> Optional[str]:
+    """Return a supported pooling mode declared by a Pooling module."""
+    for module in sentence_transformer_modules:
+        module_type = module.get("type", "")
+        module_path = module.get("path", "")
+        if "Pooling" not in module_type or not module_path:
+            continue
+
+        config_file = model_path / module_path / "config.json"
+        if not config_file.exists():
+            continue
+
+        with open(config_file, "r") as f:
+            pooling_config = json.load(f)
+
+        pooling_mode = pooling_config.get("pooling_mode")
+        if pooling_mode in {"cls", "mean"}:
+            return pooling_mode
+
+        enabled_modes = [
+            mode
+            for config_key, mode in (
+                ("pooling_mode_cls_token", "cls"),
+                ("pooling_mode_mean_tokens", "mean"),
+            )
+            if pooling_config.get(config_key) is True
+        ]
+        if len(enabled_modes) == 1:
+            return enabled_modes[0]
+
+    return None
+
+
 def _is_lateon_dense_layout(dense_layers: list) -> bool:
     expected = [
         (768, 1536, True),
@@ -616,6 +652,17 @@ def load_model(
                 "out_features",
                 config.get("colbert_dim", 128),
             )
+
+        pooling_mode = _load_sentence_transformer_pooling_mode(
+            model_path,
+            sentence_transformer_modules,
+        )
+        if pooling_mode is not None:
+            # Architecture wrappers use one of these two names. Supplying both
+            # lets the SentenceTransformer module remain authoritative while
+            # unknown dataclass fields are ignored by other architectures.
+            config["classifier_pooling"] = pooling_mode
+            config["pooling_mode"] = pooling_mode
 
         st_model_type = sentence_transformers_config.get("model_type")
         if not explicit_model_type and st_model_type == "ColBERT":

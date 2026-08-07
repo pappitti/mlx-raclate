@@ -68,6 +68,17 @@ class ModelArgs(BaseModelArgs):
     pipeline_config: Optional[Dict[str, Any]] = None  # for Sequence Classification
     use_late_interaction: bool = False 
 
+    @classmethod
+    def from_dict(cls, params):
+        params = dict(params)
+        # Newer Transformers LFM2 configs expose the feed-forward width as
+        # ``intermediate_size``. Older checkpoints use ``block_ff_dim``.
+        # Preserve the older key when both are present so explicit model
+        # overrides continue to take precedence.
+        if "block_ff_dim" not in params and "intermediate_size" in params:
+            params["block_ff_dim"] = params["intermediate_size"]
+        return super().from_dict(params)
+
     @property
     def num_labels(self) -> int:
         """
@@ -361,11 +372,6 @@ class Lfm2Model(GradientCheckpointingMixin, nn.Module):
             causal_mask = causal_mask + additive_padding_mask
 
         return causal_mask.astype(dtype)
-    
-    def _create_ssm_mask(self, h, cache=None):
-        if cache and hasattr(cache, "make_mask"):
-            return cache.make_mask(h.shape[1])
-        return None
 
     def __call__(
         self,
@@ -380,7 +386,10 @@ class Lfm2Model(GradientCheckpointingMixin, nn.Module):
         cache = [None] * len(self.layers)
 
         attn_mask = self._update_attention_mask(attention_mask, dtype=model_dtype)
-        conv_mask = self._create_ssm_mask(hidden_states, cache[self.conv_idx])
+        # Hugging Face passes the original 2D padding mask to short-conv
+        # layers. This is distinct from the additive attention mask and keeps
+        # padded token states from leaking into neighboring convolution steps.
+        conv_mask = attention_mask
 
         for layer, c in zip(self.layers, cache):
             mask = attn_mask if layer.is_attention_layer else conv_mask

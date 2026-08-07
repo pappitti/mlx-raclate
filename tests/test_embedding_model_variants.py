@@ -1,4 +1,5 @@
 import inspect
+import json
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -50,7 +51,10 @@ from mlx_raclate.models.neobert import (
     ModelForMaskedLM as NeoBERTForMaskedLM,
     ModelForSentenceSimilarity as NeoBERTForSentenceSimilarity,
 )
-from mlx_raclate.utils.utils import _is_lateon_dense_layout
+from mlx_raclate.utils.utils import (
+    _is_lateon_dense_layout,
+    _load_sentence_transformer_pooling_mode,
+)
 
 
 def test_modernbert_mlp_uses_configured_silu_activation():
@@ -397,6 +401,30 @@ def test_lateon_dense_layout_detection():
     assert not _is_lateon_dense_layout(
         [{"in_features": 768, "out_features": 128, "use_residual": False}]
     )
+
+
+def test_sentence_transformer_pooling_mode_supports_new_and_legacy_configs(tmp_path):
+    pooling_dir = tmp_path / "1_Pooling"
+    pooling_dir.mkdir()
+    modules = [
+        {
+            "path": "1_Pooling",
+            "type": "sentence_transformers.models.Pooling",
+        }
+    ]
+
+    (pooling_dir / "config.json").write_text(json.dumps({"pooling_mode": "cls"}))
+    assert _load_sentence_transformer_pooling_mode(tmp_path, modules) == "cls"
+
+    (pooling_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "pooling_mode_cls_token": False,
+                "pooling_mode_mean_tokens": True,
+            }
+        )
+    )
+    assert _load_sentence_transformer_pooling_mode(tmp_path, modules) == "mean"
 
 
 def test_pplx_uses_padding_only_attention_and_mean_pooling():

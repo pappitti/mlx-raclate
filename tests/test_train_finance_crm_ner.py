@@ -21,6 +21,7 @@ def test_dataset_manifest_requires_matching_bio_length(tmp_path):
             "label_scheme": "BIO",
             "labels": list(LABELS),
             "max_length": 16384,
+            "model": "LiquidAI/LFM2.5-Embedding-350M",
         },
     )
 
@@ -29,6 +30,17 @@ def test_dataset_manifest_requires_matching_bio_length(tmp_path):
     }
     with pytest.raises(ValueError, match="silently truncate"):
         _validate_dataset_manifest(tmp_path, 8192)
+    _validate_dataset_manifest(
+        tmp_path,
+        16384,
+        expected_model="LiquidAI/LFM2.5-Embedding-350M",
+    )
+    with pytest.raises(ValueError, match="tokenized for"):
+        _validate_dataset_manifest(
+            tmp_path,
+            16384,
+            expected_model="LiquidAI/LFM2.5-Encoder-230M",
+        )
 
 
 def test_bioes_checkpoint_is_rejected_for_bio_training(tmp_path):

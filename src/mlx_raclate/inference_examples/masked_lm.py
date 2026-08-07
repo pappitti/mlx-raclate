@@ -36,11 +36,21 @@ def run_inference(
     )
     
     # Tokenize
-    tokens = tokenizer.encode(text)
-    input_ids = mx.array([tokens])  # Add batch dimension
-    
-    # Find mask position
     mask_token_id = tokenizer.mask_token_id
+    tokens = tokenizer.encode(text)
+    if mask_token_id not in tokens and "[MASK]" in text:
+        # Some encoder tokenizers use a model-specific token such as
+        # ``<|mask|>`` even though [MASK] is the conventional example syntax.
+        text = text.replace("[MASK]", tokenizer.mask_token)
+        tokens = tokenizer.encode(text)
+    if mask_token_id not in tokens:
+        raise ValueError(
+            f"Input text must contain the tokenizer mask token {tokenizer.mask_token!r}."
+        )
+
+    input_ids = mx.array([tokens])  # Add batch dimension
+
+    # Find mask position
     mask_position = tokens.index(mask_token_id)
     
     # Run inference
@@ -85,10 +95,18 @@ text = "{text}"
 
 # Tokenize
 tokens = tokenizer.encode(text)
+mask_token_id = tokenizer.mask_token_id
+if mask_token_id not in tokens and "[MASK]" in text:
+    text = text.replace("[MASK]", tokenizer.mask_token)
+    tokens = tokenizer.encode(text)
+if mask_token_id not in tokens:
+    raise ValueError(
+        f"Input text must contain the tokenizer mask token {{tokenizer.mask_token!r}}."
+    )
+
 input_ids = mx.array([tokens])  # Add batch dimension
 
 # Find mask position
-mask_token_id = tokenizer.mask_token_id
 mask_position = tokens.index(mask_token_id)
 
 # Run inference

@@ -59,7 +59,11 @@ TRAINABLE_PIPELINES_BY_FAMILY: Dict[str, List[str]] = {
     "gemma3": TRAINABLE_PIPELINES,
     "t5gemma": TRAINABLE_PIPELINES,
     "lfm2": ["text-classification", "sentence-similarity"],
-    "lfm2_bidirectional": ["masked-lm", "sentence-similarity"],
+    "lfm2_bidirectional": [
+        "masked-lm",
+        "sentence-similarity",
+        "token-classification",
+    ],
     "neobert": TRAINABLE_PIPELINES,
     "openai_privacy_filter": ["text-classification", "sentence-similarity", "token-classification"],
 }
@@ -96,7 +100,8 @@ def _init_registry():
     _register("modernbert", "embeddings", "answerdotai/ModernBERT-base")
     _register("modernbert", "text-classification", "NousResearch/Minos-v1")
     _register("modernbert", "sentence-similarity", "nomic-ai/modernbert-embed-base")
-    _register("modernbert", "sentence-transformers", "tasksource/ModernBERT-base-embed")
+    _register("modernbert", "sentence-transformers", "lightonai/mDenseOn",
+              notes="Multilingual DenseOn checkpoint; SentenceTransformer config selects CLS pooling")
     _register("modernbert", "masked-lm", "answerdotai/ModernBERT-base")
     _register("modernbert", "zero-shot-classification", "answerdotai/ModernBERT-Large-Instruct")
     
@@ -129,7 +134,7 @@ def _init_registry():
               notes="Sentence Transformers checkpoint with CLS pooling")
     _register("lfm2_bidirectional", "sentence-similarity", "LiquidAI/LFM2.5-Embedding-350M",
               notes="Dense bidirectional LFM2.5 retrieval model")
-    _register("lfm2_bidirectional", "masked-lm", "LiquidAI/LFM2.5-Encoder-350M",
+    _register("lfm2_bidirectional", "masked-lm", "LiquidAI/LFM2.5-Encoder-230M",
               notes="Bidirectional LFM2.5 encoder with tied masked-LM head")
     
     # OpenAI endpoints 
@@ -147,8 +152,9 @@ def _init_registry():
               notes="ModernBERT-derived Granite embedding model with SiLU MLP and CLS pooling")
     _register("colbert_zero", "sentence-similarity", "lightonai/ColBERT-Zero",
               notes="ModernBERT + PyLate dense projection + MaxSim")
-    _register("lateon", "sentence-similarity", "lightonai/LateOn",
-              notes="ModernBERT + PyLate residual dense stack + MaxSim; auto-detected from Dense module layout")
+    _register("lateon", "sentence-similarity", "lightonai/mLateOn",
+              model_config={"use_late_interaction": True},
+              notes="Multilingual ModernBERT + PyLate residual dense stack + MaxSim; auto-detected from Dense module layout")
     _register("bidirectional_pplx_qwen3", "embeddings", "perplexity-ai/pplx-embed-v1-0.6b",
               notes="Qwen3-derived embedding model with bidirectional attention and mean pooling")
     _register("openai_privacy_filter", "text-classification", "OpenMed/privacy-filter-nemotron")

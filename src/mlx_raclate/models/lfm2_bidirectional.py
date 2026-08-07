@@ -29,6 +29,8 @@ class ModelArgs(Lfm2Args):
     use_cache: bool = False
     tie_word_embeddings: bool = True
     decoder_bias: bool = False
+    classifier_dropout: float = 0.0
+    classifier_bias: bool = False
     sparse_prediction: bool = True
     sparse_pred_ignore_index: int = -100
     pooling_mode: Literal["cls", "mean"] = "cls"
@@ -368,3 +370,87 @@ class ModelForMaskedLM(RaclateBaseModel):
                 sanitized["lm_head.weight"] = embedding_weight
 
         return sanitized
+
+
+class ModelForTokenClassification(RaclateBaseModel):
+    """Bidirectional LFM2 backbone with a per-token classification head."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        if config.is_causal:
+            raise ValueError(
+                "ModelForTokenClassification requires bidirectional attention."
+            )
+
+        self.config = config
+        self.model_type = config.model_type
+        self.num_labels = config.num_labels
+        self.model = Lfm2BidirectionalModel(config)
+        self.dropout = nn.Dropout(p=config.classifier_dropout)
+        self.score = nn.Linear(
+            config.hidden_size,
+            config.num_labels,
+            bias=config.classifier_bias,
+        )
+        self.hf_transformers_arch = "Lfm2BidirectionalForTokenClassification"
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.model.set_input_embeddings(value)
+
+    def _compute_loss(self, logits: mx.array, labels: mx.array) -> mx.array:
+        flat_logits = logits.reshape(-1, self.num_labels)
+        flat_labels = labels.reshape(-1)
+        ignore_index = self.config.sparse_pred_ignore_index
+        valid_mask = flat_labels != ignore_index
+        safe_labels = mx.where(valid_mask, flat_labels, 0)
+        token_losses = nn.losses.cross_entropy(
+            flat_logits,
+            safe_labels,
+            reduction="none",
+        )
+        valid_weights = valid_mask.astype(token_losses.dtype)
+        return mx.sum(token_losses * valid_weights) / mx.maximum(
+            mx.sum(valid_weights),
+            1.0,
+        )
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        attention_mask: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
+        labels: Optional[mx.array] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = True,
+    ):
+        if attention_mask is None:
+            attention_mask = mx.ones(input_ids.shape, dtype=mx.int32)
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        last_hidden_state = outputs["last_hidden_state"]
+        logits = self.score(self.dropout(last_hidden_state))
+        probabilities = mx.softmax(logits, axis=-1)
+        loss = self._compute_loss(logits, labels) if labels is not None else None
+
+        if not return_dict:
+            return (loss, logits, None)
+        return {
+            "loss": loss,
+            "logits": logits,
+            "probabilities": probabilities,
+            "hidden_states": None,
+        }
+
+    def sanitize(self, weights):
+        return {
+            key: value
+            for key, value in _sanitize_bidirectional_backbone(weights).items()
+            if key.startswith(("model.", "score."))
+        }
