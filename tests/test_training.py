@@ -423,6 +423,40 @@ def test_train_continues_from_completed_epoch():
     assert saved_epochs == [(1, True), (2, True)]
 
 
+def test_evaluation_failure_saves_completed_epoch_before_reraising():
+    """A broken evaluator must not discard a fully trained epoch."""
+    from types import SimpleNamespace
+
+    from mlx_raclate.tuner.trainer import Trainer
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = SimpleNamespace(num_train_epochs=1, eval_strategy="epoch")
+    trainer.start_epoch = 0
+    trainer.resume_microbatches_in_epoch = 0
+    trainer.eval_dataset = object()
+    trainer._train_epoch = lambda skip_microbatches=0: None
+    trainer.evaluate = lambda: (_ for _ in ()).throw(RuntimeError("bad metrics"))
+    saved = []
+    trainer._save_checkpoint = lambda metrics, completed_epoch=False: saved.append(
+        (metrics, completed_epoch)
+    )
+
+    with pytest.warns(UserWarning, match="saving a resumable checkpoint"):
+        with pytest.raises(RuntimeError, match="bad metrics"):
+            trainer.train()
+
+    assert saved == [
+        (
+            {
+                "eval_failed": True,
+                "eval_error_type": "RuntimeError",
+                "eval_error": "bad metrics",
+            },
+            True,
+        )
+    ]
+
+
 def test_label_mappings_generation():
     """Test label mapping generators."""
     id2label = generate_id2label(3)

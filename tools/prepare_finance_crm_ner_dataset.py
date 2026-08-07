@@ -13,6 +13,7 @@ from mlx_raclate.utils.tokenizer_utils import load_tokenizer
 
 
 ENTITY_TYPES = ("PERSON", "ORGANIZATION", "FUND", "EVENT")
+BIO_PREFIXES = ("B", "I")
 BIOES_PREFIXES = ("B", "I", "E", "S")
 LABELS = ["O"] + [
     f"{prefix}-{entity_type}"
@@ -25,6 +26,21 @@ PHASE_FILES = {
     "generalization": "train_generalization.jsonl",
     "lexical_calibration": "train_lexical_calibration.jsonl",
 }
+
+
+def labels_for_scheme(label_scheme: str) -> List[str]:
+    normalized_scheme = label_scheme.upper()
+    if normalized_scheme == "BIO":
+        prefixes = BIO_PREFIXES
+    elif normalized_scheme == "BIOES":
+        prefixes = BIOES_PREFIXES
+    else:
+        raise ValueError("label_scheme must be either 'BIO' or 'BIOES'")
+    return ["O"] + [
+        f"{prefix}-{entity_type}"
+        for entity_type in ENTITY_TYPES
+        for prefix in prefixes
+    ]
 
 
 def _fraction(value: str) -> float:
@@ -195,13 +211,45 @@ def _apply_bioes(
     labels[token_indices[-1]] = LABEL2ID[f"E-{entity_type}"]
 
 
+def _apply_entity_labels(
+    labels: List[int],
+    token_indices: Sequence[int],
+    entity_type: str,
+    *,
+    label2id: Mapping[str, int],
+    label_scheme: str,
+) -> None:
+    if label_scheme == "BIO":
+        labels[token_indices[0]] = label2id[f"B-{entity_type}"]
+        for token_index in token_indices[1:]:
+            labels[token_index] = label2id[f"I-{entity_type}"]
+        return
+
+    if label_scheme != "BIOES":
+        raise ValueError("label_scheme must be either 'BIO' or 'BIOES'")
+
+    if len(token_indices) == 1:
+        labels[token_indices[0]] = label2id[f"S-{entity_type}"]
+        return
+
+    labels[token_indices[0]] = label2id[f"B-{entity_type}"]
+    for token_index in token_indices[1:-1]:
+        labels[token_index] = label2id[f"I-{entity_type}"]
+    labels[token_indices[-1]] = label2id[f"E-{entity_type}"]
+
+
 def _align_entities(
     offsets: Sequence[Tuple[int, int]],
     entities: Sequence[Mapping[str, Any]],
     source: Path,
     line_number: int,
+    *,
+    label2id: Optional[Mapping[str, int]] = None,
+    label_scheme: str = "BIOES",
 ) -> Tuple[List[int], List[Optional[int]], int]:
-    labels = [LABEL2ID["O"]] * len(offsets)
+    normalized_scheme = label_scheme.upper()
+    resolved_label2id = LABEL2ID if label2id is None else label2id
+    labels = [resolved_label2id["O"]] * len(offsets)
     token_entities: List[Optional[int]] = [None] * len(offsets)
     token_starts = [start for start, _ in offsets]
     token_ends = [end for _, end in offsets]
@@ -236,7 +284,13 @@ def _align_entities(
 
         for token_index in token_indices:
             token_entities[token_index] = entity_index
-        _apply_bioes(labels, token_indices, entity["label"])
+        _apply_entity_labels(
+            labels,
+            token_indices,
+            entity["label"],
+            label2id=resolved_label2id,
+            label_scheme=normalized_scheme,
+        )
 
     return labels, token_entities, partial_boundaries
 
@@ -274,6 +328,9 @@ def _convert_row(
     tokenizer,
     max_length: int,
     source: Path,
+    *,
+    label2id: Optional[Mapping[str, int]] = None,
+    label_scheme: str = "BIOES",
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
     entities = _validate_entities(row, source)
     encoded = tokenizer(
@@ -290,7 +347,12 @@ def _convert_row(
             f"{source}:{row['_source_line']}: tokenizer produced no tokens"
         )
     labels, token_entities, partial_boundaries = _align_entities(
-        offsets, entities, source, row["_source_line"]
+        offsets,
+        entities,
+        source,
+        row["_source_line"],
+        label2id=label2id,
+        label_scheme=label_scheme,
     )
     ranges = _chunk_ranges(token_entities, max_length)
 
@@ -343,12 +405,13 @@ def _add_stats(total: Counter, addition: Mapping[str, int]) -> None:
         total[key] += value
 
 
-def _training_features() -> Features:
+def _training_features(labels: Optional[Sequence[str]] = None) -> Features:
+    label_names = list(LABELS if labels is None else labels)
     return Features(
         {
             "input_ids": DatasetSequence(Value("int32")),
             "attention_mask": DatasetSequence(Value("int8")),
-            "labels": DatasetSequence(ClassLabel(names=LABELS)),
+            "labels": DatasetSequence(ClassLabel(names=label_names)),
         }
     )
 
@@ -408,6 +471,196 @@ def _get_model_path(path_or_hf_repo: str) -> Path:
     )
 
 
+def _split_statistics(
+    stats: Mapping[str, int],
+    records: Sequence[Mapping[str, Any]],
+    labels: Sequence[str],
+) -> Dict[str, Any]:
+    label_token_counts = Counter()
+    for record in records:
+        label_token_counts.update(labels[label_id] for label_id in record["labels"])
+
+    entity_counts = Counter()
+    for label, count in label_token_counts.items():
+        if label.startswith(("B-", "S-")):
+            entity_counts[label.split("-", 1)[1]] += count
+
+    token_count = sum(label_token_counts.values())
+    return {
+        **dict(sorted(stats.items())),
+        "outside_token_fraction": (
+            label_token_counts["O"] / token_count if token_count else 0.0
+        ),
+        "label_token_counts": {
+            label: label_token_counts[label] for label in labels
+        },
+        "entity_counts": dict(sorted(entity_counts.items())),
+    }
+
+
+def prepare_dataset(
+    *,
+    input_dir: Path,
+    output_dir: Path,
+    model: str,
+    max_length: int,
+    validation_fraction: float,
+    split_seed: int,
+    split_manifest: Optional[Path],
+    overwrite: bool,
+    label_scheme: str = "BIOES",
+) -> Dict[str, Any]:
+    normalized_scheme = label_scheme.upper()
+    labels = labels_for_scheme(normalized_scheme)
+    label2id = {label: index for index, label in enumerate(labels)}
+
+    source_paths = {
+        phase: input_dir / filename for phase, filename in PHASE_FILES.items()
+    }
+    missing_sources = [str(path) for path in source_paths.values() if not path.exists()]
+    if missing_sources:
+        raise FileNotFoundError(f"Missing input files: {', '.join(missing_sources)}")
+
+    existing_outputs = [path for path in _output_paths(output_dir) if path.exists()]
+    if existing_outputs and not overwrite:
+        raise FileExistsError(
+            f"{existing_outputs[0]} already exists; pass --overwrite to replace outputs"
+        )
+
+    rows_by_phase = {
+        phase: _read_phase(source_paths[phase], phase) for phase in PHASE_FILES
+    }
+    canonical_ids = {
+        row["_canonical_document_id"] for rows in rows_by_phase.values() for row in rows
+    }
+    assignments = _make_split_assignments(
+        canonical_ids,
+        validation_fraction,
+        split_seed,
+        split_manifest,
+    )
+
+    model_path = _get_model_path(model)
+    model_context_length = _model_context_length(model_path)
+    if model_context_length is not None and max_length > model_context_length:
+        raise ValueError(
+            f"max_length={max_length} exceeds the model context window "
+            f"of {model_context_length}"
+        )
+    tokenizer = load_tokenizer(model_path)._tokenizer
+    if not getattr(tokenizer, "is_fast", False):
+        raise ValueError("A fast tokenizer is required to align character offsets")
+
+    features = _training_features(labels)
+    phase_stats = {}
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for phase, rows in rows_by_phase.items():
+        phase_dir = output_dir / phase
+        phase_dir.mkdir(parents=True, exist_ok=True)
+        split_records = {"train": [], "validation": []}
+        split_provenance = {"train": [], "validation": []}
+        split_stats = {"train": Counter(), "validation": Counter()}
+
+        for row in rows:
+            split = assignments[row["_canonical_document_id"]]
+            records, provenance, stats = _convert_row(
+                row,
+                tokenizer,
+                max_length,
+                source_paths[phase],
+                label2id=label2id,
+                label_scheme=normalized_scheme,
+            )
+            split_records[split].extend(records)
+            split_provenance[split].extend(provenance)
+            _add_stats(split_stats[split], stats)
+
+        for split in ("train", "validation"):
+            if not split_records[split]:
+                raise ValueError(f"{phase} produced an empty {split} split")
+            dataset = Dataset.from_list(split_records[split], features=features)
+            dataset.to_parquet(str(phase_dir / f"{split}.parquet"))
+            _write_jsonl(
+                phase_dir / f"{split}_provenance.jsonl",
+                split_provenance[split],
+            )
+
+        phase_stats[phase] = {
+            split: _split_statistics(split_stats[split], split_records[split], labels)
+            for split in ("train", "validation")
+        }
+
+    split_membership = {canonical_id: set() for canonical_id in canonical_ids}
+    for phase, rows in rows_by_phase.items():
+        for row in rows:
+            split_membership[row["_canonical_document_id"]].add(phase)
+    split_manifest_rows = [
+        {
+            "canonical_document_id": canonical_id,
+            "split": assignments[canonical_id],
+            "phases": sorted(split_membership[canonical_id]),
+        }
+        for canonical_id in sorted(canonical_ids)
+    ]
+    _write_jsonl(output_dir / "split_manifest.jsonl", split_manifest_rows)
+    _write_json(output_dir / "labels.json", labels)
+
+    shared_ids = set(
+        row["_canonical_document_id"] for row in rows_by_phase["generalization"]
+    ).intersection(
+        row["_canonical_document_id"] for row in rows_by_phase["lexical_calibration"]
+    )
+    manifest = {
+        "schema_version": 1,
+        "task_type": "token-classification",
+        "label_scheme": normalized_scheme,
+        "entity_types": list(ENTITY_TYPES),
+        "labels": labels,
+        "model": model,
+        "tokenizer_class": type(tokenizer).__name__,
+        "tokenizer_vocab_size": tokenizer.vocab_size,
+        "add_special_tokens": False,
+        "max_length": max_length,
+        "model_context_length": model_context_length,
+        "split": {
+            "group_field": "metadata.training_selection.canonical_document_id",
+            "strategy": "provided_manifest" if split_manifest else "sha256",
+            "seed": split_seed,
+            "validation_fraction": validation_fraction,
+            "canonical_documents": len(canonical_ids),
+            "shared_phase_documents": len(shared_ids),
+            "counts": dict(Counter(assignments.values())),
+        },
+        "columns": {
+            "input_ids": "Tokenizer token IDs, chunked without cutting entities",
+            "attention_mask": "One for every non-padding token",
+            "labels": (
+                f"{normalized_scheme} ClassLabel IDs aligned one-to-one with input_ids"
+            ),
+        },
+        "phases": phase_stats,
+    }
+    _write_json(output_dir / "manifest.json", manifest)
+
+    print(f"Saved Finance/CRM {normalized_scheme} datasets to {output_dir}")
+    print(f"Tokenizer: {type(tokenizer).__name__}; labels: {len(labels)}")
+    print(
+        "Canonical split: "
+        f"{manifest['split']['counts'].get('train', 0)} train / "
+        f"{manifest['split']['counts'].get('validation', 0)} validation"
+    )
+    for phase in PHASE_FILES:
+        train_stats = phase_stats[phase]["train"]
+        validation_stats = phase_stats[phase]["validation"]
+        print(
+            f"{phase}: {train_stats['sequences']} train sequences / "
+            f"{validation_stats['sequences']} validation sequences"
+        )
+
+    return manifest
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -435,144 +688,17 @@ def main() -> None:
         help="Overwrite this script's output files if they already exist.",
     )
     args = parser.parse_args()
-
-    input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
-    source_paths = {
-        phase: input_dir / filename for phase, filename in PHASE_FILES.items()
-    }
-    missing_sources = [str(path) for path in source_paths.values() if not path.exists()]
-    if missing_sources:
-        raise FileNotFoundError(f"Missing input files: {', '.join(missing_sources)}")
-
-    existing_outputs = [path for path in _output_paths(output_dir) if path.exists()]
-    if existing_outputs and not args.overwrite:
-        raise FileExistsError(
-            f"{existing_outputs[0]} already exists; pass --overwrite to replace outputs"
-        )
-
-    rows_by_phase = {
-        phase: _read_phase(source_paths[phase], phase) for phase in PHASE_FILES
-    }
-    canonical_ids = {
-        row["_canonical_document_id"] for rows in rows_by_phase.values() for row in rows
-    }
-    assignments = _make_split_assignments(
-        canonical_ids,
-        args.validation_fraction,
-        args.split_seed,
-        args.split_manifest,
+    prepare_dataset(
+        input_dir=Path(args.input_dir),
+        output_dir=Path(args.output_dir),
+        model=args.model,
+        max_length=args.max_length,
+        validation_fraction=args.validation_fraction,
+        split_seed=args.split_seed,
+        split_manifest=args.split_manifest,
+        overwrite=args.overwrite,
+        label_scheme="BIOES",
     )
-
-    model_path = _get_model_path(args.model)
-    model_context_length = _model_context_length(model_path)
-    if model_context_length is not None and args.max_length > model_context_length:
-        raise ValueError(
-            f"max_length={args.max_length} exceeds the model context window "
-            f"of {model_context_length}"
-        )
-    tokenizer = load_tokenizer(model_path)._tokenizer
-    if not getattr(tokenizer, "is_fast", False):
-        raise ValueError("A fast tokenizer is required to align character offsets")
-
-    features = _training_features()
-    phase_stats = {}
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for phase, rows in rows_by_phase.items():
-        phase_dir = output_dir / phase
-        phase_dir.mkdir(parents=True, exist_ok=True)
-        split_records = {"train": [], "validation": []}
-        split_provenance = {"train": [], "validation": []}
-        split_stats = {"train": Counter(), "validation": Counter()}
-
-        for row in rows:
-            split = assignments[row["_canonical_document_id"]]
-            records, provenance, stats = _convert_row(
-                row, tokenizer, args.max_length, source_paths[phase]
-            )
-            split_records[split].extend(records)
-            split_provenance[split].extend(provenance)
-            _add_stats(split_stats[split], stats)
-
-        for split in ("train", "validation"):
-            if not split_records[split]:
-                raise ValueError(f"{phase} produced an empty {split} split")
-            dataset = Dataset.from_list(split_records[split], features=features)
-            dataset.to_parquet(str(phase_dir / f"{split}.parquet"))
-            _write_jsonl(
-                phase_dir / f"{split}_provenance.jsonl",
-                split_provenance[split],
-            )
-
-        phase_stats[phase] = {
-            split: dict(sorted(stats.items())) for split, stats in split_stats.items()
-        }
-
-    split_membership = {canonical_id: set() for canonical_id in canonical_ids}
-    for phase, rows in rows_by_phase.items():
-        for row in rows:
-            split_membership[row["_canonical_document_id"]].add(phase)
-    split_manifest_rows = [
-        {
-            "canonical_document_id": canonical_id,
-            "split": assignments[canonical_id],
-            "phases": sorted(split_membership[canonical_id]),
-        }
-        for canonical_id in sorted(canonical_ids)
-    ]
-    _write_jsonl(output_dir / "split_manifest.jsonl", split_manifest_rows)
-    _write_json(output_dir / "labels.json", LABELS)
-
-    shared_ids = set(
-        row["_canonical_document_id"] for row in rows_by_phase["generalization"]
-    ).intersection(
-        row["_canonical_document_id"] for row in rows_by_phase["lexical_calibration"]
-    )
-    manifest = {
-        "schema_version": 1,
-        "task_type": "token-classification",
-        "label_scheme": "BIOES",
-        "entity_types": list(ENTITY_TYPES),
-        "labels": LABELS,
-        "model": args.model,
-        "tokenizer_class": type(tokenizer).__name__,
-        "tokenizer_vocab_size": tokenizer.vocab_size,
-        "add_special_tokens": False,
-        "max_length": args.max_length,
-        "model_context_length": model_context_length,
-        "split": {
-            "group_field": "metadata.training_selection.canonical_document_id",
-            "strategy": "provided_manifest" if args.split_manifest else "sha256",
-            "seed": args.split_seed,
-            "validation_fraction": args.validation_fraction,
-            "canonical_documents": len(canonical_ids),
-            "shared_phase_documents": len(shared_ids),
-            "counts": dict(Counter(assignments.values())),
-        },
-        "columns": {
-            "input_ids": "Tokenizer token IDs, chunked without cutting entities",
-            "attention_mask": "One for every non-padding token",
-            "labels": "BIOES ClassLabel IDs aligned one-to-one with input_ids",
-        },
-        "phases": phase_stats,
-    }
-    _write_json(output_dir / "manifest.json", manifest)
-
-    print(f"Saved Finance/CRM BIOES datasets to {output_dir}")
-    print(f"Tokenizer: {type(tokenizer).__name__}; labels: {len(LABELS)}")
-    print(
-        "Canonical split: "
-        f"{manifest['split']['counts'].get('train', 0)} train / "
-        f"{manifest['split']['counts'].get('validation', 0)} validation"
-    )
-    for phase in PHASE_FILES:
-        train_stats = phase_stats[phase]["train"]
-        validation_stats = phase_stats[phase]["validation"]
-        print(
-            f"{phase}: {train_stats['sequences']} train sequences / "
-            f"{validation_stats['sequences']} validation sequences"
-        )
 
 
 if __name__ == "__main__":

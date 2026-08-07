@@ -23,3 +23,9 @@ dev_tests/
 # Pytest cache
 .pytest_cache
 .ruff_cache
+
+# Evals
+eval/
+
+# Dataset preprocessing
+tools/

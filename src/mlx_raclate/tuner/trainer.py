@@ -536,7 +536,25 @@ class Trainer:
 
             if should_evaluate:
                 print(f"Evaluating after epoch {self.epoch + 1}...")
-                metrics = self.evaluate()
+                try:
+                    metrics = self.evaluate()
+                except Exception as error:
+                    failure_metrics = {
+                        "eval_failed": True,
+                        "eval_error_type": type(error).__name__,
+                        "eval_error": str(error),
+                    }
+                    warnings.warn(
+                        f"Evaluation failed after epoch {self.epoch + 1}; "
+                        "saving a resumable checkpoint before re-raising: "
+                        f"{type(error).__name__}: {error}",
+                        stacklevel=2,
+                    )
+                    self._save_checkpoint(
+                        failure_metrics,
+                        completed_epoch=True,
+                    )
+                    raise
                 self._save_checkpoint(metrics, completed_epoch=True)
             else:
                 print(f"Saving checkpoint after epoch {self.epoch + 1} without evaluation...")
