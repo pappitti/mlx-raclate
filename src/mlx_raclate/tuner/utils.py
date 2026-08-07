@@ -1,5 +1,5 @@
 # Copyright © 2024 Apple Inc.
-from typing import Dict
+from typing import Callable, Dict, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -15,6 +15,66 @@ EMBEDDING_LAYER_NAMES = {
     "t5gemma_encoder": ["embed_tokens"],
     "modernbert": ["embeddings"]
 }
+
+
+class MultiPrecisionAdamW(opt.Optimizer):
+    """AdamW with FP32 master weights and moments for low-precision models."""
+
+    def __init__(
+        self,
+        learning_rate: Union[float, Callable[[mx.array], mx.array]],
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        bias_correction: bool = False,
+    ):
+        super().__init__()
+        self._maybe_schedule("learning_rate", learning_rate)
+        self.betas = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.bias_correction = bias_correction
+
+    def update(self, model: nn.Module, gradients: dict):
+        if not self._initialized:
+            self.init(model.trainable_parameters())
+        super().update(model, gradients)
+
+    def init_single(self, parameter: mx.array, state: dict):
+        master = parameter.astype(mx.float32)
+        state["master"] = master
+        state["m"] = mx.zeros(parameter.shape, dtype=mx.float32)
+        state["v"] = mx.zeros(parameter.shape, dtype=mx.float32)
+
+    def apply_single(
+        self,
+        gradient: mx.array,
+        parameter: mx.array,
+        state: dict,
+    ) -> mx.array:
+        gradient = gradient.astype(mx.float32)
+        learning_rate = self.learning_rate.astype(mx.float32)
+        master = state["master"]
+        m = state["m"]
+        v = state["v"]
+        beta1, beta2 = self.betas
+
+        m = beta1 * m + (1 - beta1) * gradient
+        v = beta2 * v + (1 - beta2) * mx.square(gradient)
+        decayed_master = master * (1 - learning_rate * self.weight_decay)
+
+        if self.bias_correction:
+            numerator = learning_rate * m / (1 - beta1**self.step)
+            denominator = mx.sqrt(v / (1 - beta2**self.step)) + self.eps
+        else:
+            numerator = learning_rate * m
+            denominator = mx.sqrt(v) + self.eps
+
+        master = decayed_master - numerator / denominator
+        state["master"] = master
+        state["m"] = m
+        state["v"] = v
+        return master.astype(parameter.dtype)
     
 def build_schedule(schedule_config: Dict):
     """

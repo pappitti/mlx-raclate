@@ -88,6 +88,7 @@ def init_args():
 
     # Trainer / End Model Init Params
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help="Path to the pre-trained model or model identifier from a model hub.")
+    parser.add_argument("--dtype", choices=("auto", "float32", "float16", "bfloat16"), help="Override model_config dtype. If omitted, use the checkpoint config.")
     parser.add_argument("--task_type", type=str, default=DEFAULT_TASK_TYPE, help="Type of task (default: text-classification).")
     parser.add_argument("--is_regression", default=False, action='store_true', help="Set this flag if the task is regression.")
     parser.add_argument("--use_late_interaction", default=False, action='store_true', help="Set this flag to use late interaction for retrieval tasks (if applicable).")
@@ -98,6 +99,8 @@ def init_args():
     # Training Params
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size for training.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=DEFAULT_GRADIENT_ACCUMULATION_STEPS, help="Number of gradient accumulation steps.")
+    parser.add_argument("--gradient_accumulation_dtype", choices=("float32", "model"), default="float32", help="Dtype used to accumulate gradients.")
+    parser.add_argument("--no_multi_precision", dest="multi_precision", action="store_false", help="Disable FP32 master weights for low-precision full training.")
     parser.add_argument("--num_train_epochs", type=int, default=DEFAULT_TRAIN_EPOCHS, help="Number of training epochs.")
     parser.add_argument("--max_length", type=int, default=None, help="Maximum sequence length for the model inputs. If not specified, the model's default max length will be used.")
     parser.add_argument("--freeze_embeddings", default=False, action='store_true', help="Set this flag to freeze embedding layers during training.")
@@ -110,6 +113,7 @@ def init_args():
     parser.add_argument("--warmup_steps", type=int, default=DEFAULT_WARMUP_STEPS, help="Number of warmup steps for learning rate scheduler (if set, steps override ratio).")
     parser.add_argument("--max_grad_norm", type=float, default=1, help="Maximum gradient norm for gradient clipping (Default: 1).")
     parser.add_argument("--resume_from_step", type=int, default=0, help="Step number to resume training from (if applicable). Will override warmup if steps are after warmup period.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume model, optimizer, scheduler, and epoch position from a complete Raclate checkpoint.")
     # Other Training Params
     parser.add_argument("--logging_steps", type=int, default=DEFAULT_LOGGING_STEPS, help="Number of steps between logging training metrics.")
     parser.add_argument("--save_steps", type=int, default=DEFAULT_SAVE_STEPS, help="Number of steps between model checkpoints.")
@@ -119,6 +123,7 @@ def init_args():
     parser.add_argument("--cache_clear_steps", type=int, default=DEFAULT_CACHE_CLEAR_STEPS, help="Clear the MLX cache every N optimizer updates. Use 0 to disable explicit cache clearing.")
     parser.set_defaults(train=True)
     parser.set_defaults(grad_checkpoint=True)
+    parser.set_defaults(multi_precision=True)
     return parser.parse_args()
 
 def main():
@@ -137,6 +142,7 @@ def main():
 
     # Trainer / End Model Params
     model_path : str = args.model_path 
+    dtype : str = args.dtype
     task_type : str = args.task_type
     is_regression : bool = args.is_regression
     use_late_interaction : bool = args.use_late_interaction
@@ -147,6 +153,8 @@ def main():
     # Training Params
     batch_size : int = args.batch_size
     gradient_accumulation_steps : int = args.gradient_accumulation_steps
+    gradient_accumulation_dtype : str = args.gradient_accumulation_dtype
+    multi_precision : bool = args.multi_precision
     num_train_epochs : int = args.num_train_epochs
     weight_decay : float = args.weight_decay
     learning_rate : float = args.lr
@@ -158,11 +166,17 @@ def main():
     save_steps : int = args.save_steps
     eval_batch_size : int = args.eval_batch_size
     resume_from_step : int = args.resume_from_step
+    resume_from_checkpoint : str = args.resume_from_checkpoint
     max_length : int = args.max_length
     freeze_embeddings : bool = args.freeze_embeddings
     max_grad_norm : float = args.max_grad_norm
     grad_checkpoint : bool = args.grad_checkpoint
     cache_clear_steps : int = args.cache_clear_steps
+
+    if resume_from_step and resume_from_checkpoint:
+        raise ValueError("Use either --resume_from_step or --resume_from_checkpoint, not both.")
+    if resume_from_checkpoint:
+        model_path = resume_from_checkpoint
 
     print(f"Training Mode : {train}")
 
@@ -188,8 +202,10 @@ def main():
     train_dataset, valid_dataset, test_dataset, id2label, label2id = load_dataset(dataset_args)
 
     model_config={}
+    if dtype is not None:
+        model_config["dtype"] = dtype
     if task_type == "text-classification" and is_regression:
-        model_config={"is_regression":True}
+        model_config["is_regression"] = True
     if use_late_interaction and task_type in ["sentence-transformers","sentence-similarity"]:
         model_config["use_late_interaction"] = True
     if id2label:
@@ -221,8 +237,11 @@ def main():
     training_args = TrainingArgs(
         batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps, 
+        gradient_accumulation_dtype=gradient_accumulation_dtype,
+        multi_precision=multi_precision,
         max_length= max_length if max_length else model.config.max_position_embeddings,
         resume_from_step=resume_from_step, # warmup will be ingnored if before this step and schedulers will only start after
+        resume_from_checkpoint=resume_from_checkpoint,
         num_train_epochs=num_train_epochs,
         learning_rate=learning_rate, 
         weight_decay=weight_decay,

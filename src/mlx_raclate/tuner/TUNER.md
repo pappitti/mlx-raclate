@@ -220,6 +220,46 @@ An example of CLI tool including **all** parameters to train a model is availabl
 
 WARNING : this example includes default values that override the default values of the DatasetArgs, TrainingArgs and Trainer classes presented below.
 
+### NER evaluation
+
+Use `tools/evaluate_ner_models.py` to compare saved token-classification
+checkpoints. It reports token accuracy plus macro/micro precision, recall, and
+F1 at both token level and exact entity-boundary level. Entity true-positive,
+false-positive, false-negative, support, precision, recall, and F1 values are
+also included per entity type in the JSON output.
+
+For a normal dataset directory containing `validation.parquet`:
+
+```bash
+uv run python tools/evaluate_ner_models.py \
+  --model trained_models/my_ner_run/checkpoint-4000 \
+  --dataset data/my_ner_dataset \
+  --output eval/my_ner_run.json
+```
+
+A multi-phase root is discovered automatically. The following evaluates both
+`generalization/validation.parquet` and
+`lexical_calibration/validation.parquet` for every checkpoint:
+
+```bash
+uv run python tools/evaluate_ner_models.py \
+  --model \
+    trained_models/finance_ner/checkpoint-4000 \
+    trained_models/finance_ner/checkpoint-6000 \
+  --dataset data/NER-Finance-CRM/bioes_pplx_embed_v1_0.6b \
+  --decode both \
+  --output eval/finance_ner_checkpoints.json
+```
+
+`--decode viterbi` is the default and enforces valid BIO/BIOES transitions,
+using the checkpoint's `viterbi_calibration.json` when present. Use
+`--decode argmax` for raw greedy scores or `--decode both` to compare them.
+Add `--limit N` for a quick smoke test. Existing output files are protected
+unless `--overwrite` is passed. Dataset labels are resolved from ClassLabel
+metadata or a nearby `labels.json` and remapped to model IDs by name; an
+incompatible dataset/model ontology fails before inference rather than
+silently producing invalid scores.
+
 ## API Reference
 
 ### DatasetArgs
@@ -250,6 +290,8 @@ Controls the hyperparameters and runtime configuration.
 | :--- | :--- | :--- |
 | `batch_size` | `2` | The physical batch size per device/step. Reduce to 1 on Macbooks with limited RAM if training on long context. |
 | `gradient_accumulation_steps` | `8` | Number of steps to accumulate gradients before updating weights. |
+| `gradient_accumulation_dtype` | `"float32"` | Accumulation precision: `"float32"` is recommended for FP16/BF16 models; `"model"` uses the gradient dtype. |
+| `multi_precision` | `True` | Keep FP32 master weights and AdamW moments when fully training an FP16/BF16 model. |
 | `num_train_epochs` | `2` | Total number of training epochs. |
 | `max_length` | `512` | Max sequence length. If `None`, uses model's default config. |
 | `freeze_embeddings` | `False` | If `True`, freezes the embedding layer to save memory/compute. |
@@ -273,11 +315,12 @@ Controls the hyperparameters and runtime configuration.
 | `logging_steps` | `100` | Frequency of logging metrics to console/files. |
 | `eval_batch_size` | `4` | Batch size used during evaluation/testing. |
 | `eval_strategy` | `"end"` | When to run validation: `"end"` for the final epoch only, `"epoch"` after every epoch, or `"no"` to skip validation during training. |
-| `resume_from_step`| `0` | Step to resume training from. If this is after the last warmup step (either declared or calculated via warmup_ratio), warmup will be ignored. |  
+| `resume_from_checkpoint` | `None` | Complete checkpoint containing model, optimizer, scheduler step, and trainer position. This is the recommended resume mechanism. `num_train_epochs` remains the total target. |
+| `resume_from_step`| `0` | Legacy data-skipping resume without Adam moments; use only when a complete checkpoint is unavailable. |
 | `grad_checkpoint` | `True` | Whether to wrap transformer layers in MLX gradient checkpointing to reduce activation memory. |
 | `cache_clear_steps` | `1` | Clear MLX cache every N optimizer updates. `1` is safest for large/MoE models; higher values can improve speed but may increase process footprint. |
 
-Gradient checkpointing is enabled by default due to RAM constraints of consumer hardware. MLX cache clearing is also aggressive by default because unified-memory footprint can be much larger than `mx.get_active_memory()` for some architectures.
+Gradient checkpointing is enabled by default due to RAM constraints of consumer hardware. It is applied at each backbone block call through `GradientCheckpointingMixin`, using MLX's module-aware `mlx.nn.utils.checkpoint` helper so the block's trainable parameters participate in recomputation. A new backbone must inherit that mixin and invoke blocks through `_call_checkpointed_layer`; the trainer fails explicitly if no compatible backbone is present. MLX cache clearing is also aggressive by default because unified-memory footprint can be much larger than `mx.get_active_memory()` for some architectures.
 
 ### Model Config
 
@@ -287,6 +330,7 @@ When loading a pretrained model, you can create a model_config dictionary with n
 | :--- | :--- | :--- | :--- |
 | `is_regression` | `bool` | `False` | For text-classification tasks, whether the classification is a regression |
 | `use_late_interaction`| `bool` | `False` | For sentence similarity tasks, whether late interaction (MaxSim) should be used instead of cosine similarity |
+| `dtype` | `str` | `"auto"` | Persisted model parameter dtype: `"auto"`, `"float32"`, `"float16"`, or `"bfloat16"`. Canonical `dtype` takes precedence over legacy `torch_dtype`. |
 
 ## Trainer
 

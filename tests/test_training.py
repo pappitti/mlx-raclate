@@ -263,14 +263,22 @@ def test_pretokenized_token_classification_collator_pads_inputs():
     assert batch["labels"].tolist() == [[1, 2, 3], [4, -100, -100]]
 
 
-def test_token_classification_checkpoint_saves_viterbi_calibration(tmp_path):
+def test_token_classification_checkpoint_survives_model_card_failure(
+    tmp_path, monkeypatch
+):
     """Test token-classification checkpoints include Viterbi calibration metadata."""
     import json
     from types import SimpleNamespace
 
     import mlx.core as mx
 
+    from mlx_raclate.tuner import trainer as trainer_module
     from mlx_raclate.tuner.trainer import Trainer
+
+    def fail_model_card(**kwargs):
+        raise ImportError("missing inference template")
+
+    monkeypatch.setattr(trainer_module, "get_code_for_trained_model", fail_model_card)
 
     class DummyModel:
         config = SimpleNamespace(model_type="dummy")
@@ -307,13 +315,146 @@ def test_token_classification_checkpoint_saves_viterbi_calibration(tmp_path):
     trainer.task_type = "token-classification"
     trainer.args = SimpleNamespace(push_to_hub=False, save_total_limit=None)
 
-    trainer._save_checkpoint({"loss": 1.0})
+    with pytest.warns(UserWarning, match="README generation failed"):
+        trainer._save_checkpoint({"loss": 1.0})
 
     calibration_path = tmp_path / "checkpoint-7" / "viterbi_calibration.json"
     with open(calibration_path) as f:
         calibration = json.load(f)
 
     assert calibration["operating_points"]["default"]["biases"]["transition_bias_background_to_start"] == 2.0
+    assert (tmp_path / "checkpoint-7" / "model.safetensors").is_file()
+    assert (tmp_path / "checkpoint-7" / "config.json").is_file()
+    assert (tmp_path / "checkpoint-7" / "metrics.json").is_file()
+
+
+def test_checkpoint_restores_optimizer_and_completed_epoch(tmp_path):
+    """A complete checkpoint resumes at the next epoch with Adam state intact."""
+    import json
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from mlx_raclate.tuner.trainer import Trainer
+    from mlx_raclate.tuner.utils import MultiPrecisionAdamW
+
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = mx.array([1.0], dtype=mx.bfloat16)
+            self.config = SimpleNamespace(model_type="dummy")
+
+        def get_hf_transformers_arch(self):
+            return None
+
+    class DummyTokenizer:
+        def save_pretrained(self, path):
+            return None
+
+    model = TinyModel()
+    optimizer = MultiPrecisionAdamW(learning_rate=1.5e-5, weight_decay=0.01)
+    optimizer.update(
+        model,
+        {"weight": mx.array([0.1], dtype=mx.bfloat16)},
+    )
+    mx.eval(model.parameters(), optimizer.state)
+    expected_master = optimizer.state["weight"]["master"]
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.output_dir = tmp_path
+    trainer.global_step = 8
+    trainer.epoch = 0
+    trainer.microbatches_in_epoch = 8
+    trainer.model = model
+    trainer.optimizer = optimizer
+    trainer.tokenizer = DummyTokenizer()
+    trainer.task_type = "text-classification"
+    trainer.args = SimpleNamespace(push_to_hub=False, save_total_limit=None)
+    trainer._save_checkpoint({"loss": 1.0}, completed_epoch=True)
+
+    checkpoint = tmp_path / "checkpoint-8"
+    with open(checkpoint / "trainer_state.json") as file:
+        state = json.load(file)
+    assert state["completed_epochs"] == 1
+    assert state["optimizer_step"] == 1
+
+    resumed = Trainer.__new__(Trainer)
+    resumed.model = TinyModel()
+    resumed.optimizer = MultiPrecisionAdamW(
+        learning_rate=1.5e-5,
+        weight_decay=0.01,
+    )
+    resumed._restore_checkpoint_state(checkpoint)
+
+    assert resumed.global_step == 8
+    assert resumed.start_epoch == 1
+    assert resumed.resume_microbatches_in_epoch == 0
+    assert resumed.optimizer.step.item() == 1
+    assert mx.allclose(
+        resumed.optimizer.state["weight"]["master"],
+        expected_master,
+    )
+
+
+def test_train_continues_from_completed_epoch():
+    """The total epoch target is retained when resuming a phase."""
+    from types import SimpleNamespace
+
+    from mlx_raclate.tuner.trainer import Trainer
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = SimpleNamespace(num_train_epochs=3, eval_strategy="no")
+    trainer.start_epoch = 1
+    trainer.resume_microbatches_in_epoch = 0
+    trainer.eval_dataset = None
+    trained_epochs = []
+    saved_epochs = []
+    trainer._train_epoch = lambda skip_microbatches=0: trained_epochs.append(
+        (trainer.epoch, skip_microbatches)
+    )
+    trainer._save_checkpoint = lambda metrics, completed_epoch=False: saved_epochs.append(
+        (trainer.epoch, completed_epoch)
+    )
+
+    trainer.train()
+
+    assert trained_epochs == [(1, 0), (2, 0)]
+    assert saved_epochs == [(1, True), (2, True)]
+
+
+def test_evaluation_failure_saves_completed_epoch_before_reraising():
+    """A broken evaluator must not discard a fully trained epoch."""
+    from types import SimpleNamespace
+
+    from mlx_raclate.tuner.trainer import Trainer
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = SimpleNamespace(num_train_epochs=1, eval_strategy="epoch")
+    trainer.start_epoch = 0
+    trainer.resume_microbatches_in_epoch = 0
+    trainer.eval_dataset = object()
+    trainer._train_epoch = lambda skip_microbatches=0: None
+    trainer.evaluate = lambda: (_ for _ in ()).throw(RuntimeError("bad metrics"))
+    saved = []
+    trainer._save_checkpoint = lambda metrics, completed_epoch=False: saved.append(
+        (metrics, completed_epoch)
+    )
+
+    with pytest.warns(UserWarning, match="saving a resumable checkpoint"):
+        with pytest.raises(RuntimeError, match="bad metrics"):
+            trainer.train()
+
+    assert saved == [
+        (
+            {
+                "eval_failed": True,
+                "eval_error_type": "RuntimeError",
+                "eval_error": "bad metrics",
+            },
+            True,
+        )
+    ]
 
 
 def test_label_mappings_generation():
@@ -334,10 +475,16 @@ def test_training_args_runtime_memory_options():
     default_args = TrainingArgs()
     assert default_args.grad_checkpoint is True
     assert default_args.cache_clear_steps == 1
+    assert default_args.multi_precision is True
+    assert default_args.gradient_accumulation_dtype == "float32"
 
     custom_args = TrainingArgs(
         grad_checkpoint=False,
         cache_clear_steps=8,
+        multi_precision=False,
+        gradient_accumulation_dtype="model",
     )
     assert custom_args.grad_checkpoint is False
     assert custom_args.cache_clear_steps == 8
+    assert custom_args.multi_precision is False
+    assert custom_args.gradient_accumulation_dtype == "model"

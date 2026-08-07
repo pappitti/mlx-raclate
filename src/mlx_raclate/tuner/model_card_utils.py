@@ -86,20 +86,20 @@ def _load_inference_example_module(pipeline: str):
 
     module_name = _PIPELINE_TO_MODULE[pipeline]
 
-    # Try importing from tests.inference_examples first (development)
-    # Fall back to relative import if tests not available
+    # Runtime templates live in the installed package. The tests fallback keeps
+    # compatibility with older source checkouts that predate that package.
     try:
-        return importlib.import_module(f"tests.inference_examples.{module_name}")
+        return importlib.import_module(
+            f"mlx_raclate.inference_examples.{module_name}"
+        )
     except ImportError:
-        # If running from within the library, try relative path
         try:
-            import tests.inference_examples
-            return getattr(tests.inference_examples, module_name)
-        except (ImportError, AttributeError):
+            return importlib.import_module(f"tests.inference_examples.{module_name}")
+        except ImportError as error:
             raise ImportError(
                 f"Could not import inference example module for {pipeline}. "
-                "Make sure the tests package is installed or accessible."
-            )
+                "The mlx_raclate inference-examples package is incomplete."
+            ) from error
 
 
 def get_available_pipelines() -> List[str]:

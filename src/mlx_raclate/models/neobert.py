@@ -6,6 +6,7 @@ import mlx.nn as nn
 
 from .base import (
     BaseModelArgs,
+    GradientCheckpointingMixin,
     RaclateBaseModel,
     RotaryEmbedding,
     SwiGLU,
@@ -188,7 +189,7 @@ class EncoderBlock(nn.Module):
         return hidden_states
 
 
-class NeoBERTModel(nn.Module):
+class NeoBERTModel(GradientCheckpointingMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
@@ -230,7 +231,9 @@ class NeoBERTModel(nn.Module):
 
         all_hidden_states = [] if output_hidden_states else None
         for layer in self.transformer_encoder:
-            hidden_states = layer(hidden_states, attention_mask, position_ids)
+            hidden_states = self._call_checkpointed_layer(
+                layer, hidden_states, attention_mask, position_ids
+            )
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
 

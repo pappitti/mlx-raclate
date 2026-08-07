@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .base import (
 	BaseModelArgs,
+	GradientCheckpointingMixin,
 	RaclateBaseModel,
 	compute_similarity_and_loss,
 	RotaryEmbedding,
@@ -506,7 +507,7 @@ class OpenAIPrivacyFilterEncoderLayer(nn.Module):
 		return hidden_states, router_logits
 
 
-class OpenAIPrivacyFilterModel(nn.Module):
+class OpenAIPrivacyFilterModel(GradientCheckpointingMixin, nn.Module):
 	def __init__(self, config: ModelArgs):
 		super().__init__()
 		self.config = config
@@ -574,7 +575,8 @@ class OpenAIPrivacyFilterModel(nn.Module):
 		for layer in self.layers:
 			if hidden_state_list is not None:
 				hidden_state_list.append(hidden_states)
-			hidden_states, router_logits = layer(
+			hidden_states, router_logits = self._call_checkpointed_layer(
+				layer,
 				hidden_states,
 				attention_mask=attention_mask,
 				position_ids=position_ids,

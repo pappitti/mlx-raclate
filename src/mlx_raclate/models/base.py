@@ -1,15 +1,45 @@
 import inspect
 from dataclasses import dataclass
-import math
+from typing import Optional
+
 import mlx.core as mx
 import mlx.nn as nn
-from typing import Any, Dict, Optional, Tuple
+from mlx.nn.utils import checkpoint as checkpoint_module
+
+
+class GradientCheckpointingMixin:
+    """Opt-in support for checkpointing repeated backbone blocks."""
+
+    supports_gradient_checkpointing = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gradient_checkpointing = False
+
+    def set_gradient_checkpointing(self, enabled: bool = True) -> None:
+        self.gradient_checkpointing = bool(enabled)
+
+    def _call_checkpointed_layer(self, layer, *args, **kwargs):
+        if self.gradient_checkpointing and self.training:
+            return checkpoint_module(layer)(*args, **kwargs)
+        return layer(*args, **kwargs)
+
 
 class RaclateBaseModel(nn.Module):
     """Base class for Raclate models."""
+
     def __init__(self):
         super().__init__()
-    
+
+    def set_gradient_checkpointing(self, enabled: bool = True) -> int:
+        """Enable checkpointing on every compatible backbone in this model."""
+        checkpointed_backbones = 0
+        for module in self.modules():
+            if isinstance(module, GradientCheckpointingMixin):
+                module.set_gradient_checkpointing(enabled)
+                checkpointed_backbones += 1
+        return checkpointed_backbones
+
     def get_hf_transformers_arch(self):
         return self.hf_transformers_arch if hasattr(self, "hf_transformers_arch") else None
 
@@ -29,11 +59,16 @@ class RaclateBaseModel(nn.Module):
         if new_num_tokens == old_num_tokens:
             return old_embeddings
 
+        embedding_dtype = old_embeddings.weight.dtype
+
         # Create new embeddings
         new_embeddings = nn.Embedding(new_num_tokens, old_embedding_dim)
         
         # Initialize new weights (e.g. Normal)
-        new_embeddings.weight = mx.random.normal(shape=(new_num_tokens, old_embedding_dim)) * 0.02
+        new_embeddings.weight = mx.random.normal(
+            shape=(new_num_tokens, old_embedding_dim),
+            dtype=embedding_dtype,
+        ) * mx.array(0.02, dtype=embedding_dtype)
         
         # We copy up to the min size to handle both expansion and shrinking (though usually expansion)
         n = min(old_num_tokens, new_num_tokens)
@@ -56,6 +91,8 @@ class RaclateBaseModel(nn.Module):
 
 @dataclass
 class BaseModelArgs:
+    dtype: str = "auto"
+
     @classmethod
     def from_dict(cls, params):
         return cls(

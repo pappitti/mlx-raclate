@@ -123,7 +123,7 @@ def test_openai_privacy_filter_sanitize_drops_mismatched_head():
     assert "score.weight" not in sanitized
     assert "score.bias" not in sanitized
     _verify_weights(model, sanitized, train_mode=True)
-    _initialize_head_weights(model, sanitized, model.config, target_dtype=mx.float32)
+    _initialize_head_weights(model, sanitized, model.config)
     model.load_weights(list(sanitized.items()))
 
 
@@ -297,7 +297,7 @@ def test_loader_helpers_treat_score_as_pipeline_head():
         _verify_weights(model, weights, train_mode=False)
 
     _verify_weights(model, weights, train_mode=True)
-    _initialize_head_weights(model, weights, model.config, target_dtype=mx.float32)
+    _initialize_head_weights(model, weights, model.config)
 
     assert "score.weight" in weights
     assert "score.bias" in weights
