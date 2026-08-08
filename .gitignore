@@ -28,4 +28,5 @@ dev_tests/
 eval/
 
 # Dataset preprocessing
-tools/
+tools/*
+!tools/calibrate_ner_viterbi.py

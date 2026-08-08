@@ -11,6 +11,8 @@ VITERBI_BIAS_KEYS = (
     "transition_bias_background_to_start",
     "transition_bias_inside_to_continue",
     "transition_bias_inside_to_end",
+    "transition_bias_inside_to_background",
+    "transition_bias_inside_to_start",
     "transition_bias_end_to_background",
     "transition_bias_end_to_start",
 )
@@ -192,13 +194,30 @@ def _transition_bias(
     scheme: str,
     transition_biases: Mapping[str, float],
 ) -> float:
-    if scheme != "BIOES":
-        return 0.0
-
     previous_prefix, previous_entity = _split_bioes_label(previous_label)
     current_prefix, current_entity = _split_bioes_label(current_label)
     previous_is_background = previous_label == "O" or previous_prefix is None
     current_is_background = current_label == "O" or current_prefix is None
+
+    if scheme == "BIO":
+        if previous_is_background:
+            if current_is_background:
+                return transition_biases["transition_bias_background_stay"]
+            if current_prefix == "B":
+                return transition_biases["transition_bias_background_to_start"]
+            return 0.0
+
+        if previous_prefix in {"B", "I"}:
+            if current_prefix == "I" and previous_entity == current_entity:
+                return transition_biases["transition_bias_inside_to_continue"]
+            if current_is_background:
+                return transition_biases["transition_bias_inside_to_background"]
+            if current_prefix == "B":
+                return transition_biases["transition_bias_inside_to_start"]
+        return 0.0
+
+    if scheme != "BIOES":
+        return 0.0
 
     if previous_is_background:
         if current_is_background:
@@ -231,7 +250,7 @@ def viterbi_decode_bioes_ids(
     transition_biases: Optional[Mapping[str, float]] = None,
 ) -> List[int]:
     """Decode a single label sequence with BIO/BIOES transition constraints."""
-    if not emissions:
+    if len(emissions) == 0:
         return []
 
     scheme = _infer_tag_scheme(label_names)
@@ -248,7 +267,7 @@ def viterbi_decode_bioes_ids(
 
     num_labels = len(label_names)
     num_tokens = len(emissions)
-    special_mask = list(special_tokens_mask or [])
+    special_mask = [] if special_tokens_mask is None else list(special_tokens_mask)
     biases = _resolve_viterbi_transition_biases(transition_biases)
 
     scores = [[_INVALID_PATH_SCORE] * num_labels for _ in range(num_tokens)]

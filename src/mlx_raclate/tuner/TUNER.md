@@ -268,6 +268,49 @@ metadata or a nearby `labels.json` and remapped to model IDs by name; an
 incompatible dataset/model ontology fails before inference rather than
 silently producing invalid scores.
 
+### Post-training BIO Viterbi calibration
+
+BIO checkpoints support coarse transition biases for starting, continuing,
+ending, and splitting entity spans. Cache validation logits once while running
+the normal evaluator:
+
+```bash
+uv run python tools/evaluate_ner_models.py \
+  --model trained_models/finance_ner/checkpoint-4000 \
+  --dataset data/NER-Finance-CRM/bio_pplx_embed_v1_0_6b_16k \
+  --decode both \
+  --logits-cache-dir eval/finance_ner_logits \
+  --output eval/finance_ner_before_calibration.json
+```
+
+The evaluator prints each generated `.npz` path. Search one cache, or pool
+multiple caches with the same label ontology, without loading the model again:
+
+```bash
+uv run python tools/calibrate_ner_viterbi.py \
+  --cache \
+    eval/finance_ner_logits/MODEL_CACHE/generalization.npz \
+    eval/finance_ner_logits/MODEL_CACHE/lexical_calibration.npz \
+  --output-calibration trained_models/finance_ner/checkpoint-4000
+```
+
+The tuner preserves the existing `default` point and writes `balanced`,
+`high_precision`, and `high_recall`. The latter two retain at least 95% of the
+balanced point's recall or precision by default. Select one during evaluation:
+
+```bash
+uv run python tools/evaluate_ner_models.py \
+  --model trained_models/finance_ner/checkpoint-4000 \
+  --dataset data/NER-Finance-CRM/bio_pplx_embed_v1_0_6b_16k \
+  --operating-point balanced
+```
+
+Use `--set-default` when tuning to promote `balanced` to the default decoder
+setting. Calibration selects a decoder on labelled data, so report final
+metrics on a separate untouched test split rather than on the calibration
+cache itself. Float32 logits are cached by default; `--logits-cache-dtype
+float16` reduces disk use when small score perturbations are acceptable.
+
 ## API Reference
 
 ### DatasetArgs

@@ -224,6 +224,42 @@ def test_viterbi_decode_bioes_ids_applies_transition_biases():
     assert decoded == [0, 3]
 
 
+def test_viterbi_decode_bio_ids_applies_transition_biases():
+    label_names = ["O", "B-email", "I-email"]
+    emissions = [
+        [3.0, 0.0, 0.0],
+        [1.0, 1.5, 0.0],
+    ]
+
+    baseline = viterbi_decode_bioes_ids(emissions, label_names)
+    tuned = viterbi_decode_bioes_ids(
+        emissions,
+        label_names,
+        transition_biases={"transition_bias_background_to_start": -1.0},
+    )
+
+    assert baseline == [0, 1]
+    assert tuned == [0, 0]
+
+
+def test_viterbi_decode_bio_ids_can_favor_continuing_an_entity():
+    label_names = ["O", "B-email", "I-email"]
+    emissions = [
+        [0.0, 3.0, 0.0],
+        [1.0, 0.0, 0.8],
+    ]
+
+    baseline = viterbi_decode_bioes_ids(emissions, label_names)
+    tuned = viterbi_decode_bioes_ids(
+        emissions,
+        label_names,
+        transition_biases={"transition_bias_inside_to_continue": 0.5},
+    )
+
+    assert baseline == [1, 0]
+    assert tuned == [1, 2]
+
+
 def test_viterbi_calibration_roundtrips_transition_biases(tmp_path):
     calibration = default_viterbi_calibration()
     calibration["operating_points"]["default"]["biases"]["transition_bias_background_to_start"] = 3.0

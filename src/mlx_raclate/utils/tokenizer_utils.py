@@ -6,6 +6,24 @@ from transformers import AutoTokenizer
 
 REPLACEMENT_CHAR = "\ufffd"
 
+# Correct pattern used by Transformers' ``fix_mistral_regex`` compatibility
+# path. Some checkpoints incorrectly declare a new enough Transformers version,
+# causing current Transformers releases to skip their own requested patch.
+_FIXED_MISTRAL_REGEX = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?"
+    r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+"
+    r"[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+_KNOWN_INCORRECT_MISTRAL_REGEXES = {
+    (
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|"
+        r"\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|"
+        r"\s+(?!\S)|\s+"
+    ),
+}
+
 def _remove_space(x):
     if x and x[0] == " ":
         return x[1:]
@@ -326,7 +344,38 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def load_tokenizer(model_path, tokenizer_config_extra={}):
+def _ensure_mistral_regex_fixed(tokenizer):
+    """Apply the requested regex fix when Transformers incorrectly skips it."""
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        return False
+
+    serialized = backend.to_str()
+    if not isinstance(serialized, str):
+        return False
+    tokenizer_state = json.loads(serialized)
+    pre_tokenizer = tokenizer_state.get("pre_tokenizer")
+    if not isinstance(pre_tokenizer, dict) or pre_tokenizer.get("type") != "Sequence":
+        return False
+    pre_tokenizers = pre_tokenizer.get("pretokenizers")
+    if not isinstance(pre_tokenizers, list) or not pre_tokenizers:
+        return False
+
+    split = pre_tokenizers[0]
+    pattern = split.get("pattern") if isinstance(split, dict) else None
+    regex = pattern.get("Regex") if isinstance(pattern, dict) else None
+    if regex not in _KNOWN_INCORRECT_MISTRAL_REGEXES:
+        return False
+
+    from tokenizers import Tokenizer
+
+    pattern["Regex"] = _FIXED_MISTRAL_REGEX
+    tokenizer._tokenizer = Tokenizer.from_str(json.dumps(tokenizer_state))
+    tokenizer.fix_mistral_regex = True
+    return True
+
+
+def load_tokenizer(model_path, tokenizer_config_extra=None):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
 
@@ -347,10 +396,19 @@ def load_tokenizer(model_path, tokenizer_config_extra={}):
             elif _is_bpe_decoder(tokenizer_content["decoder"]):
                 detokenizer_class = BPEStreamingDetokenizer
 
-    tokenizer_config = {"trust_remote_code": False}
-    tokenizer_config.update(tokenizer_config_extra)
+    tokenizer_config = {
+        "trust_remote_code": False,
+        # Transformers detects several otherwise compatible checkpoints whose
+        # tokenizer.json contains the incorrect Mistral-family pre-tokenizer
+        # regex. Apply its supported correction unless a caller explicitly
+        # opts out for backwards compatibility with already-tokenized data.
+        "fix_mistral_regex": True,
+    }
+    if tokenizer_config_extra is not None:
+        tokenizer_config.update(tokenizer_config_extra)
 
-    return TokenizerWrapper(
-        AutoTokenizer.from_pretrained(model_path, **tokenizer_config),
-        detokenizer_class,
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_config)
+    if tokenizer_config.get("fix_mistral_regex") is True:
+        _ensure_mistral_regex_fixed(tokenizer)
+
+    return TokenizerWrapper(tokenizer, detokenizer_class)

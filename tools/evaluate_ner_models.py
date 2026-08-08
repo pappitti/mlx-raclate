@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +26,7 @@ from mlx_raclate.utils.token_classification import (
     viterbi_decode_bioes_batch,
     viterbi_transition_biases_from_calibration,
 )
+from mlx_raclate.utils.token_classification_calibration import LogitsCacheBuilder
 
 
 SUPPORTED_DATA_EXTENSIONS = ("parquet", "jsonl", "json", "csv")
@@ -310,6 +313,7 @@ def evaluate_dataset(
     decode_modes: Sequence[str],
     transition_biases: Mapping[str, float],
     include_outside_in_macro: bool,
+    logits_cache_builder: Optional[LogitsCacheBuilder] = None,
 ) -> dict[str, Any]:
     import mlx.core as mx
 
@@ -351,6 +355,12 @@ def evaluate_dataset(
             loss_batches += 1
 
         references.extend(batch["labels"].tolist())
+        if logits_cache_builder is not None:
+            logits_cache_builder.append(
+                logits.astype(mx.float32),
+                batch["labels"],
+                batch["attention_mask"],
+            )
         for decode_mode in decode_modes:
             predictions[decode_mode].extend(
                 _decode_predictions(
@@ -395,6 +405,22 @@ def _print_summary(result: Mapping[str, Any]) -> None:
             f"entity macro F1 {metrics['boundary_f1_macro']:.4f} | "
             f"token accuracy {metrics['token_accuracy']:.4f}"
         )
+
+
+def _cache_component(value: str, maximum_length: int = 64) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-._")
+    normalized = normalized or "item"
+    return normalized[-maximum_length:].strip("-._") or "item"
+
+
+def _logits_cache_path(
+    cache_dir: Path,
+    model_path: str,
+    source_name: str,
+) -> Path:
+    digest = hashlib.sha256(model_path.encode()).hexdigest()[:8]
+    model_name = f"{_cache_component(model_path)}-{digest}"
+    return cache_dir / model_name / f"{_cache_component(source_name)}.npz"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -454,9 +480,23 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path, help="Write the complete benchmark as JSON.")
     parser.add_argument(
+        "--logits-cache-dir",
+        type=Path,
+        help=(
+            "Write one reusable .npz logits cache per model/dataset. These caches can "
+            "be searched by tools/calibrate_ner_viterbi.py without rerunning inference."
+        ),
+    )
+    parser.add_argument(
+        "--logits-cache-dtype",
+        choices=("float16", "float32"),
+        default="float32",
+        help="Stored logits precision when --logits-cache-dir is used.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Allow replacing an existing --output file.",
+        help="Allow replacing an existing --output file and logits caches.",
     )
     return parser.parse_args()
 
@@ -495,6 +535,22 @@ def main() -> None:
     from mlx_raclate.utils.utils import load
 
     for model_path in args.model:
+        cache_paths = {
+            source.name: _logits_cache_path(
+                args.logits_cache_dir,
+                model_path,
+                source.name,
+            )
+            for source, _, _, _ in loaded_datasets
+        } if args.logits_cache_dir is not None else {}
+        existing_caches = [
+            path for path in cache_paths.values() if path.exists()
+        ]
+        if existing_caches and not args.overwrite:
+            raise FileExistsError(
+                f"{existing_caches[0]} exists; pass --overwrite to replace logits caches"
+            )
+
         print(f"Loading {model_path}...")
         model, tokenizer = load(model_path, pipeline="token-classification")
         label_names, model_label2id = _model_label_mapping(model)
@@ -512,6 +568,19 @@ def main() -> None:
 
         for source, dataset, dataset_labels, label_source in loaded_datasets:
             print(f"Evaluating {source.name} ({len(dataset)} examples)...")
+            cache_builder = None
+            if args.logits_cache_dir is not None:
+                cache_builder = LogitsCacheBuilder(
+                    label_names,
+                    logits_dtype=args.logits_cache_dtype,
+                    metadata={
+                        "model": model_path,
+                        "dataset": source.name,
+                        "dataset_location": source.location,
+                        "split": args.split,
+                        "max_length": max_length,
+                    },
+                )
             result = evaluate_dataset(
                 model=model,
                 tokenizer=tokenizer,
@@ -524,6 +593,7 @@ def main() -> None:
                 decode_modes=_decode_modes(args.decode),
                 transition_biases=transition_biases,
                 include_outside_in_macro=args.include_outside_in_macro,
+                logits_cache_builder=cache_builder,
             )
             result.update(
                 {
@@ -537,10 +607,19 @@ def main() -> None:
                     "model_labels": label_names,
                     "max_length": max_length,
                     "batch_size": args.batch_size,
+                    "logits_cache": (
+                        str(cache_paths[source.name])
+                        if args.logits_cache_dir is not None
+                        else None
+                    ),
                 }
             )
             benchmark["results"].append(result)
             _print_summary(result)
+            if cache_builder is not None:
+                cache_path = cache_paths[source.name]
+                cache_builder.save(cache_path)
+                print(f"Wrote logits cache to {cache_path}")
 
         del model
         del tokenizer

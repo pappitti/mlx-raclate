@@ -155,7 +155,27 @@ Detailed code for each pipeline is available in the `test` directory of this rep
 
 ## Server
 
-`mlx-raclate` includes a FastAPI server for classifier inference. See `mlx_raclate.utils.server`
+`mlx-raclate` includes a FastAPI server for classifier inference. See `mlx_raclate.utils.server`.
+Token-classification requests use constrained Viterbi decoding by default and
+automatically read `viterbi_calibration.json` from the loaded checkpoint. A
+named calibration point can be selected per request:
+
+```bash
+curl -X POST "http://localhost:8000/predict" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "trained_models/finance_ner/checkpoint-4000",
+    "pipeline": "token-classification",
+    "text": "Email alice@example.com",
+    "decode_mode": "viterbi",
+    "operating_point": "high_precision"
+  }'
+```
+
+Use `"decode_mode": "argmax"` for unstructured greedy decoding. Named
+operating points require the corresponding entry in the checkpoint's
+calibration file; unavailable names return HTTP 400 rather than silently
+falling back.
 
 ## Training (Tuner)
 

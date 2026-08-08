@@ -2,11 +2,14 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional, Any, Union, Dict
+from typing import Any, Dict, List, Literal, Optional, Union
 import uvicorn
 import gc
 import mlx.core as mx
-from mlx_raclate.utils.token_classification import postprocess_token_classification_output
+from mlx_raclate.utils.token_classification import (
+    postprocess_token_classification_output,
+    viterbi_transition_biases_from_calibration,
+)
 from mlx_raclate.utils.utils import PIPELINES, load
 
 app = FastAPI(
@@ -45,6 +48,38 @@ def _item(value):
     if hasattr(value, "item"):
         return value.item()
     return value
+
+
+def _resolve_token_classification_transition_biases(model, operating_point: str):
+    calibration = getattr(model, "viterbi_calibration", None)
+    if calibration is None:
+        if operating_point != "default":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Viterbi operating point {operating_point!r} is unavailable: "
+                    "the loaded model has no viterbi_calibration.json"
+                ),
+            )
+        return None
+
+    try:
+        return viterbi_transition_biases_from_calibration(
+            calibration,
+            operating_point=operating_point,
+        )
+    except ValueError as error:
+        operating_points = calibration.get("operating_points", {})
+        available = (
+            ", ".join(sorted(str(name) for name in operating_points))
+            if isinstance(operating_points, dict) and operating_points
+            else "none"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"{error}. Available operating points: {available}",
+        ) from error
+
 
 def get_model(model_name: str, pipeline_name: str, config_file: Optional[Dict] = None):
     """
@@ -108,6 +143,17 @@ class PredictionRequest(BaseModel):
     # Configuration
     config_file: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Configuration overrides (e.g., {'use_late_interaction': True})")
     label_candidates: Optional[Union[Dict[str, str], List[str]]] = Field(None, description="For zero-shot-classification only")
+    decode_mode: Literal["viterbi", "argmax"] = Field(
+        "viterbi",
+        description="Token-classification decoder. Ignored by other pipelines.",
+    )
+    operating_point: str = Field(
+        "default",
+        description=(
+            "Named Viterbi calibration operating point for token classification "
+            "(for example: default, balanced, high_precision, or high_recall)."
+        ),
+    )
 
 # -----------------------------------------------------------------------------
 # Endpoints
@@ -187,6 +233,19 @@ async def predict(request: PredictionRequest):
     # Pipeline: Token Classification (NER / Privacy Filtering)
     # -------------------------------------------------------------------------
     elif request.pipeline == "token-classification":
+        if request.decode_mode == "argmax":
+            if request.operating_point != "default":
+                raise HTTPException(
+                    status_code=400,
+                    detail="operating_point only applies when decode_mode='viterbi'",
+                )
+            transition_biases = None
+        else:
+            transition_biases = _resolve_token_classification_transition_biases(
+                model,
+                request.operating_point,
+            )
+
         inputs = tokenizer._tokenizer(
             texts,
             return_tensors="mlx",
@@ -225,6 +284,8 @@ async def predict(request: PredictionRequest):
             id2label=id2label,
             texts=texts,
             offsets=offsets,
+            decode_mode=request.decode_mode,
+            transition_biases=transition_biases,
         )
 
         input_ids = inputs["input_ids"]
@@ -243,6 +304,12 @@ async def predict(request: PredictionRequest):
             "entities": processed["grouped_spans"],
             "label_names": processed["label_names"],
             "id2label": id2label,
+            "decode_mode": request.decode_mode,
+            "operating_point": (
+                request.operating_point
+                if request.decode_mode == "viterbi"
+                else None
+            ),
         }
 
     # -------------------------------------------------------------------------

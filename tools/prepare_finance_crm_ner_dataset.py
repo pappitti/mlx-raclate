@@ -27,6 +27,8 @@ PHASE_FILES = {
     "lexical_calibration": "train_lexical_calibration.jsonl",
 }
 
+TOKENIZER_CONFIG = {"fix_mistral_regex": True}
+
 
 def labels_for_scheme(label_scheme: str) -> List[str]:
     normalized_scheme = label_scheme.upper()
@@ -547,7 +549,7 @@ def prepare_dataset(
             f"max_length={max_length} exceeds the model context window "
             f"of {model_context_length}"
         )
-    tokenizer = load_tokenizer(model_path)._tokenizer
+    tokenizer = load_tokenizer(model_path, TOKENIZER_CONFIG)._tokenizer
     if not getattr(tokenizer, "is_fast", False):
         raise ValueError("A fast tokenizer is required to align character offsets")
 
@@ -620,6 +622,7 @@ def prepare_dataset(
         "model": model,
         "tokenizer_class": type(tokenizer).__name__,
         "tokenizer_vocab_size": tokenizer.vocab_size,
+        "tokenizer_config": TOKENIZER_CONFIG,
         "add_special_tokens": False,
         "max_length": max_length,
         "model_context_length": model_context_length,

@@ -51,6 +51,19 @@ class _FakeProbabilitiesOnlyModel:
         }
 
 
+class _FakeCalibratedModel(_FakeModel):
+    viterbi_calibration = {
+        "operating_points": {
+            "default": {"biases": {}},
+            "high_precision": {
+                "biases": {
+                    "transition_bias_background_to_start": -10.0,
+                }
+            },
+        }
+    }
+
+
 class _FakeTokenizer:
     def __init__(self):
         self._tokenizer = self
@@ -95,6 +108,8 @@ def test_predict_token_classification_returns_grouped_spans(monkeypatch):
     assert result["predictions"][0][2]["token"] == "tok-2"
     assert result["predictions"][0][2]["start"] == 5
     assert result["predictions"][0][2]["end"] == 23
+    assert result["decode_mode"] == "viterbi"
+    assert result["operating_point"] == "default"
 
 
 def test_predict_token_classification_accepts_probabilities_without_logits(monkeypatch):
@@ -121,6 +136,88 @@ def test_predict_token_classification_accepts_probabilities_without_logits(monke
 
     assert result["grouped_spans"][0][0]["entity_group"] == "private_email"
     assert result["predictions"][0][2]["label"] == "S-private_email"
+
+
+def test_predict_token_classification_uses_named_viterbi_operating_point(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_model",
+        lambda model_name, pipeline_name, config_file: {
+            "model": _FakeCalibratedModel(),
+            "tokenizer": _FakeTokenizer(),
+        },
+    )
+    monkeypatch.setattr(server.mx.metal, "clear_cache", lambda: None)
+    monkeypatch.setattr(server.gc, "collect", lambda: None)
+
+    result = asyncio.run(
+        server.predict(
+            server.PredictionRequest(
+                model="fake-privacy-filter",
+                pipeline="token-classification",
+                text="Email alice@example.com",
+                operating_point="high_precision",
+            )
+        )
+    )
+
+    assert result["grouped_spans"] == [[]]
+    assert result["decode_mode"] == "viterbi"
+    assert result["operating_point"] == "high_precision"
+
+
+def test_predict_token_classification_allows_argmax(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_model",
+        lambda model_name, pipeline_name, config_file: {
+            "model": _FakeCalibratedModel(),
+            "tokenizer": _FakeTokenizer(),
+        },
+    )
+    monkeypatch.setattr(server.mx.metal, "clear_cache", lambda: None)
+    monkeypatch.setattr(server.gc, "collect", lambda: None)
+
+    result = asyncio.run(
+        server.predict(
+            server.PredictionRequest(
+                model="fake-privacy-filter",
+                pipeline="token-classification",
+                text="Email alice@example.com",
+                decode_mode="argmax",
+            )
+        )
+    )
+
+    assert result["predictions"][0][2]["label"] == "S-private_email"
+    assert result["decode_mode"] == "argmax"
+    assert result["operating_point"] is None
+
+
+def test_predict_token_classification_rejects_unavailable_operating_point(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_model",
+        lambda model_name, pipeline_name, config_file: {
+            "model": _FakeModel(),
+            "tokenizer": _FakeTokenizer(),
+        },
+    )
+
+    with pytest.raises(server.HTTPException) as error:
+        asyncio.run(
+            server.predict(
+                server.PredictionRequest(
+                    model="fake-privacy-filter",
+                    pipeline="token-classification",
+                    text="Email alice@example.com",
+                    operating_point="high_precision",
+                )
+            )
+        )
+
+    assert error.value.status_code == 400
+    assert "no viterbi_calibration.json" in error.value.detail
 
 
 @pytest.mark.parametrize(
