@@ -222,14 +222,23 @@ class DataCollatorForMaskedLanguageModeling(DataCollator):
         # Create Mask
         probability_matrix = mx.random.uniform(shape=input_ids.shape) < self.mlm_probability
         
-        # Protect special tokens
-        special_tokens_mask = mx.array([
-            [1 if token_id in [self.tokenizer.cls_token_id, self.tokenizer.sep_token_id, self.tokenizer.pad_token_id]
-             else 0 for token_id in seq]
-            for seq in input_ids.tolist() 
-        ])
-        
-        probability_matrix = mx.where(special_tokens_mask, 0, probability_matrix)
+        # Protect special tokens without copying the device batch into Python.
+        special_tokens_mask = mx.zeros(input_ids.shape, dtype=mx.bool_)
+        for special_token_id in (
+            self.tokenizer.cls_token_id,
+            self.tokenizer.sep_token_id,
+            self.tokenizer.pad_token_id,
+        ):
+            if special_token_id is not None:
+                special_tokens_mask = mx.logical_or(
+                    special_tokens_mask,
+                    input_ids == special_token_id,
+                )
+
+        probability_matrix = mx.logical_and(
+            probability_matrix,
+            mx.logical_not(special_tokens_mask),
+        )
         
         # Create labels (-100 for unmasked)
         labels = mx.where(probability_matrix, input_ids, -100)

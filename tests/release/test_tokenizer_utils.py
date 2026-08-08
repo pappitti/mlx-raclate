@@ -1,13 +1,30 @@
 import json
 from unittest.mock import Mock, patch
 
+import pytest
 from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers
 
 from mlx_raclate.utils.tokenizer_utils import (
     _FIXED_MISTRAL_REGEX,
     _ensure_mistral_regex_fixed,
+    TokenizerWrapper,
     load_tokenizer,
 )
+
+
+pytestmark = pytest.mark.release
+
+
+def test_tokenizer_wrapper_is_callable():
+    tokenizer = Mock()
+    tokenizer.decode.return_value = ""
+    tokenizer.return_value = {"input_ids": [[1, 2, 3]]}
+
+    wrapper = TokenizerWrapper(tokenizer)
+
+    assert wrapper(["hello"], padding=True) == {"input_ids": [[1, 2, 3]]}
+    assert wrapper.raw_tokenizer is tokenizer
+    tokenizer.assert_called_once_with(["hello"], padding=True)
 
 
 def test_load_tokenizer_fixes_mistral_regex_by_default(tmp_path):

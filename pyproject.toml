@@ -8,14 +8,26 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
-    "datasets>=4.4.1",
-    "fastapi>=0.121.3",
     "huggingface-hub>=1.15.0",
-    "jinja2>=3.1.6",
     "mlx>=0.31.0",
+    "numpy>=2.0.2",
     "transformers>=5.8.1",
+]
+
+[project.optional-dependencies]
+train = ["datasets>=4.4.1"]
+serve = [
+    "fastapi>=0.121.3",
     "uvicorn>=0.38.0",
 ]
+all = [
+    "datasets>=4.4.1",
+    "fastapi>=0.121.3",
+    "uvicorn>=0.38.0",
+]
+
+[project.scripts]
+raclate = "mlx_raclate.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -23,9 +35,14 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "polars>=1.36.1",
+    "datasets>=4.4.1",
+    "fastapi>=0.121.3",
     "pytest>=9.0.1",
     "ruff>=0.14.5",
+    "uvicorn>=0.38.0",
+]
+reference = [
+    "polars>=1.36.1",
     "torch>=2.9.1",
     "torchvision>=0.24.1",
 ]

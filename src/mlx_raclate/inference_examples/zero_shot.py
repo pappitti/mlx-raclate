@@ -4,7 +4,7 @@ Zero-Shot Classification Inference Example
 Based on the AnswerAI paper: https://arxiv.org/html/2502.03793v2
 
 Example usage:
-    from tests.inference_examples.zero_shot import run_inference
+    from mlx_raclate.inference_examples.zero_shot import run_inference
     
     results = run_inference(
         model_path="answerdotai/ModernBERT-Large-Instruct",
@@ -39,7 +39,7 @@ def run_inference(
         - top_label: The most likely label
         - raw_tokens: Top-k raw token predictions
     """
-    from mlx_raclate.utils.utils import load
+    from mlx_raclate import load
     
     config = model_config or {}
     
@@ -135,7 +135,7 @@ ANSWER: [unused0][MASK]
 
 
 _EXAMPLE_CODE_TEMPLATE = '''import mlx.core as mx
-from mlx_raclate.utils.utils import load
+from mlx_raclate import load
 
 # Load model and tokenizer
 model, tokenizer = load(

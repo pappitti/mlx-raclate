@@ -1,16 +1,6 @@
-import importlib.util
-import sys
-from pathlib import Path
-
 import pytest
 
-
-SCRIPT_PATH = Path(__file__).parents[1] / "tools" / "evaluate_ner_models.py"
-SPEC = importlib.util.spec_from_file_location("evaluate_ner_models", SCRIPT_PATH)
-evaluate_ner_models = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-sys.modules[SPEC.name] = evaluate_ner_models
-SPEC.loader.exec_module(evaluate_ner_models)
+from mlx_raclate.ner import evaluate as evaluate_ner_models
 
 
 def test_discovers_all_phase_validation_files(tmp_path):

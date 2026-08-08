@@ -20,7 +20,7 @@ def run_inference(
         - embeddings: Tensor of shape [batch_size, hidden_size]
         - hidden_size: Dimension of embeddings
     """
-    from mlx_raclate.utils.utils import load
+    from mlx_raclate import load
     
     config = model_config or {}
     
@@ -34,7 +34,7 @@ def run_inference(
     max_length = getattr(model.config, "max_position_embeddings", 512)
     
     # Tokenize
-    tokens = tokenizer._tokenizer(
+    tokens = tokenizer(
         texts,
         return_tensors="mlx",
         padding=True,
@@ -57,7 +57,7 @@ def run_inference(
 
 
 _EXAMPLE_CODE_TEMPLATE = '''import mlx.core as mx
-from mlx_raclate.utils.utils import load
+from mlx_raclate import load
 
 # Load model and tokenizer
 model, tokenizer = load(
@@ -70,7 +70,7 @@ texts = {texts}
 
 # Tokenize
 max_length = getattr(model.config, "max_position_embeddings", 512)
-tokens = tokenizer._tokenizer(
+tokens = tokenizer(
     texts,
     return_tensors="mlx",
     padding=True,

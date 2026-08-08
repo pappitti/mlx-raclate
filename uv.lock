@@ -574,40 +574,64 @@ name = "mlx-raclate"
 version = "0.1.0b1"
 source = { editable = "." }
 dependencies = [
+    { name = "huggingface-hub" },
+    { name = "mlx" },
+    { name = "numpy" },
+    { name = "transformers" },
+]
+
+[package.optional-dependencies]
+all = [
     { name = "datasets" },
     { name = "fastapi" },
-    { name = "huggingface-hub" },
-    { name = "jinja2" },
-    { name = "mlx" },
-    { name = "transformers" },
     { name = "uvicorn" },
+]
+serve = [
+    { name = "fastapi" },
+    { name = "uvicorn" },
+]
+train = [
+    { name = "datasets" },
 ]
 
 [package.dev-dependencies]
 dev = [
-    { name = "polars" },
+    { name = "datasets" },
+    { name = "fastapi" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "uvicorn" },
+]
+reference = [
+    { name = "polars" },
     { name = "torch" },
     { name = "torchvision" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "datasets", specifier = ">=4.4.1" },
-    { name = "fastapi", specifier = ">=0.121.3" },
+    { name = "datasets", marker = "extra == 'all'", specifier = ">=4.4.1" },
+    { name = "datasets", marker = "extra == 'train'", specifier = ">=4.4.1" },
+    { name = "fastapi", marker = "extra == 'all'", specifier = ">=0.121.3" },
+    { name = "fastapi", marker = "extra == 'serve'", specifier = ">=0.121.3" },
     { name = "huggingface-hub", specifier = ">=1.15.0" },
-    { name = "jinja2", specifier = ">=3.1.6" },
     { name = "mlx", specifier = ">=0.31.0" },
+    { name = "numpy", specifier = ">=2.0.2" },
     { name = "transformers", specifier = ">=5.8.1" },
-    { name = "uvicorn", specifier = ">=0.38.0" },
+    { name = "uvicorn", marker = "extra == 'all'", specifier = ">=0.38.0" },
+    { name = "uvicorn", marker = "extra == 'serve'", specifier = ">=0.38.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "polars", specifier = ">=1.36.1" },
+    { name = "datasets", specifier = ">=4.4.1" },
+    { name = "fastapi", specifier = ">=0.121.3" },
     { name = "pytest", specifier = ">=9.0.1" },
     { name = "ruff", specifier = ">=0.14.5" },
+    { name = "uvicorn", specifier = ">=0.38.0" },
+]
+reference = [
+    { name = "polars", specifier = ">=1.36.1" },
     { name = "torch", specifier = ">=2.9.1" },
     { name = "torchvision", specifier = ">=0.24.1" },
 ]

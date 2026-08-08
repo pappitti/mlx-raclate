@@ -28,7 +28,7 @@ def run_inference(
         - probabilities: Raw probability tensor
         - id2label: Label mapping (if available)
     """
-    from mlx_raclate.utils.utils import load
+    from mlx_raclate import load
     
     # Merge user config with defaults
     config = {"is_regression": is_regression}
@@ -46,7 +46,7 @@ def run_inference(
     id2label = getattr(model.config, "id2label", None)
     
     # Tokenize
-    tokens = tokenizer._tokenizer(
+    tokens = tokenizer(
         texts,
         text_pairs,
         return_tensors="mlx",
@@ -98,7 +98,7 @@ def run_inference(
 
 
 _EXAMPLE_CODE_TEMPLATE = '''import mlx.core as mx
-from mlx_raclate.utils.utils import load
+from mlx_raclate import load
 
 # Load model and tokenizer
 model, tokenizer = load(
@@ -112,7 +112,7 @@ texts = {texts}
 
 # Tokenize
 max_length = getattr(model.config, "max_position_embeddings", 512)
-tokens = tokenizer._tokenizer(
+tokens = tokenizer(
     texts,
     return_tensors="mlx",
     padding=True,

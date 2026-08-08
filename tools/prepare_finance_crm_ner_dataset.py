@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from datasets import ClassLabel, Dataset, Features, Sequence as DatasetSequence, Value
-from huggingface_hub import snapshot_download
-
+from mlx_raclate.utils.hub import TOKENIZER_ALLOW_PATTERNS, get_model_path
 from mlx_raclate.utils.tokenizer_utils import load_tokenizer
 
 
@@ -455,24 +454,6 @@ def _model_context_length(model_path: Path) -> Optional[int]:
     return value if isinstance(value, int) else None
 
 
-def _get_model_path(path_or_hf_repo: str) -> Path:
-    model_path = Path(path_or_hf_repo)
-    if model_path.exists():
-        return model_path
-    return Path(
-        snapshot_download(
-            repo_id=path_or_hf_repo,
-            allow_patterns=[
-                "*.json",
-                "*.model",
-                "*.py",
-                "*.tiktoken",
-                "*.txt",
-            ],
-        )
-    )
-
-
 def _split_statistics(
     stats: Mapping[str, int],
     records: Sequence[Mapping[str, Any]],
@@ -542,14 +523,17 @@ def prepare_dataset(
         split_manifest,
     )
 
-    model_path = _get_model_path(model)
+    model_path = get_model_path(
+        model,
+        allow_patterns=TOKENIZER_ALLOW_PATTERNS,
+    )
     model_context_length = _model_context_length(model_path)
     if model_context_length is not None and max_length > model_context_length:
         raise ValueError(
             f"max_length={max_length} exceeds the model context window "
             f"of {model_context_length}"
         )
-    tokenizer = load_tokenizer(model_path, TOKENIZER_CONFIG)._tokenizer
+    tokenizer = load_tokenizer(model_path, TOKENIZER_CONFIG)
     if not getattr(tokenizer, "is_fast", False):
         raise ValueError("A fast tokenizer is required to align character offsets")
 
@@ -620,7 +604,7 @@ def prepare_dataset(
         "entity_types": list(ENTITY_TYPES),
         "labels": labels,
         "model": model,
-        "tokenizer_class": type(tokenizer).__name__,
+        "tokenizer_class": type(tokenizer.raw_tokenizer).__name__,
         "tokenizer_vocab_size": tokenizer.vocab_size,
         "tokenizer_config": TOKENIZER_CONFIG,
         "add_special_tokens": False,
@@ -664,7 +648,7 @@ def prepare_dataset(
     return manifest
 
 
-def main() -> None:
+def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Create model-tokenized BIOES datasets for the two-phase Finance/CRM "
@@ -690,7 +674,7 @@ def main() -> None:
         action="store_true",
         help="Overwrite this script's output files if they already exist.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     prepare_dataset(
         input_dir=Path(args.input_dir),
         output_dir=Path(args.output_dir),

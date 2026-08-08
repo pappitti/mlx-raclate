@@ -40,6 +40,34 @@ class EvaluationSource:
     local_file: Optional[Path] = None
 
 
+@dataclass(frozen=True)
+class EvaluationRequest:
+    """Inputs for a programmatic NER evaluation run."""
+
+    model: Sequence[str]
+    dataset: Sequence[str]
+    split: str = "validation"
+    batch_size: int = 1
+    max_length: Optional[int] = None
+    limit: Optional[int] = None
+    decode: str = "viterbi"
+    operating_point: str = "default"
+    labels: Optional[Path] = None
+    include_outside_in_macro: bool = False
+    output: Optional[Path] = None
+    logits_cache_dir: Optional[Path] = None
+    logits_cache_dtype: str = "float32"
+    overwrite: bool = False
+
+
+@dataclass(frozen=True)
+class EvaluationRun:
+    """Evaluation output and any reusable logits caches written by the run."""
+
+    benchmark: dict[str, Any]
+    logits_cache_paths: tuple[Path, ...]
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -328,7 +356,7 @@ def evaluate_dataset(
             )
 
     collator = DataCollatorForTokenClassification(
-        tokenizer=tokenizer._tokenizer,
+        tokenizer=tokenizer,
         max_length=max_length,
     )
     predictions = {decode_mode: [] for decode_mode in decode_modes}
@@ -423,8 +451,9 @@ def _logits_cache_path(
     return cache_dir / model_name / f"{_cache_component(source_name)}.npz"
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        prog="raclate ner evaluate",
         description=(
             "Evaluate one or more NER checkpoints with token-level and exact-boundary "
             "precision, recall, and F1 metrics."
@@ -466,7 +495,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--operating-point",
         default="default",
-        help="Viterbi calibration operating point stored with the checkpoint.",
+        help=(
+            "Evaluator-side Viterbi decoder profile stored with the checkpoint; "
+            "this is not passed to the model."
+        ),
     )
     parser.add_argument(
         "--labels",
@@ -484,7 +516,7 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Write one reusable .npz logits cache per model/dataset. These caches can "
-            "be searched by tools/calibrate_ner_viterbi.py without rerunning inference."
+            "be searched by 'raclate ner calibrate' without rerunning inference."
         ),
     )
     parser.add_argument(
@@ -498,86 +530,96 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow replacing an existing --output file and logits caches.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = _parse_args()
-    if args.output is not None and args.output.exists() and not args.overwrite:
-        raise FileExistsError(f"{args.output} exists; pass --overwrite to replace it")
-    if args.labels is not None and not args.labels.is_file():
-        raise FileNotFoundError(f"Labels file not found: {args.labels}")
+def run_evaluation(
+    request: EvaluationRequest,
+    *,
+    emit_progress: bool = True,
+    emit_json: bool = True,
+) -> EvaluationRun:
+    """Evaluate checkpoints and return metrics plus generated cache paths."""
+    if request.output is not None and request.output.exists() and not request.overwrite:
+        raise FileExistsError(
+            f"{request.output} exists; pass --overwrite to replace it"
+        )
+    if request.labels is not None and not request.labels.is_file():
+        raise FileNotFoundError(f"Labels file not found: {request.labels}")
 
-    sources = discover_evaluation_sources(args.dataset, args.split)
+    sources = discover_evaluation_sources(request.dataset, request.split)
     loaded_datasets = []
     for source in sources:
-        dataset = load_evaluation_dataset(source, args.split)
-        if args.limit is not None:
-            dataset = dataset.select(range(min(args.limit, len(dataset))))
+        dataset = load_evaluation_dataset(source, request.split)
+        if request.limit is not None:
+            dataset = dataset.select(range(min(request.limit, len(dataset))))
         if not len(dataset):
             raise ValueError(f"Dataset {source.name!r} is empty")
         dataset_labels, label_source = resolve_dataset_labels(
-            dataset, source, args.labels
+            dataset, source, request.labels
         )
         loaded_datasets.append((source, dataset, dataset_labels, label_source))
 
     benchmark = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "split": args.split,
-        "decode": args.decode,
-        "operating_point": args.operating_point,
+        "split": request.split,
+        "decode": request.decode,
+        "operating_point": request.operating_point,
         "results": [],
     }
+    written_cache_paths = []
 
     import mlx.core as mx
 
-    from mlx_raclate.utils.utils import load
+    from mlx_raclate import load
 
-    for model_path in args.model:
+    for model_path in request.model:
         cache_paths = {
             source.name: _logits_cache_path(
-                args.logits_cache_dir,
+                request.logits_cache_dir,
                 model_path,
                 source.name,
             )
             for source, _, _, _ in loaded_datasets
-        } if args.logits_cache_dir is not None else {}
+        } if request.logits_cache_dir is not None else {}
         existing_caches = [
             path for path in cache_paths.values() if path.exists()
         ]
-        if existing_caches and not args.overwrite:
+        if existing_caches and not request.overwrite:
             raise FileExistsError(
                 f"{existing_caches[0]} exists; pass --overwrite to replace logits caches"
             )
 
-        print(f"Loading {model_path}...")
+        if emit_progress:
+            print(f"Loading {model_path}...")
         model, tokenizer = load(model_path, pipeline="token-classification")
         label_names, model_label2id = _model_label_mapping(model)
         transition_biases = {}
-        if args.decode in {"viterbi", "both"}:
+        if request.decode in {"viterbi", "both"}:
             transition_biases = viterbi_transition_biases_from_calibration(
                 getattr(model, "viterbi_calibration", None),
-                operating_point=args.operating_point,
+                operating_point=request.operating_point,
             )
         max_length = (
-            args.max_length
+            request.max_length
             or getattr(model.config, "max_position_embeddings", None)
             or 512
         )
 
         for source, dataset, dataset_labels, label_source in loaded_datasets:
-            print(f"Evaluating {source.name} ({len(dataset)} examples)...")
+            if emit_progress:
+                print(f"Evaluating {source.name} ({len(dataset)} examples)...")
             cache_builder = None
-            if args.logits_cache_dir is not None:
+            if request.logits_cache_dir is not None:
                 cache_builder = LogitsCacheBuilder(
                     label_names,
-                    logits_dtype=args.logits_cache_dtype,
+                    logits_dtype=request.logits_cache_dtype,
                     metadata={
                         "model": model_path,
                         "dataset": source.name,
                         "dataset_location": source.location,
-                        "split": args.split,
+                        "split": request.split,
                         "max_length": max_length,
                     },
                 )
@@ -588,11 +630,11 @@ def main() -> None:
                 dataset_labels=dataset_labels,
                 label_names=label_names,
                 model_label2id=model_label2id,
-                batch_size=args.batch_size,
+                batch_size=request.batch_size,
                 max_length=max_length,
-                decode_modes=_decode_modes(args.decode),
+                decode_modes=_decode_modes(request.decode),
                 transition_biases=transition_biases,
-                include_outside_in_macro=args.include_outside_in_macro,
+                include_outside_in_macro=request.include_outside_in_macro,
                 logits_cache_builder=cache_builder,
             )
             result.update(
@@ -606,33 +648,62 @@ def main() -> None:
                     ),
                     "model_labels": label_names,
                     "max_length": max_length,
-                    "batch_size": args.batch_size,
+                    "batch_size": request.batch_size,
                     "logits_cache": (
                         str(cache_paths[source.name])
-                        if args.logits_cache_dir is not None
+                        if request.logits_cache_dir is not None
                         else None
                     ),
                 }
             )
             benchmark["results"].append(result)
-            _print_summary(result)
+            if emit_progress:
+                _print_summary(result)
             if cache_builder is not None:
                 cache_path = cache_paths[source.name]
                 cache_builder.save(cache_path)
-                print(f"Wrote logits cache to {cache_path}")
+                written_cache_paths.append(cache_path)
+                if emit_progress:
+                    print(f"Wrote logits cache to {cache_path}")
 
         del model
         del tokenizer
         gc.collect()
         mx.clear_cache()
 
-    if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with args.output.open("w", encoding="utf-8") as handle:
+    if request.output is not None:
+        request.output.parent.mkdir(parents=True, exist_ok=True)
+        with request.output.open("w", encoding="utf-8") as handle:
             json.dump(benchmark, handle, indent=2)
-        print(f"Wrote complete metrics to {args.output}")
-    else:
+        if emit_progress:
+            print(f"Wrote complete metrics to {request.output}")
+    elif emit_json:
         print(json.dumps(benchmark, indent=2))
+    return EvaluationRun(
+        benchmark=benchmark,
+        logits_cache_paths=tuple(written_cache_paths),
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> EvaluationRun:
+    args = _parse_args(argv)
+    request = EvaluationRequest(
+        model=tuple(args.model),
+        dataset=tuple(args.dataset),
+        split=args.split,
+        batch_size=args.batch_size,
+        max_length=args.max_length,
+        limit=args.limit,
+        decode=args.decode,
+        operating_point=args.operating_point,
+        labels=args.labels,
+        include_outside_in_macro=args.include_outside_in_macro,
+        output=args.output,
+        logits_cache_dir=args.logits_cache_dir,
+        logits_cache_dtype=args.logits_cache_dtype,
+        overwrite=args.overwrite,
+    )
+    return run_evaluation(request)
 
 
 if __name__ == "__main__":

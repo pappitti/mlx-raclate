@@ -1,63 +1,10 @@
 import argparse
 import time
+from collections.abc import Sequence
 
-from mlx_raclate.utils.utils import load, PIPELINES
-from mlx_raclate.tuner.datasets import load_dataset, DatasetArgs
-from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
+from mlx_raclate.registry import PIPELINES
 
-train_tested = {
-    "text-classification": [
-        {"model": "Qwen/Qwen3-Embedding-0.6B", "special_model_config" : {}, "special_trainer_config" : {"use_chat_template": True}, "special_training_args" : {"max_length":8192}},
-        {"model": "answerdotai/ModernBERT-base", "special_model_config" : {}, "special_training_args" : {}},
-        {"model": "LiquidAI/LFM2-350M", "special_model_config" : {"use_chat_template": True}, "special_training_args" : {}},
-        {"model": "google/t5gemma-b-b-ul2", "special_model_config" : {}, "special_training_args" : {"max_length":8192}}, # failed
-        {"model": "google/embeddinggemma-300m", "special_model_config" : {}, "special_training_args" : {}} # failed
-    ],
-}
 
-# LFM2 CHAT TEMPLATE
-FORCED_CHAT_TEMPLATE = """
-{- bos_token -}}
-{%- set system_prompt = "" -%}
-{%- set ns = namespace(system_prompt="") -%}
-{%- if messages[0]["role"] == "system" -%}
-	{%- set ns.system_prompt = messages[0]["content"] -%}
-	{%- set messages = messages[1:] -%}
-{%- endif -%}
-{%- if tools -%}
-	{%- set ns.system_prompt = ns.system_prompt + ("\n" if ns.system_prompt else "") + "List of tools: <|tool_list_start|>[" -%}
-	{%- for tool in tools -%}
-		{%- if tool is not string -%}
-            {%- set tool = tool | tojson -%}
-		{%- endif -%}
-		{%- set ns.system_prompt = ns.system_prompt + tool -%}
-        {%- if not loop.last -%}
-            {%- set ns.system_prompt = ns.system_prompt + ", " -%}
-        {%- endif -%}
-	{%- endfor -%}
-	{%- set ns.system_prompt = ns.system_prompt + "]<|tool_list_end|>" -%}
-{%- endif -%}
-{%- if ns.system_prompt -%}
-	{{- "<|im_start|>system\n" + ns.system_prompt + "<|im_end|>\n" -}}
-{%- endif -%}
-{%- for message in messages -%}
-	{{- "<|im_start|>" + message["role"] + "\n" -}}
-	{%- set content = message["content"] -%}
-	{%- if content is not string -%}
-		{%- set content = content | tojson -%}
-	{%- endif -%}
-	{%- if message["role"] == "tool" -%}
-		{%- set content = "<|tool_response_start|>" + content + "<|tool_response_end|>" -%}
-	{%- endif -%}
-	{{- content + "<|im_end|>\n" -}}
-{%- endfor -%}
-{%- if add_generation_prompt -%}
-	{{- "<|im_start|>assistant\n" -}}
-{%- endif -%}
-"""
-
-DEFAULT_MODEL_PATH : str = "./trained_models/Qwen3-Embedding-0.6B_text-classification_20251219_001137/checkpoint-39939" #"Qwen/Qwen3-Embedding-0.6B" "answerdotai/ModernBERT-base" "google/t5gemma-b-b-ul2"
-DEFAULT_DATASET : str = "data/wines" # can be a local path or HF "argilla/synthetic-domain-text-classification" "data/20251205_1125"
 DEFAULT_TASK_TYPE : str = "text-classification"
 DEFAULT_BATCH_SIZE : int = 8
 DEFAULT_GRADIENT_ACCUMULATION_STEPS : int = 8
@@ -73,10 +20,13 @@ DEFAULT_LOGGING_STEPS : int = 64
 DEFAULT_EVAL_BATCH_SIZE : int = 8
 DEFAULT_CACHE_CLEAR_STEPS : int = 1
 
-def init_args():
-    parser = argparse.ArgumentParser(description="Train or evaluate a classification model using MLX Raclate.")
+def init_args(argv: Sequence[str] | None = None):
+    parser = argparse.ArgumentParser(
+        prog="raclate train",
+        description="Train or evaluate a classification model using MLX Raclate.",
+    )
     # Dataset Init Params
-    parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET, help="Local path or HF identifier of the dataset to use for training/evaluation.")
+    parser.add_argument("--dataset", type=str, required=True, help="Local path or HF identifier of the dataset to use for training/evaluation.")
     parser.add_argument("--text_field", type=str, default=None, help="Name of the text field in the dataset (if different from default).")
     parser.add_argument("--text_pair_field", type=str, default=None, help="Name of the text pair field in the dataset (if applicable and different from default).")
     parser.add_argument("--label_field", type=str, default=None, help="Name of the label field in the dataset (if different from default).")
@@ -87,14 +37,17 @@ def init_args():
     parser.add_argument("--test_limit", type=int, default=None, help="Limit the number of test examples after loading and split creation.")
 
     # Trainer / End Model Init Params
-    parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH, help="Path to the pre-trained model or model identifier from a model hub.")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to the pre-trained model or model identifier from a model hub.")
     parser.add_argument("--dtype", choices=("auto", "float32", "float16", "bfloat16"), help="Override model_config dtype. If omitted, use the checkpoint config.")
-    parser.add_argument("--task_type", type=str, default=DEFAULT_TASK_TYPE, help="Type of task (default: text-classification).")
+    parser.add_argument("--task_type", choices=PIPELINES, default=DEFAULT_TASK_TYPE, help="Type of task (default: text-classification).")
     parser.add_argument("--is_regression", default=False, action='store_true', help="Set this flag if the task is regression.")
     parser.add_argument("--use_late_interaction", default=False, action='store_true', help="Set this flag to use late interaction for retrieval tasks (if applicable).")
     parser.add_argument("--eval_only", dest="train", action='store_false', help="Set this flag to skip training and only evaluate.")
     parser.add_argument("--use_chat_template", default=False, action='store_true', help="Use chat template for decoder models when there are text pairs.")
     parser.add_argument("--force_separator", type=str, default=None, help="Force a specific separator between text pairs for decoder models, if not using chat template.")
+    parser.add_argument("--base_model", type=str, default=None, help="Upstream Hugging Face model ID recorded in checkpoint model cards. Required with --push_to_hub.")
+    parser.add_argument("--hub_repo_id", type=str, default=None, help="Destination Hugging Face model repository, for example org/model-name.")
+    parser.add_argument("--push_to_hub", default=False, action="store_true", help="Upload each saved checkpoint to --hub_repo_id.")
 
     # Training Params
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size for training.")
@@ -124,10 +77,19 @@ def init_args():
     parser.set_defaults(train=True)
     parser.set_defaults(grad_checkpoint=True)
     parser.set_defaults(multi_precision=True)
-    return parser.parse_args()
+    arguments = parser.parse_args(argv)
+    if arguments.push_to_hub and not arguments.hub_repo_id:
+        parser.error("--hub_repo_id is required with --push_to_hub")
+    if arguments.push_to_hub and not arguments.base_model:
+        parser.error("--base_model is required with --push_to_hub")
+    return arguments
 
-def main():
-    args = init_args()
+def main(argv: Sequence[str] | None = None):
+    args = init_args(argv)
+
+    from mlx_raclate.tuner.datasets import DatasetArgs, load_dataset
+    from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
+    from mlx_raclate import load
 
     # Dataset Params
     dataset : str = args.dataset
@@ -149,6 +111,9 @@ def main():
     train : bool = args.train
     use_chat_template : bool = args.use_chat_template
     force_separator : str = args.force_separator
+    base_model : str = args.base_model
+    hub_repo_id : str = args.hub_repo_id
+    push_to_hub : bool = args.push_to_hub
 
     # Training Params
     batch_size : int = args.batch_size
@@ -180,9 +145,6 @@ def main():
 
     print(f"Training Mode : {train}")
 
-    if task_type not in PIPELINES:
-        raise ValueError(f"Task type {task_type} not supported. Choose from {PIPELINES.items()}")
-    
     output_dir : str =  args.output_dir if args.output_dir else model_path.split("/")[-1] + "_" + task_type + "_" + time.strftime("%Y%m%d_%H%M%S")
 
     # Load datasets
@@ -227,8 +189,11 @@ def main():
             {"role": "user", "content": "test_prompt"},
             {"role": "assistant", "content": "test_response"}
         ]
-        if not getattr(tokenizer, "chat_template", None) and FORCED_CHAT_TEMPLATE:
-            tokenizer.chat_template = FORCED_CHAT_TEMPLATE
+        if not getattr(tokenizer, "chat_template", None):
+            raise ValueError(
+                "--use_chat_template requires the selected tokenizer to define a "
+                "chat template. Use --force_separator for plain text pairs."
+            )
         
         templated = tokenizer.apply_chat_template(messages, tokenize=False)
         print("Chat template working:", templated)
@@ -258,7 +223,9 @@ def main():
         save_total_limit=None,
         grad_checkpoint=grad_checkpoint,
         cache_clear_steps=cache_clear_steps,
-        push_to_hub=False,
+        push_to_hub=push_to_hub,
+        hub_repo_id=hub_repo_id,
+        base_model=base_model,
     )
 
     # Initialize trainer

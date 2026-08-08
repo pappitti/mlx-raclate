@@ -24,7 +24,7 @@ def run_inference(
         - mask_position: Position of the mask token
         - logits: Raw logits
     """
-    from mlx_raclate.utils.utils import load
+    from mlx_raclate import load
     
     config = model_config or {}
     
@@ -82,7 +82,7 @@ def run_inference(
 
 
 _EXAMPLE_CODE_TEMPLATE = '''import mlx.core as mx
-from mlx_raclate.utils.utils import load
+from mlx_raclate import load
 
 # Load model and tokenizer
 model, tokenizer = load(

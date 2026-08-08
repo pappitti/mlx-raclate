@@ -1,3 +1,5 @@
+"""Checkpoint-layout compatibility contracts for supported remote-code models."""
+
 import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten

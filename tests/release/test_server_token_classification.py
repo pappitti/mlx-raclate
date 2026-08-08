@@ -6,6 +6,9 @@ from fastapi.testclient import TestClient
 from mlx_raclate.utils import server
 
 
+pytestmark = [pytest.mark.release, pytest.mark.integration]
+
+
 class _FakeConfig:
     max_position_embeddings = 64
     id2label = {"0": "O", "1": "S-private_email"}

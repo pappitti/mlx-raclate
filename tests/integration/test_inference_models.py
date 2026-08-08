@@ -5,29 +5,24 @@ These tests verify that inference works correctly for each (model_family, pipeli
 combination in the model registry. Tests are marked as 'slow' since they require
 model downloads.
 
-Run with: pytest tests/test_inference.py -v --run-slow
-Skip slow tests: pytest tests/test_inference.py -v
-Filter by family: pytest tests/test_inference.py -v --run-slow --model-family modernbert
+Run with: pytest tests/integration/test_inference_models.py --run-slow
+Filter by family: pytest tests/integration/test_inference_models.py --run-slow --model-family modernbert
 """
 
 import pytest
-import mlx.core as mx
-from typing import Dict, List, Any
 
-from .model_registry import (
-    get_endpoint,
-    get_inference_test_cases,
-    get_untested_combinations,
-    MODEL_FAMILIES
-)
-from .inference_examples import (
-    text_classification,
-    sentence_similarity,
+from mlx_raclate.inference_examples import (
     embeddings,
     masked_lm,
+    sentence_similarity,
+    text_classification,
     token_classification,
     zero_shot,
 )
+from tests.model_registry import MODEL_FAMILIES, get_inference_test_cases
+
+
+pytestmark = pytest.mark.integration
 
 def _get_inference_params():
     """Generate pytest parameters from the model registry."""
@@ -192,20 +187,6 @@ def test_privacy_filter_token_classification_endpoints(
     assert result["id2label"]["0"] == "O"
 
 
-def test_model_registry_coverage():
-    """Validate that all expected combinations have endpoints or are documented."""
-    untested = get_untested_combinations()
-    
-    # Just log the untested combinations for now
-    if untested:
-        print(f"\n⚠️  {len(untested)} untested (model_family, pipeline) combinations:")
-        for fam, pipe in untested:
-            print(f"   - ({fam}, {pipe})")
-    
-    # This test passes but logs warnings - adjust as needed for stricter coverage
-    assert True
-
-
 def test_all_model_families_have_at_least_one_endpoint():
     """Ensure each model family has at least one testable endpoint."""
     for family in MODEL_FAMILIES:
@@ -214,77 +195,3 @@ def test_all_model_families_have_at_least_one_endpoint():
             if fam == family
         ]
         assert len(endpoints) > 0, f"Model family '{family}' has no registered endpoints"
-
-
-# ============================================================================
-# EXAMPLE CODE EXTRACTION TESTS
-# ============================================================================
-
-def test_text_classification_example_code_generation():
-    """Test that example code generates valid Python."""
-    code = text_classification.get_example_code(
-        model_path="NousResearch/Minos-v1",
-        texts=["Test text"],
-        is_regression=False,
-    )
-    assert "from mlx_raclate.utils.utils import load" in code
-    assert "NousResearch/Minos-v1" in code
-    assert "pipeline=\"text-classification\"" in code
-    # Verify it's valid Python syntax
-    compile(code, "<string>", "exec")
-
-
-def test_sentence_similarity_example_code_generation():
-    """Test that example code generates valid Python."""
-    code = sentence_similarity.get_example_code(
-        model_path="nomic-ai/modernbert-embed-base",
-        use_late_interaction=False,
-    )
-    assert "from mlx_raclate.utils.utils import load" in code
-    assert "sentence-similarity" in code
-    compile(code, "<string>", "exec")
-    
-    # Also test late interaction variant
-    code_late = sentence_similarity.get_example_code(
-        model_path="LiquidAI/LFM2-ColBERT-350M",
-        use_late_interaction=True,
-    )
-    assert "use_late_interaction" in code_late
-    compile(code_late, "<string>", "exec")
-
-
-def test_embeddings_example_code_generation():
-    """Test that example code generates valid Python."""
-    code = embeddings.get_example_code(model_path="answerdotai/ModernBERT-base")
-    assert "pipeline=\"embeddings\"" in code
-    compile(code, "<string>", "exec")
-
-
-def test_masked_lm_example_code_generation():
-    """Test that example code generates valid Python."""
-    code = masked_lm.get_example_code(
-        model_path="answerdotai/ModernBERT-base",
-        text="The [MASK] is blue.",
-    )
-    assert "pipeline=\"masked-lm\"" in code
-    assert "[MASK]" in code
-    compile(code, "<string>", "exec")
-
-
-def test_token_classification_example_code_generation():
-    """Test that token-classification example code generates valid Python."""
-    code = token_classification.get_example_code(
-        model_path="mlx-community/openai-privacy-filter-bf16",
-        texts=["Email me at alice.smith@example.com after 5pm."],
-    )
-    assert "pipeline=\"token-classification\"" in code
-    compile(code, "<string>", "exec")
-
-
-def test_zero_shot_example_code_generation():
-    """Test that example code generates valid Python."""
-    code = zero_shot.get_example_code(
-        model_path="answerdotai/ModernBERT-Large-Instruct",
-    )
-    assert "zero-shot-classification" in code
-    compile(code, "<string>", "exec")

@@ -1,7 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Any, Literal
-import re
-from functools import partial
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn

@@ -1,5 +1,5 @@
-from typing import Dict, List, Any, Optional
 import random
+from typing import Any, Dict, List
 
 # ============================================================================
 # DUMMY DATASET GENERATORS
@@ -9,7 +9,6 @@ def generate_classification_dataset(
     n_samples: int = 20,
     n_classes: int = 3,
     text_prefix: str = "Sample text",
-    seed: int = 42,
 ) -> Dict[str, List[Any]]:
     """
     Generate a dummy text classification dataset.
@@ -18,38 +17,13 @@ def generate_classification_dataset(
         n_samples: Number of samples to generate
         n_classes: Number of classes
         text_prefix: Prefix for generated texts
-        seed: Random seed for reproducibility
-        
     Returns:
         Dict with "text" and "label" keys, each mapping to a list of values
         (HF dataset batch format)
     """
-    random.seed(seed)
     return {
         "text": [f"{text_prefix} {i}: This is a sample for classification testing." for i in range(n_samples)],
         "label": [i % n_classes for i in range(n_samples)],
-    }
-
-
-def generate_regression_dataset(
-    n_samples: int = 20,
-    seed: int = 42,
-) -> Dict[str, List[Any]]:
-    """
-    Generate a dummy regression dataset.
-    
-    Args:
-        n_samples: Number of samples to generate
-        seed: Random seed for reproducibility
-        
-    Returns:
-        Dict with "text" and "label" keys, each mapping to a list of values
-        (HF dataset batch format)
-    """
-    random.seed(seed)
-    return {
-        "text": [f"Sample {i}: This is a sample for regression testing." for i in range(n_samples)],
-        "label": [random.uniform(0.0, 1.0) for i in range(n_samples)],
     }
 
 
@@ -86,20 +60,16 @@ def generate_similarity_dataset(
 
 def generate_triplet_dataset(
     n_samples: int = 20,
-    seed: int = 42,
 ) -> Dict[str, List[Any]]:
     """
     Generate a dummy triplet dataset (anchor, positive, negative).
     
     Args:
         n_samples: Number of samples to generate
-        seed: Random seed for reproducibility
-        
     Returns:
         Dict with "text", "text_pair", and "negative" keys
         (HF dataset batch format)
     """
-    random.seed(seed)
     triplets = [
         ("What is MLX?", "MLX is an array framework", "The weather is nice today"),
         ("How does Python work?", "Python is an interpreted language", "I like pizza"),
@@ -115,19 +85,15 @@ def generate_triplet_dataset(
 
 def generate_mlm_dataset(
     n_samples: int = 20,
-    seed: int = 42,
 ) -> Dict[str, List[Any]]:
     """
     Generate a dummy masked language modeling dataset.
     
     Args:
         n_samples: Number of samples to generate
-        seed: Random seed for reproducibility
-        
     Returns:
         Dict with "text" key (HF dataset batch format)
     """
-    random.seed(seed)
     templates = [
         "The capital of France is Paris and it has many tourists.",
         "Machine learning is a subset of artificial intelligence.",
@@ -144,7 +110,6 @@ def generate_mlm_dataset(
 def generate_ner_dataset(
     n_samples: int = 20,
     n_tags: int = 5,
-    seed: int = 42,
 ) -> Dict[str, List[Any]]:
     """
     Generate a dummy NER/token classification dataset.
@@ -152,14 +117,11 @@ def generate_ner_dataset(
     Args:
         n_samples: Number of samples to generate
         n_tags: Number of unique tags (e.g., B-PER, I-PER, O, etc.)
-        seed: Random seed for reproducibility
-        
     Returns:
         Dict with "text" (list of token lists) and "labels" (list of label lists)
         Note: 'text' contains pre-tokenized inputs as expected by DataCollatorForTokenClassification
         (HF dataset batch format)
     """
-    random.seed(seed)
     sample_sentences = [
         ["John", "works", "at", "Apple", "in", "California", "."],
         ["The", "Eiffel", "Tower", "is", "in", "Paris", "."],
@@ -194,37 +156,3 @@ def generate_label2id(n_classes: int = 3) -> Dict[str, int]:
     id2label = generate_id2label(n_classes)
     return {v: int(k) for k, v in id2label.items()}
 
-
-def generate_ner_id2label(n_tags: int = 5) -> Dict[str, str]:
-    """Generate id2label mapping for NER."""
-    tags = ["O", "B-PER", "I-PER", "B-ORG", "B-LOC", "I-ORG", "I-LOC"]
-    return {str(i): tags[i % len(tags)] for i in range(n_tags)}
-
-
-# ============================================================================
-# TEST INPUT GENERATORS
-# ============================================================================
-
-def get_sample_texts(n: int = 4) -> List[str]:
-    """Get sample texts for inference testing."""
-    texts = [
-        "What is MLX?",
-        "How does Apple Silicon work?",
-        "I really enjoyed this movie!",
-        "The weather is terrible today.",
-        "Machine learning is fascinating.",
-        "Python is a great programming language.",
-    ]
-    return texts[:n]
-
-
-def get_sample_documents(n: int = 5) -> List[str]:
-    """Get sample documents for similarity testing."""
-    docs = [
-        "MLX is an array framework for machine learning on Apple Silicon.",
-        "Apple Silicon uses ARM architecture with unified memory.",
-        "Python is a popular programming language for data science.",
-        "The movie was absolutely fantastic and I loved every minute.",
-        "Today's weather forecast predicts rain and thunderstorms.",
-    ]
-    return docs[:n]

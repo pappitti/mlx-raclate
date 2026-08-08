@@ -1,5 +1,6 @@
 import json
 from dataclasses import dataclass
+from inspect import signature
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -11,10 +12,15 @@ from mlx_raclate.models.base import BaseModelArgs, RaclateBaseModel
 from mlx_raclate.utils.utils import (
     _align_checkpoint_dtypes,
     _determine_model_dtype,
+    _get_classes,
     _prepare_quantized_modules,
     _resolve_model_dtype,
+    load,
     load_model,
 )
+
+
+pytestmark = pytest.mark.release
 
 
 @dataclass
@@ -136,6 +142,54 @@ def test_load_model_quantizes_structure_before_strict_loading(tmp_path):
     assert isinstance(model.linear, nn.QuantizedLinear)
     assert config["dtype"] == "float32"
     assert model.config.dtype == "float32"
+
+
+def test_loader_configuration_defaults_are_not_mutable():
+    assert signature(load_model).parameters["model_config"].default is None
+    assert signature(load).parameters["model_config"].default is None
+    assert signature(load).parameters["tokenizer_config"].default is None
+
+
+def test_load_rejects_unsupported_adapter_path_before_model_resolution():
+    with pytest.raises(NotImplementedError, match="Adapter loading"):
+        load("unused", adapter_path="unused-adapter")
+
+
+def test_loader_rejects_placeholder_head_before_importing_it():
+    with pytest.raises(ValueError, match="not implemented"):
+        _get_classes({"model_type": "colbert_zero"}, pipeline="masked-lm")
+
+
+@pytest.mark.parametrize(
+    ("sentence_transformer", "expected_pipeline"),
+    [
+        (False, "embeddings"),
+        (True, "sentence-transformers"),
+    ],
+)
+def test_loader_defaults_pipeline_before_checkpoint_io(
+    tmp_path,
+    sentence_transformer,
+    expected_pipeline,
+):
+    with open(tmp_path / "config.json", "w") as config_file:
+        json.dump({"model_type": "test"}, config_file)
+    if sentence_transformer:
+        with open(
+            tmp_path / "config_sentence_transformers.json",
+            "w",
+        ) as sentence_transformer_file:
+            json.dump({}, sentence_transformer_file)
+
+    class PipelineResolved(Exception):
+        pass
+
+    def capture_pipeline(**kwargs):
+        assert kwargs["pipeline"] == expected_pipeline
+        raise PipelineResolved
+
+    with pytest.raises(PipelineResolved):
+        load_model(tmp_path, get_model_classes=capture_pipeline)
 
 
 def test_resize_token_embeddings_preserves_model_dtype():

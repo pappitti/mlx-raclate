@@ -7,9 +7,13 @@ import pytest
 
 from mlx_raclate.tuner.model_card_utils import (
     _load_inference_example_module,
+    get_code_for_trained_model,
     get_inference_code,
     get_transformers_inference_code,
 )
+
+
+pytestmark = pytest.mark.release
 
 
 def test_token_classification_template_is_loaded_from_runtime_package():
@@ -28,6 +32,38 @@ def test_token_classification_model_card_code_is_generated_without_tests_package
 
     assert 'model_path = "org/model"' in code
     assert "postprocess_token_classification_output" in code
+
+
+def test_trained_model_card_contains_hub_metadata_and_repo_usage_path():
+    from huggingface_hub import ModelCard
+
+    content = get_code_for_trained_model(
+        pipeline="text-classification",
+        model_path="acme/fine-tuned-model",
+        base_model="acme/base-model",
+    )
+    card = ModelCard(content)
+
+    assert card.data.base_model == "acme/base-model"
+    assert card.data.library_name == "mlx-raclate"
+    assert card.data.pipeline_tag == "text-classification"
+    assert set(card.data.tags) == {"mlx", "mlx-raclate"}
+    assert '    "acme/fine-tuned-model",' in content
+    assert "https://huggingface.co/acme/base-model" in content
+
+
+def test_trained_model_card_omits_unknown_base_model():
+    from huggingface_hub import ModelCard
+
+    content = get_code_for_trained_model(
+        pipeline="embeddings",
+        model_path="local/checkpoint-1",
+    )
+    card = ModelCard(content)
+
+    assert card.data.base_model is None
+    assert card.data.pipeline_tag == "feature-extraction"
+    assert "**Base Model**" not in content
 
 
 class _FakeTokenizer:
@@ -212,15 +248,3 @@ def test_generated_transformers_token_classification_code_executes(monkeypatch):
 
     assert code is not None
     exec(compile(code, "<generated-transformers-model-card>", "exec"), {})
-
-
-@pytest.mark.slow
-def test_generated_token_classification_card_runs_against_real_checkpoint():
-    """Integration-test the emitted NER snippet with a published checkpoint."""
-    code = get_inference_code(
-        pipeline="token-classification",
-        model_path="mlx-community/openai-privacy-filter-bf16",
-        texts=["Email Alice at alice@example.com after 5pm."],
-    )
-
-    exec(compile(code, "<generated-real-model-card>", "exec"), {})

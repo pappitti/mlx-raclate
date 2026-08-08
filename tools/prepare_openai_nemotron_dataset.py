@@ -3,12 +3,12 @@ import ast
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from datasets import ClassLabel, Features, Sequence, Value, load_dataset
+from datasets import ClassLabel, Features, Sequence as DatasetSequence, Value, load_dataset
 
+from mlx_raclate.utils.hub import TOKENIZER_ALLOW_PATTERNS, get_model_path
 from mlx_raclate.utils.tokenizer_utils import load_tokenizer
-from mlx_raclate.utils.utils import get_model_path
 
 
 BASE_LABELS = (
@@ -188,9 +188,9 @@ def _prepare_split(
 
     features = Features(
         {
-            "input_ids": Sequence(Value("int32")),
-            "attention_mask": Sequence(Value("int8")),
-            "labels": Sequence(ClassLabel(names=LABELS)),
+            "input_ids": DatasetSequence(Value("int32")),
+            "attention_mask": DatasetSequence(Value("int8")),
+            "labels": DatasetSequence(ClassLabel(names=LABELS)),
             "num_conflicts": Value("int32"),
             "num_skipped_spans": Value("int32"),
         }
@@ -238,7 +238,7 @@ def _optional_positive_int(value: str) -> Optional[int]:
     return parsed
 
 
-def main():
+def main(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser(
         description="Prepare a model-tokenized Nemotron PII dataset for token classification."
     )
@@ -247,10 +247,13 @@ def main():
     parser.add_argument("--train-limit", type=_optional_positive_int, default=100_000)
     parser.add_argument("--validation-limit", type=_optional_positive_int, default=5_000)
     parser.add_argument("--max-length", type=_optional_positive_int, default=256)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    model_path = get_model_path(args.model)
-    tokenizer = load_tokenizer(model_path)._tokenizer
+    model_path = get_model_path(
+        args.model,
+        allow_patterns=TOKENIZER_ALLOW_PATTERNS,
+    )
+    tokenizer = load_tokenizer(model_path)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

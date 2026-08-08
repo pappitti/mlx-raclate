@@ -1,199 +1,39 @@
-"""
-Training Tests for mlx-raclate
-
-These tests verify that training works correctly for each (model_family, pipeline)
-combination. Tests use dummy datasets and run minimal training steps.
-
-Run with: pytest tests/test_training.py -v --run-slow
-"""
+"""Lean training, checkpoint, and dataset contracts for publishing."""
 
 import pytest
 from datasets import Dataset as HFDataset
 
-from .model_registry import MODEL_FAMILIES, BASE_MODELS, get_trainable_pipelines
-from .test_fixtures import (
-    generate_classification_dataset,
-    generate_similarity_dataset,
-    generate_triplet_dataset,
-    generate_mlm_dataset,
-    generate_ner_dataset,
-    generate_id2label,
-    generate_label2id,
-)
+pytestmark = pytest.mark.release
 
 
-def _get_training_params():
-    """Generate pytest parameters for training tests."""
-    params = []
-    for family in MODEL_FAMILIES:
-        for pipeline in get_trainable_pipelines(family):
-            params.append(
-                pytest.param(
-                    family,
-                    pipeline,
-                    id=f"{family}-{pipeline}",
-                    marks=[pytest.mark.slow]
-                )
-            )
-    return params
+def _checkpoint_only_trainer(tmp_path, args, *, global_step=3):
+    from types import SimpleNamespace
 
+    import mlx.core as mx
 
-def _get_dataset_for_pipeline(pipeline: str, triplet: bool = False) -> tuple:
-    """Get dummy dataset and label mappings for a pipeline."""
-    if pipeline == "text-classification":
-        data = generate_classification_dataset(n_samples=16, n_classes=3)
-        id2label = generate_id2label(3)
-        label2id = generate_label2id(3)
-        return HFDataset.from_dict(data), id2label, label2id
-    
-    elif pipeline == "sentence-similarity":
-        # Use triplet data for cross-entropy training
-        if triplet:
-            data = generate_triplet_dataset(n_samples=16)
-        else:
-            data = generate_similarity_dataset(n_samples=16)
-        return HFDataset.from_dict(data), None, None
-    
-    elif pipeline == "masked-lm":
-        data = generate_mlm_dataset(n_samples=16)
-        return HFDataset.from_dict(data), None, None
-    
-    elif pipeline == "token-classification":
-        data = generate_ner_dataset(n_samples=16, n_tags=5)
-        id2label = {str(i): f"TAG_{i}" for i in range(5)}
-        label2id = {v: int(k) for k, v in id2label.items()}
-        return HFDataset.from_dict(data), id2label, label2id
-    
-    else:
-        raise ValueError(f"Unknown trainable pipeline: {pipeline}")
+    from mlx_raclate.tuner.trainer import Trainer
 
+    class DummyModel:
+        config = SimpleNamespace(model_type="dummy")
 
-@pytest.mark.parametrize("model_family,pipeline", _get_training_params())
-def test_training_step(model_family: str, pipeline: str):
-    """Test that a single training step completes without error."""
-    from mlx_raclate.utils.utils import load
-    from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
-    
-    def _test_training_step(model_family: str, pipeline: str, triplet: bool = False):
-        """Test that a single training step completes without error."""
-        # Get base model and dataset
-        base_model = BASE_MODELS[model_family]
-        train_dataset, id2label, label2id = _get_dataset_for_pipeline(pipeline, triplet)
-    
-        # Build model config
-        model_config = {}
-        if id2label:
-            model_config["id2label"] = id2label
-            model_config["label2id"] = label2id
-    
-        # Load model in training mode
-        model, tokenizer = load(
-            base_model,
-            model_config=model_config,
-            pipeline=pipeline,
-            train=True,
-        )
+        def get_hf_transformers_arch(self):
+            return None
 
-        if pipeline == "masked-lm" and getattr(tokenizer, "mask_token_id", None) is None:
-             # 1. Try to find common mask tokens
-             if "<mask >" in tokenizer.vocab:
-                 tokenizer.mask_token = "<mask >"
-                 tokenizer.mask_token_id = tokenizer.vocab["<mask >"]
-             elif "[MASK]" in tokenizer.vocab:
-                 tokenizer.mask_token = "[MASK]"
-                 tokenizer.mask_token_id = tokenizer.vocab["[MASK]"]
-             elif "<mask>" in tokenizer.vocab:
-                 tokenizer.mask_token = "<mask>"
-                 tokenizer.mask_token_id = tokenizer.vocab["<mask>"]
-             
-             # 2. If not found, add it and resize
-             else:
-                 tokenizer.add_tokens(["[MASK]"], special_tokens=True)
-                 tokenizer.mask_token = "[MASK]"
-                 tokenizer.mask_token_id = tokenizer.convert_tokens_to_ids("[MASK]")
-                 
-                 # Resize using the new base model method
-                 if hasattr(model, "resize_token_embeddings"):
-                    model.resize_token_embeddings(len(tokenizer))
+        def parameters(self):
+            return {"weight": mx.zeros((1,), dtype=mx.float32)}
 
-        # Configure minimal training
-        args = TrainingArgs(
-            batch_size=2,
-            num_train_epochs=1,
-            max_length=64,  # Short for speed
-            learning_rate=1e-5,
-            logging_steps=1,
-            save_steps=10000,  # Don't save during test
-            output_dir=f"/tmp/test_training_{model_family}_{pipeline}",
-        )
-    
-        # Initialize trainer
-        trainer = Trainer(
-            model=model,
-            tokenizer=tokenizer,
-            task_type=pipeline,
-            training_args=args,
-            train_dataset=train_dataset,
-            label2id=label2id,
-        )
+    class DummyTokenizer:
+        def save_pretrained(self, path):
+            return None
 
-        # Just verify the training loop executes without error
-        try:
-            # Access the internal training method to run just a few batches
-            batches = list(trainer._create_batches(
-                train_dataset, 
-                args.batch_size,
-                shuffle=True
-            ))[:2]  # Just 2 batches
-        
-            for batch in batches:
-                # Verify we can compute loss
-                outputs = model(**trainer.data_collator(batch))
-                assert "loss" in outputs or outputs.get("loss") is not None, \
-                    f"Model should return loss during training for {pipeline}"
-            
-        except Exception as e:
-            pytest.fail(f"Training step failed for {model_family}/{pipeline}: {e}")
-
-    _test_training_step(model_family, pipeline)
-    # second test for triplet
-    if pipeline == "sentence-similarity":
-        _test_training_step(model_family, pipeline, triplet=True)
-
-
-def test_classification_dataset_generation():
-    """Test classification dataset generator."""
-    data = generate_classification_dataset(n_samples=10, n_classes=3)
-    assert "text" in data and "label" in data
-    assert len(data["text"]) == 10
-    assert len(data["label"]) == 10
-    assert all(label in [0, 1, 2] for label in data["label"])
-
-def test_similarity_dataset_generation():
-    """Test similarity dataset generator."""
-    data = generate_similarity_dataset(n_samples=10)
-    assert "text" in data and "text_pair" in data and "label" in data
-    assert len(data["text"]) == 10
-    assert all(0.0 <= score <= 1.0 for score in data["label"])
-
-def test_triplet_dataset_generation():
-    """Test triplet dataset generator."""
-    data = generate_triplet_dataset(n_samples=10)
-    assert "text" in data and "text_pair" in data and "negative" in data
-    assert len(data["text"]) == 10
-
-def test_mlm_dataset_generation():
-    """Test MLM dataset generator."""
-    data = generate_mlm_dataset(n_samples=10)
-    assert "text" in data
-    assert len(data["text"]) == 10
-
-def test_ner_dataset_generation():
-    """Test NER dataset generator."""
-    data = generate_ner_dataset(n_samples=10, n_tags=5)
-    assert "text" in data and "labels" in data
-    assert len(data["text"]) == 10
-    assert all(len(tokens) == len(labels) for tokens, labels in zip(data["text"], data["labels"]))
+    trainer = Trainer.__new__(Trainer)
+    trainer.output_dir = tmp_path
+    trainer.global_step = global_step
+    trainer.model = DummyModel()
+    trainer.tokenizer = DummyTokenizer()
+    trainer.task_type = "text-classification"
+    trainer.args = args
+    return trainer
 
 
 def test_token_classification_dataset_columns_are_standardized():
@@ -313,7 +153,8 @@ def test_token_classification_checkpoint_survives_model_card_failure(
     trainer.model = DummyModel()
     trainer.tokenizer = DummyTokenizer()
     trainer.task_type = "token-classification"
-    trainer.args = SimpleNamespace(push_to_hub=False, save_total_limit=None)
+    trainer.args = SimpleNamespace(push_to_hub=False, save_total_limit=1)
+    (tmp_path / "checkpoint-1").mkdir()
 
     with pytest.warns(UserWarning, match="README generation failed"):
         trainer._save_checkpoint({"loss": 1.0})
@@ -326,6 +167,227 @@ def test_token_classification_checkpoint_survives_model_card_failure(
     assert (tmp_path / "checkpoint-7" / "model.safetensors").is_file()
     assert (tmp_path / "checkpoint-7" / "config.json").is_file()
     assert (tmp_path / "checkpoint-7" / "metrics.json").is_file()
+    assert not (tmp_path / "checkpoint-1").exists()
+
+
+def test_local_checkpoint_card_uses_local_path_and_explicit_base_model(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from mlx_raclate.tuner import trainer as trainer_module
+
+    captured = {}
+
+    def capture_model_card(**kwargs):
+        captured.update(kwargs)
+        return "local card"
+
+    monkeypatch.setattr(
+        trainer_module,
+        "get_code_for_trained_model",
+        capture_model_card,
+    )
+    trainer = _checkpoint_only_trainer(
+        tmp_path,
+        SimpleNamespace(
+            push_to_hub=False,
+            hub_repo_id=None,
+            base_model="acme/base-model",
+            save_total_limit=None,
+        ),
+    )
+
+    trainer._save_checkpoint({"loss": 1.0})
+
+    checkpoint = tmp_path / "checkpoint-3"
+    assert captured["model_path"] == str(checkpoint)
+    assert captured["base_model"] == "acme/base-model"
+    assert (checkpoint / "README.md").read_text() == "local card"
+
+
+def test_hub_upload_failure_preserves_checkpoint_and_uses_explicit_ids(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from mlx_raclate.tuner import trainer as trainer_module
+
+    captured = {}
+
+    def capture_model_card(**kwargs):
+        captured["model_card"] = kwargs
+        return "hub card"
+
+    def fail_upload(**kwargs):
+        captured["upload"] = kwargs
+        raise RuntimeError("Hub unavailable")
+
+    monkeypatch.setattr(
+        trainer_module,
+        "get_code_for_trained_model",
+        capture_model_card,
+    )
+    monkeypatch.setattr(trainer_module, "upload_to_hub", fail_upload)
+    trainer = _checkpoint_only_trainer(
+        tmp_path,
+        SimpleNamespace(
+            push_to_hub=True,
+            hub_repo_id="acme/fine-tuned-model",
+            base_model="acme/base-model",
+            save_total_limit=None,
+        ),
+    )
+
+    with pytest.warns(UserWarning, match="Hub upload failed"):
+        trainer._save_checkpoint({"loss": 1.0})
+
+    checkpoint = tmp_path / "checkpoint-3"
+    assert captured["model_card"]["model_path"] == "acme/fine-tuned-model"
+    assert captured["model_card"]["base_model"] == "acme/base-model"
+    assert captured["upload"] == {
+        "path": checkpoint,
+        "hub_repo_id": "acme/fine-tuned-model",
+    }
+    assert (checkpoint / "README.md").read_text() == "hub card"
+    assert (checkpoint / "model.safetensors").is_file()
+
+
+def test_upload_to_hub_creates_and_uploads_explicit_repo(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    from mlx_raclate.tuner.trainer import upload_to_hub
+
+    calls = []
+
+    class FakeApi:
+        def create_repo(self, **kwargs):
+            calls.append(("create_repo", kwargs))
+
+        def upload_folder(self, **kwargs):
+            calls.append(("upload_folder", kwargs))
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    checkpoint = tmp_path / "checkpoint-11"
+    checkpoint.mkdir()
+
+    upload_to_hub(checkpoint, "acme/fine-tuned-model")
+
+    assert calls == [
+        (
+            "create_repo",
+            {
+                "repo_id": "acme/fine-tuned-model",
+                "repo_type": "model",
+                "exist_ok": True,
+            },
+        ),
+        (
+            "upload_folder",
+            {
+                "folder_path": checkpoint,
+                "repo_id": "acme/fine-tuned-model",
+                "repo_type": "model",
+                "commit_message": "Upload checkpoint-11",
+            },
+        ),
+    ]
+
+
+def test_checkpoint_rotation_uses_numeric_steps_and_ignores_other_paths(tmp_path):
+    """Checkpoint retention removes only the oldest numbered directories."""
+    from types import SimpleNamespace
+
+    from mlx_raclate.tuner.trainer import Trainer
+
+    for name in ("checkpoint-2", "checkpoint-10", "checkpoint-100"):
+        checkpoint = tmp_path / name
+        checkpoint.mkdir()
+        (checkpoint / "marker").write_text(name)
+    (tmp_path / "checkpoint-latest").mkdir()
+    (tmp_path / "checkpoint-200").write_text("not a directory")
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.output_dir = tmp_path
+    trainer.args = SimpleNamespace(save_total_limit=2)
+
+    trainer._rotate_checkpoints()
+
+    assert not (tmp_path / "checkpoint-2").exists()
+    assert (tmp_path / "checkpoint-10").is_dir()
+    assert (tmp_path / "checkpoint-100").is_dir()
+    assert (tmp_path / "checkpoint-latest").is_dir()
+    assert (tmp_path / "checkpoint-200").is_file()
+
+
+def test_partial_accumulation_window_is_flushed_with_actual_divisor(
+    monkeypatch,
+):
+    """A short final window produces one correctly averaged optimizer update."""
+    from types import SimpleNamespace
+
+    from mlx_raclate.tuner import trainer as trainer_module
+    from mlx_raclate.tuner.trainer import Trainer
+
+    cache_clears = []
+    monkeypatch.setattr(
+        trainer_module,
+        "mx",
+        SimpleNamespace(
+            array=lambda value: value,
+            stop_gradient=lambda value: value,
+            eval=lambda *values: None,
+            clear_cache=lambda: cache_clears.append(True),
+        ),
+    )
+    monkeypatch.setattr(trainer_module.gc, "collect", lambda: None)
+
+    class DummyModel:
+        state = {}
+
+        def train(self):
+            return None
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.model = DummyModel()
+    trainer.optimizer = SimpleNamespace(state={})
+    trainer.optimizer_step = 0
+    trainer.args = SimpleNamespace(
+        batch_size=1,
+        gradient_accumulation_steps=3,
+        gradient_accumulation_dtype="model",
+        cache_clear_steps=2,
+    )
+    trainer.train_dataset = object()
+    trainer.epoch = 0
+    trainer.global_step = 0
+    trainer.next_log_step = 100
+    trainer.next_save_step = 100
+    trainer.logging_steps = 100
+    trainer.save_steps = 100
+    trainer.data_collator = lambda batch: batch
+    trainer._create_batches = lambda *args, **kwargs: iter(
+        {"gradient": gradient} for gradient in (1.0, 2.0, 3.0, 8.0, 10.0)
+    )
+    trainer.step_calc = lambda batch: (
+        1.0,
+        {"weight": batch["gradient"]},
+    )
+    applied_gradients = []
+
+    def record_update(grads):
+        applied_gradients.append(grads["weight"])
+        return 1.0
+
+    trainer.step_update = record_update
+
+    trainer._train_epoch()
+
+    assert applied_gradients == [2.0, 9.0]
+    assert trainer.global_step == 5
+    assert trainer.microbatches_in_epoch == 5
+    assert trainer.optimizer_step == 2
+    assert len(cache_clears) == 1
 
 
 def test_checkpoint_restores_optimizer_and_completed_epoch(tmp_path):
@@ -457,17 +519,6 @@ def test_evaluation_failure_saves_completed_epoch_before_reraising():
     ]
 
 
-def test_label_mappings_generation():
-    """Test label mapping generators."""
-    id2label = generate_id2label(3)
-    label2id = generate_label2id(3)
-    
-    assert len(id2label) == 3
-    assert len(label2id) == 3
-    assert all(str(k) in id2label for k in range(3))
-    assert all(label2id[v] == int(k) for k, v in id2label.items())
-
-
 def test_training_args_runtime_memory_options():
     """Test runtime memory knobs are exposed with expected defaults."""
     from mlx_raclate.tuner.trainer import TrainingArgs
@@ -477,6 +528,9 @@ def test_training_args_runtime_memory_options():
     assert default_args.cache_clear_steps == 1
     assert default_args.multi_precision is True
     assert default_args.gradient_accumulation_dtype == "float32"
+    assert default_args.push_to_hub is False
+    assert default_args.hub_repo_id is None
+    assert default_args.base_model is None
 
     custom_args = TrainingArgs(
         grad_checkpoint=False,
@@ -488,3 +542,14 @@ def test_training_args_runtime_memory_options():
     assert custom_args.cache_clear_steps == 8
     assert custom_args.multi_precision is False
     assert custom_args.gradient_accumulation_dtype == "model"
+
+    with pytest.raises(ValueError, match="gradient_accumulation_steps"):
+        TrainingArgs(gradient_accumulation_steps=0)
+    with pytest.raises(ValueError, match="save_total_limit"):
+        TrainingArgs(save_total_limit=0)
+    with pytest.raises(ValueError, match="cache_clear_steps"):
+        TrainingArgs(cache_clear_steps=-1)
+    with pytest.raises(ValueError, match="hub_repo_id"):
+        TrainingArgs(push_to_hub=True, base_model="acme/base-model")
+    with pytest.raises(ValueError, match="base_model"):
+        TrainingArgs(push_to_hub=True, hub_repo_id="acme/model")

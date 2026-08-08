@@ -287,6 +287,15 @@ class TokenizerWrapper:
         self._tokenizer = tokenizer
         self._detokenizer = detokenizer_class(tokenizer)
 
+    def __call__(self, *args, **kwargs):
+        """Forward tokenization to the wrapped Hugging Face tokenizer."""
+        return self._tokenizer(*args, **kwargs)
+
+    @property
+    def raw_tokenizer(self):
+        """Return the wrapped Hugging Face tokenizer for backend-specific APIs."""
+        return self._tokenizer
+
     def __getattr__(self, attr):
         if attr == "detokenizer":
             return self._detokenizer

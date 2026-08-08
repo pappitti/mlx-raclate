@@ -37,6 +37,10 @@ def viterbi_transition_biases_from_calibration(
     operating_point: str = "default",
 ) -> Dict[str, float]:
     if calibration is None:
+        if operating_point != "default":
+            raise ValueError(
+                f"Viterbi calibration operating point not found: {operating_point}"
+            )
         return zero_viterbi_transition_biases()
 
     operating_points = calibration.get("operating_points")
@@ -58,7 +62,7 @@ def viterbi_transition_biases_from_calibration(
 
 
 def load_viterbi_calibration(path_or_hf_repo: str | Path) -> Optional[Dict[str, Any]]:
-    from mlx_raclate.utils.utils import get_model_path
+    from mlx_raclate.utils.hub import get_model_path
 
     model_path = get_model_path(str(path_or_hf_repo))
     calibration_path = model_path / VITERBI_CALIBRATION_FILE

@@ -12,23 +12,17 @@ from typing import Any, Callable, Optional, Tuple, Type, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_reduce
-from huggingface_hub import snapshot_download
-from transformers import PreTrainedTokenizer
 
-# Local imports
+from mlx_raclate.registry import (
+    PIPELINES as PIPELINES,
+    infer_pipeline_from_architecture,
+    resolve_model_class,
+)
+from mlx_raclate.tuner.utils import nparams
+
+from .hub import ModelNotFoundError as ModelNotFoundError
+from .hub import get_model_path as get_model_path
 from .tokenizer_utils import TokenizerWrapper, load_tokenizer
-# Training imports 
-from mlx_raclate.tuner.utils import nparams #, load_adapters ### removing adapters for now
-
-PIPELINES = [
-    "embeddings",
-    "masked-lm", 
-    "text-classification", 
-    "token-classification",
-    "sentence-transformers",
-    "zero-shot-classification",
-    "sentence-similarity"
-]
 
 # Map accepted model-config spellings to a canonical name and MLX dtype.
 STR_TO_DTYPE = {
@@ -40,28 +34,6 @@ STR_TO_DTYPE = {
     "bfloat16": ("bfloat16", mx.bfloat16),
     "bf16": ("bfloat16", mx.bfloat16),
 }
-
-HF_ARCH_TO_PIPELINE_MAPPING = {
-    "ForSequenceClassification": "text-classification",
-    "ForMaskedLM": "masked-lm",
-    "ForTokenClassification": "token-classification",
-}
-
-MODEL_REMAPPING = {
-    "mistral": "llama",  # mistral is compatible with llama
-    "phi-msft": "phixtral"
-}
-
-MODEL_ARCH_TO_PIPELINE_MAPPING = {
-    "Lfm2BidirectionalModel": "embeddings",
-}
-
-MAX_FILE_SIZE_GB = 5
-
-class ModelNotFoundError(Exception):
-    def __init__(self, message):
-        self.message = message
-        super().__init__(self.message)
 
 @dataclass(frozen=True)
 class ModelDTypePolicy:
@@ -190,7 +162,7 @@ def _validate_explicit_model_dtype(
         )
 
 
-def _get_pipeline_from_config(arch : str):
+def _get_pipeline_from_config(arch: Optional[str]) -> Optional[str]:
     """
     Retrieve the pipeline type based on the model configuration.
 
@@ -200,13 +172,7 @@ def _get_pipeline_from_config(arch : str):
     Returns:
         str: The pipeline type.
     """
-    if arch in MODEL_ARCH_TO_PIPELINE_MAPPING:
-        return MODEL_ARCH_TO_PIPELINE_MAPPING[arch]
-    if arch is not None:
-        for k,v in HF_ARCH_TO_PIPELINE_MAPPING.items():
-            if k in arch:
-                return v
-    return None  
+    return infer_pipeline_from_architecture(arch)
 
 
 def _uses_lfm2_bidirectional_architecture(config: dict) -> bool:
@@ -234,7 +200,7 @@ def _remap_lfm2_bidirectional_model_type(
         config["model_type"] = "lfm2_bidirectional"
 
 
-def _get_classes(config: dict, pipeline: Optional[str] = 'masked-lm'):
+def _get_classes(config: dict, pipeline: Optional[str] = "masked-lm"):
     """
     Retrieve the model and model args classes based on the configuration.
 
@@ -244,43 +210,22 @@ def _get_classes(config: dict, pipeline: Optional[str] = 'masked-lm'):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    if pipeline not in PIPELINES:
-        raise ValueError(f"Pipeline {pipeline} not supported. Supported pipelines: {PIPELINES}")
+    model_type = config.get("model_type")
+    if not model_type:
+        raise ValueError("Model config is missing the required 'model_type' field.")
 
-    model_type = config["model_type"]
-    model_type = MODEL_REMAPPING.get(model_type, model_type)
+    reference = resolve_model_class(model_type, pipeline)
+    architecture = importlib.import_module(reference.module)
     try:
-        arch = importlib.import_module(f"mlx_raclate.models.{model_type}")
-    except ImportError:
-        msg = f"Model type {model_type} not supported."
-        logging.error(msg)
-        raise ValueError(msg)
-
-    if pipeline == "masked-lm":
-        return arch.ModelForMaskedLM, arch.ModelArgs
-    
-    if pipeline == "text-classification":
-        return arch.ModelForSequenceClassification, arch.ModelArgs
-    
-    if pipeline == "token-classification":
-        return arch.ModelForTokenClassification, arch.ModelArgs
-    
-    if pipeline == "embeddings":
-        return arch.Model, arch.ModelArgs
-    
-    if pipeline == "sentence-transformers":
-        return arch.ModelForSentenceTransformers, arch.ModelArgs
-    
-    if pipeline == "zero-shot-classification":
-        return arch.ModelForMaskedLM, arch.ModelArgs
-        # using the MaskeLM pipeline for now (see models/modernbert.py comment for class ModelForZeroShotClassification)
-        # return arch.ModelForZeroShotClassification, arch.ModelArgs
-    
-    if pipeline == "sentence-similarity":
-        return arch.ModelForSentenceSimilarity, arch.ModelArgs
-
-    ### should not reach here
-    return arch.Model, arch.ModelArgs
+        return (
+            getattr(architecture, reference.model_class),
+            getattr(architecture, reference.args_class),
+        )
+    except AttributeError as error:
+        raise RuntimeError(
+            f"Runtime registry entry for {model_type!r}/{pipeline!r} does not "
+            f"match module {reference.module!r}."
+        ) from error
 
 
 def _initialize_head_weights(model: nn.Module, loaded_weights: dict, config: Any):
@@ -366,48 +311,6 @@ def compute_bits_per_weight(model):
     )
     model_params = sum(nparams(m) for _, m in leaf_modules)
     return model_bytes * 8 / model_params
-
-
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
-    """
-    Ensures the model is available locally. If the path does not exist locally,
-    it is downloaded from the Hugging Face Hub.
-
-    Args:
-        path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
-        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
-
-    Returns:
-        Path: The path to the model.
-    """
-    model_path = Path(path_or_hf_repo)
-    if not model_path.exists():
-        try:
-            model_path = Path(
-                snapshot_download(
-                    repo_id=path_or_hf_repo,
-                    revision=revision,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        # "adapters/*/*.json",
-                        # "adapters/*/*.safetensors",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                        "*.txt",
-                    ],
-                )
-            )
-        except Exception:
-            raise ModelNotFoundError(
-                f"Model not found for path or HF repo: {path_or_hf_repo}.\n"
-                "Please make sure you specified the local path or Hugging Face"
-                " repo id correctly.\nIf you are trying to access a private or"
-                " gated Hugging Face repo, make sure you are authenticated:\n"
-                "https://huggingface.co/docs/huggingface_hub/en/guides/cli#huggingface-cli-login"
-            ) from None
-    return model_path
 
 
 def load_config(model_path: Path) -> dict:
@@ -496,49 +399,6 @@ def _is_lateon_dense_layout(dense_layers: list) -> bool:
             return False
     return True
 
-# Not too sure about adpaters. It's necessary for jina models but it adds 
-# complexity. we may et rid of of jina altogether
-def _load_adapter_weights(
-    weights: dict,
-    config: dict,
-    adapter_dir: Path,
-    required: bool = False,
-    adapter_name: Optional[str] = None,
-) -> None:
-    if not adapter_dir.exists():
-        if required:
-            raise FileNotFoundError(f"The adapter path does not exist: {adapter_dir}")
-        return
-
-    adapter_config_file = adapter_dir / "adapter_config.json"
-    if adapter_config_file.exists():
-        with open(adapter_config_file, "r") as f:
-            config["adapter_config"] = json.load(f)
-
-    adapter_weight_files = glob.glob(str(adapter_dir / "adapter*.safetensors"))
-    if not adapter_weight_files:
-        if required:
-            raise FileNotFoundError(f"No adapter safetensors found in {adapter_dir}")
-        return
-
-    inferred_adapter_name = adapter_name or adapter_dir.name
-    task_names = config.get("task_names") or []
-    if inferred_adapter_name in task_names:
-        requested_task = config.get("task")
-        if requested_task is not None and requested_task != inferred_adapter_name:
-            raise ValueError(
-                f"Adapter path '{adapter_dir}' is for task '{inferred_adapter_name}' "
-                f"but model_config requested task '{requested_task}'."
-            )
-        config["task"] = inferred_adapter_name
-
-    for wf in adapter_weight_files:
-        adapter_weights = mx.load(wf)
-        for key, value in adapter_weights.items():
-            adapter_key = key if key.startswith("adapter.") else f"adapter.{key}"
-            weights[adapter_key] = value
-
-
 def _prepare_quantized_modules(
     model: nn.Module,
     weights: dict,
@@ -571,12 +431,11 @@ def _prepare_quantized_modules(
 def load_model(
     model_path: Path,
     lazy: bool = False,
-    model_config: dict = {},
-    get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
+    model_config: Optional[dict] = None,
+    get_model_classes: Callable[..., Tuple[Type[nn.Module], Type]] = _get_classes,
     pipeline: Optional[str] = None,
-    train: bool = False, 
-    # adapter_path: Optional[Union[str, Path]] = None,
-) -> nn.Module:
+    train: bool = False,
+) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
 
@@ -595,17 +454,16 @@ def load_model(
         train (bool, optional): Whether the model is being loaded for training.
             In training model, models can be loaded from a different pipeline and
             some weights can be initialized accordingly. Defaults to False.
-        # adapter_path (str | Path, optional): Explicit adapter directory containing
-        #     adapter_config.json and adapter*.safetensors. If omitted, task adapters
-        #     under model_path/adapters/<task> are used when present.
-
     Returns:
-        nn.Module: The loaded and initialized model.
+        Tuple[nn.Module, dict]: The loaded model and its resolved configuration.
 
     Raises:
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
+
+    if model_config is None:
+        model_config = {}
 
     # check if model_path/config_sentence_transformers.json exists
     sentence_transformers_config_file = model_path / "config_sentence_transformers.json"
@@ -704,7 +562,9 @@ def load_model(
                     f"[INFO] Using pipeline {pipeline} based on user input, ignoring model architecture {model_arch}"
                 )
 
-    if is_sentence_transformer :
+    if is_sentence_transformer:
+        if pipeline is None:
+            pipeline = "sentence-transformers"
         if pipeline not in ["sentence-transformers", "embeddings", "sentence-similarity"]:
             if not train:
                 raise ValueError(
@@ -716,6 +576,16 @@ def load_model(
         else:
             pipeline = "sentence-transformers"
             print(f"[INFO] Using pipeline {pipeline} based on Sentence Transformer config file.")
+    elif pipeline is None:
+        pipeline = "embeddings"
+        print("[INFO] No task architecture found; using the embeddings pipeline.")
+
+    # Validate the model/pipeline pair before reading checkpoint tensors. This
+    # rejects unimplemented placeholder heads without paying the I/O cost first.
+    model_class, model_args_class = get_model_classes(
+        config=config,
+        pipeline=pipeline,
+    )
 
     weights = {}
 
@@ -757,25 +627,6 @@ def load_model(
         for wf in weight_files:
             weights.update(mx.load(wf))
 
-    ## disabling adapters for now, we can reintroduce them later if needed, 
-    ## They would be necessary for jina models
-    # if adapter_path is not None:
-    #     _load_adapter_weights(
-    #         weights,
-    #         config,
-    #         Path(adapter_path),
-    #         required=True,
-    #     )
-    # else:
-    #     adapter_root = model_path / "adapters"
-    #     adapter_task = config.get("task", "retrieval")
-    #     _load_adapter_weights(
-    #         weights,
-    #         config,
-    #         adapter_root / adapter_task,
-    #         adapter_name=adapter_task,
-    #     )
-
     dtype_policy = _resolve_model_dtype(config, weights)
     config["dtype"] = dtype_policy.config_name
     print(
@@ -783,7 +634,6 @@ def load_model(
         f"{dtype_policy.dtype} (source: {dtype_policy.source})"
     )
 
-    model_class, model_args_class = get_model_classes(config=config, pipeline=pipeline)
     model_args = model_args_class.from_dict(config)
     
     # Instantiate the model (random init)
@@ -828,9 +678,9 @@ def load_model(
 
 def load(
     path_or_hf_repo: str,
-    tokenizer_config={},
-    model_config={},
-    adapter_path: Optional[str] = None, ## for now, disabling adapter loading
+    tokenizer_config: Optional[dict] = None,
+    model_config: Optional[dict] = None,
+    adapter_path: Optional[str] = None,
     lazy: bool = False,
     pipeline: Optional[str] = None,
     train: bool = False
@@ -844,8 +694,8 @@ def load(
             Defaults to an empty dictionary.
         model_config(dict, optional): Configuration parameters specifically for the model.
             Defaults to an empty dictionary.
-        adapter_path (str, optional): Path to the LoRA adapters. If provided, applies LoRA layers
-            to the model. Default: ``None``.
+        adapter_path (str, optional): Reserved for adapter loading, which is not
+            currently implemented. Passing a value raises ``NotImplementedError``.
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
@@ -861,29 +711,23 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
+    if adapter_path is not None:
+        raise NotImplementedError(
+            "Adapter loading is not currently supported; adapter_path must be None."
+        )
+
     model_path = get_model_path(path_or_hf_repo)
 
     model, config = load_model(
         model_path,
         lazy,
-        model_config,
+        model_config=model_config,
         pipeline=pipeline,
         train=train,
-        # adapter_path=adapter_path,
     )
     tokenizer = load_tokenizer(model_path, tokenizer_config)
 
     return model, tokenizer
-
-def fetch_from_hub(
-    model_path: Path, lazy: bool = False
-) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
-    model, config = load_model(model_path, lazy)
-    tokenizer = load_tokenizer(
-        model_path, eos_token_ids=config.get("eos_token_id", None)
-    )
-    return model, config, tokenizer
-
 
 def quantize_model(
     model: nn.Module,
@@ -934,67 +778,3 @@ def quantize_model(
     print(f"[INFO] Quantized model with {bpw:.3f} bits per weight.")
 
     return quantized_weights, quantized_config
-
-### Conversion should not be needed if we work with safetensors
-### Kept here for reference, and if we need to re-implement it later
-
-# def convert(
-#     hf_path: str,
-#     mlx_path: str = "mlx_model",
-#     quantize: bool = False,
-#     q_group_size: int = 64,
-#     q_bits: int = 4,
-#     dtype: str = "float16",
-#     upload_repo: str = None,
-#     revision: Optional[str] = None,
-#     dequantize: bool = False,
-#     quant_predicate: Optional[
-#         Callable[[str, nn.Module, dict], Union[bool, dict]]
-#     ] = None,
-# ):
-#     # Check the save path is empty
-#     if isinstance(mlx_path, str):
-#         mlx_path = Path(mlx_path)
-
-#     if mlx_path.exists():
-#         raise ValueError(
-#             f"Cannot save to the path {mlx_path} as it already exists."
-#             " Please delete the file/directory or specify a new path to save to."
-#         )
-
-#     print("[INFO] Loading")
-#     model_path = get_model_path(hf_path, revision=revision)
-#     model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
-
-#     weights = dict(tree_flatten(model.parameters()))
-#     dtype = getattr(mx, dtype)
-#     weights = {k: v.astype(dtype) for k, v in weights.items()}
-
-#     if quantize and dequantize:
-#         raise ValueError("Choose either quantize or dequantize, not both.")
-
-#     if quantize:
-#         print("[INFO] Quantizing")
-#         model.load_weights(list(weights.items()))
-#         weights, config = quantize_model(
-#             model, config, q_group_size, q_bits, quant_predicate=quant_predicate
-#         )
-
-#     if dequantize:
-#         print("[INFO] Dequantizing")
-#         model = dequantize_model(model)
-#         weights = dict(tree_flatten(model.parameters()))
-
-#     del model
-#     save_weights(mlx_path, weights, donate_weights=True)
-
-#     py_files = glob.glob(str(model_path / "*.py"))
-#     for file in py_files:
-#         shutil.copy(file, mlx_path)
-
-#     tokenizer.save_pretrained(mlx_path)
-
-#     save_config(config, config_path=mlx_path / "config.json")
-
-#     if upload_repo is not None:
-#         upload_to_hub(mlx_path, upload_repo, hf_path)

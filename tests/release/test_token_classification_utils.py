@@ -13,6 +13,9 @@ from mlx_raclate.utils.token_classification import (
 )
 
 
+pytestmark = pytest.mark.release
+
+
 def test_decode_bioes_spans_groups_multi_token_entity():
     text = "Call Alice Smith tomorrow"
     offsets = [(0, 4), (5, 10), (11, 16), (17, 25)]
@@ -270,6 +273,14 @@ def test_viterbi_calibration_roundtrips_transition_biases(tmp_path):
 
     save_viterbi_calibration(tmp_path, calibration)
     assert (tmp_path / "viterbi_calibration.json").exists()
+
+
+def test_named_viterbi_profile_requires_calibration():
+    with pytest.raises(ValueError, match="high_precision"):
+        viterbi_transition_biases_from_calibration(
+            None,
+            operating_point="high_precision",
+        )
 
 
 def test_postprocess_token_classification_output_decodes_predictions_and_spans():

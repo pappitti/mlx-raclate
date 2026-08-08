@@ -798,6 +798,10 @@ def write_calibration_operating_points(
     operating_points = payload.setdefault("operating_points", {})
     if not isinstance(operating_points, dict):
         raise ValueError("Existing calibration has an invalid operating_points value")
+    operating_points.setdefault(
+        "default",
+        {"biases": zero_viterbi_transition_biases()},
+    )
 
     new_points = search_result.get("operating_points")
     if not isinstance(new_points, Mapping) or not new_points:

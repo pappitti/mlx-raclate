@@ -27,7 +27,7 @@ def run_inference(
         - grouped_spans: BIOES-decoded grouped spans per input
         - id2label: Label mapping (if available)
     """
-    from mlx_raclate.utils.utils import load
+    from mlx_raclate import load
     
     config = model_config or {}
     
@@ -45,7 +45,7 @@ def run_inference(
     )
     
     # Tokenize
-    tokens = tokenizer._tokenizer(
+    tokens = tokenizer(
         texts,
         return_tensors="mlx",
         padding=True,
@@ -88,7 +88,7 @@ def run_inference(
     }
 
 
-_EXAMPLE_CODE_TEMPLATE = '''from mlx_raclate.utils.utils import load
+_EXAMPLE_CODE_TEMPLATE = '''from mlx_raclate import load
 from mlx_raclate.utils.token_classification import (
     postprocess_token_classification_output,
     viterbi_transition_biases_from_calibration,
@@ -106,7 +106,7 @@ texts = {texts}
 
 # Tokenize
 max_length = getattr(model.config, "max_position_embeddings", 512)
-tokens = tokenizer._tokenizer(
+tokens = tokenizer(
     texts,
     return_tensors="mlx",
     padding=True,

@@ -1,3 +1,5 @@
+"""Forward, pooling, projection, and task-head behavior contracts."""
+
 import inspect
 import json
 
@@ -19,10 +21,6 @@ from mlx_raclate.models.granite_embedding import (
     ModelArgs as GraniteArgs,
     Model as GraniteModel,
 )
-# from dev_tests.jina_embeddings_v5 import (
-#     ModelArgs as JinaArgs,
-#     Model as JinaModel,
-# )
 from mlx_raclate.models.lateon import (
     ModelArgs as LateOnArgs,
     ModelForSentenceSimilarity as LateOnModel,
@@ -451,116 +449,6 @@ def test_pplx_uses_padding_only_attention_and_mean_pooling():
         attention_mask=attention_mask,
     )
     assert outputs["embeddings"].shape == (1, 16)
-
-
-# def test_jina_tiny_forward_truncates_last_token_embedding():
-#     config = JinaArgs(
-#         vocab_size=64,
-#         hidden_size=16,
-#         intermediate_size=32,
-#         num_hidden_layers=1,
-#         num_attention_heads=4,
-#         num_key_value_heads=2,
-#         head_dim=4,
-#         truncate_dim=8,
-#     )
-#     model = JinaModel(config)
-
-#     outputs = model(
-#         mx.array([[1, 2, 0]], dtype=mx.int32),
-#         attention_mask=mx.array([[1, 1, 0]], dtype=mx.int32),
-#         task="retrieval",
-#         prompt_name="document",
-#     )
-
-#     assert outputs["embeddings"].shape == (1, 8)
-
-
-# def test_jina_task_is_selected_at_load_time():
-#     config = JinaArgs(
-#         vocab_size=64,
-#         hidden_size=16,
-#         intermediate_size=32,
-#         num_hidden_layers=1,
-#         num_attention_heads=4,
-#         num_key_value_heads=2,
-#         head_dim=4,
-#         task="retrieval",
-#     )
-#     model = JinaModel(config)
-
-#     with pytest.raises(ValueError, match="merged into the model at load time"):
-#         model(
-#             mx.array([[1, 2, 0]], dtype=mx.int32),
-#             attention_mask=mx.array([[1, 1, 0]], dtype=mx.int32),
-#             task="classification",
-#         )
-
-
-# def test_jina_sanitize_merges_selected_lora_adapter():
-#     config = JinaArgs(
-#         vocab_size=64,
-#         hidden_size=16,
-#         intermediate_size=32,
-#         num_hidden_layers=1,
-#         num_attention_heads=4,
-#         num_key_value_heads=2,
-#         head_dim=4,
-#         adapter_config={"peft_type": "LORA", "r": 2, "lora_alpha": 4},
-#     )
-#     model = JinaModel(config)
-
-#     sanitized = model.sanitize(
-#         {
-#             "layers.0.self_attn.q_proj.weight": mx.zeros((16, 16)),
-#             "adapter.base_model.model.layers.0.self_attn.q_proj.lora_A.default.weight": mx.ones((2, 16)),
-#             "adapter.base_model.model.layers.0.self_attn.q_proj.lora_B.default.weight": mx.ones((16, 2)),
-#         }
-#     )
-
-#     merged = sanitized["model.layers.0.self_attn.q_proj.weight"]
-#     assert merged.shape == (16, 16)
-#     assert float(merged[0, 0].item()) == 4.0
-
-
-# def test_load_adapter_weights_sets_config_and_prefixes_keys(tmp_path):
-#     adapter_dir = tmp_path / "retrieval"
-#     adapter_dir.mkdir()
-#     (adapter_dir / "adapter_config.json").write_text(
-#         json.dumps({"peft_type": "LORA", "r": 2, "lora_alpha": 4})
-#     )
-#     mx.save_safetensors(
-#         str(adapter_dir / "adapter_model.safetensors"),
-#         {"base_model.model.layers.0.self_attn.q_proj.lora_A.weight": mx.ones((2, 16))},
-#     )
-
-#     weights = {}
-#     config = {"task_names": ["retrieval", "classification"]}
-#     _load_adapter_weights(weights, config, adapter_dir, required=True)
-
-#     assert config["adapter_config"]["peft_type"] == "LORA"
-#     assert config["task"] == "retrieval"
-#     assert "adapter.base_model.model.layers.0.self_attn.q_proj.lora_A.weight" in weights
-
-
-# def test_load_adapter_weights_rejects_task_mismatch(tmp_path):
-#     adapter_dir = tmp_path / "classification"
-#     adapter_dir.mkdir()
-#     (adapter_dir / "adapter_config.json").write_text(
-#         json.dumps({"peft_type": "LORA", "r": 2, "lora_alpha": 4})
-#     )
-#     mx.save_safetensors(
-#         str(adapter_dir / "adapter_model.safetensors"),
-#         {"base_model.model.layers.0.self_attn.q_proj.lora_A.weight": mx.ones((2, 16))},
-#     )
-
-#     with pytest.raises(ValueError, match="model_config requested task"):
-#         _load_adapter_weights(
-#             {},
-#             {"task_names": ["retrieval", "classification"], "task": "retrieval"},
-#             adapter_dir,
-#             required=True,
-#         )
 
 
 def test_neobert_tiny_forward_and_sanitize():

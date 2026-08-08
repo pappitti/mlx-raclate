@@ -245,14 +245,11 @@ def compute_similarity(query_embeddings: mx.array, reference_embeddings: mx.arra
         return similarities
 
 def mean_pooling(token_embeddings: mx.array, attention_mask: mx.array):
-    input_mask_expanded = mx.expand_dims(attention_mask, -1)
-    input_mask_expanded = mx.broadcast_to(
-        input_mask_expanded, token_embeddings.shape
-    ).astype(mx.float32)
-    
-    sum_embeddings = mx.sum(token_embeddings * input_mask_expanded, axis=1)
-    sum_mask = mx.maximum(mx.sum(input_mask_expanded, axis=1), 1e-9)
-    
+    input_mask = mx.expand_dims(attention_mask, -1).astype(mx.float32)
+
+    sum_embeddings = mx.sum(token_embeddings * input_mask, axis=1)
+    sum_mask = mx.maximum(mx.sum(input_mask, axis=1), 1e-9)
+
     return sum_embeddings / sum_mask
 
 

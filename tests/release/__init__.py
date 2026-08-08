@@ -1,0 +1,1 @@
+"""Lean publishability contract tests."""

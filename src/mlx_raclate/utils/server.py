@@ -1,21 +1,25 @@
-# server.py
+import argparse
+from collections.abc import Sequence
+import gc
+from typing import Any, Dict, List, Literal, Optional, Union
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Literal, Optional, Union
 import uvicorn
-import gc
 import mlx.core as mx
+
+from mlx_raclate import __version__
+from mlx_raclate.registry import PIPELINES
 from mlx_raclate.utils.token_classification import (
     postprocess_token_classification_output,
     viterbi_transition_biases_from_calibration,
 )
-from mlx_raclate.utils.utils import PIPELINES, load
 
 app = FastAPI(
     title="Raclate Inference API", 
     description="API for using Raclate pipelines (ModernBERT, LFM2, Qwen, etc.) on Apple Silicon",
-    version="0.1.0"
+    version=__version__,
 )
 
 LOCAL_DEMO_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?$"
@@ -109,6 +113,8 @@ def get_model(model_name: str, pipeline_name: str, config_file: Optional[Dict] =
     print(f"Loading model: {model_name} | Pipeline: {pipeline_name} | Config: {config_file}")
     
     try:
+        from mlx_raclate import load
+
         model, tokenizer = load(
             model_name,
             pipeline=pipeline_name,
@@ -150,8 +156,9 @@ class PredictionRequest(BaseModel):
     operating_point: str = Field(
         "default",
         description=(
-            "Named Viterbi calibration operating point for token classification "
-            "(for example: default, balanced, high_precision, or high_recall)."
+            "Server-side Viterbi decoder profile for token classification "
+            "(for example: default, balanced, high_precision, or high_recall). "
+            "This value is applied after inference and is not passed to the model."
         ),
     )
 
@@ -192,7 +199,7 @@ async def predict(request: PredictionRequest):
             if len(text_pairs) != len(texts):
                 raise HTTPException(status_code=400, detail="Length of text and text_pair must match")
 
-        inputs = tokenizer._tokenizer(
+        inputs = tokenizer(
             texts,
             text_pairs,
             return_tensors="mlx",
@@ -246,7 +253,7 @@ async def predict(request: PredictionRequest):
                 request.operating_point,
             )
 
-        inputs = tokenizer._tokenizer(
+        inputs = tokenizer(
             texts,
             return_tensors="mlx",
             padding=True,
@@ -321,8 +328,8 @@ async def predict(request: PredictionRequest):
         
         refs = request.reference_text if isinstance(request.reference_text, list) else [request.reference_text]
 
-        q_inputs = tokenizer._tokenizer(texts, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
-        d_inputs = tokenizer._tokenizer(refs, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
+        q_inputs = tokenizer(texts, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
+        d_inputs = tokenizer(refs, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
 
         # The model handles the complexity (Cosine vs MaxSim) internally based on config
         outputs = model(
@@ -340,7 +347,7 @@ async def predict(request: PredictionRequest):
     # Pipeline: Raw Embeddings
     # -------------------------------------------------------------------------
     elif request.pipeline == "embeddings":
-        inputs = tokenizer._tokenizer(texts, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
+        inputs = tokenizer(texts, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
         
         outputs = model(
             input_ids=inputs['input_ids'],
@@ -355,7 +362,7 @@ async def predict(request: PredictionRequest):
     # Pipeline: Masked LM (Raw)
     # -------------------------------------------------------------------------
     elif request.pipeline == "masked-lm":
-        inputs = tokenizer._tokenizer(texts, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
+        inputs = tokenizer(texts, return_tensors="mlx", padding=True, truncation=True, max_length=max_len)
         
         outputs = model(
             input_ids=inputs['input_ids'],
@@ -420,7 +427,7 @@ async def predict(request: PredictionRequest):
             """
             classification_inputs.append(classification_input)
 
-        inputs = tokenizer._tokenizer(
+        inputs = tokenizer(
             classification_inputs, 
             return_tensors="mlx", 
             padding=True, 
@@ -485,8 +492,30 @@ async def unload_model():
     mx.metal.clear_cache()
     return {"message": f"Unloaded {name}"}
 
+def run(host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Run the single-worker Raclate inference server."""
+    uvicorn.run(
+        "mlx_raclate.utils.server:app",
+        host=host,
+        port=port,
+        workers=1,
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Parse compatibility CLI arguments and run the inference server."""
+    parser = argparse.ArgumentParser(
+        prog="raclate serve",
+        description="Run the Raclate inference API.",
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args(argv)
+    run(host=args.host, port=args.port)
+
+
 if __name__ == "__main__":
-    uvicorn.run("mlx_raclate.utils.server:app", host="0.0.0.0", port=8000, workers=1)
+    main()
 
 ### EXAMPLE
 '''

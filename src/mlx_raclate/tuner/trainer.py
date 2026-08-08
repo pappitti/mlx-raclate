@@ -3,6 +3,8 @@ import json
 import gc
 import ctypes
 import platform
+import re
+import shutil
 import warnings
 
 from dataclasses import dataclass
@@ -105,6 +107,8 @@ class TrainingArgs:
         grad_checkpoint: bool = True,
         cache_clear_steps: int = 1,
         push_to_hub: bool = False,
+        hub_repo_id: Optional[str] = None,
+        base_model: Optional[str] = None,
         eval_strategy: str = "end",
         multi_precision: bool = True,
         gradient_accumulation_dtype: str = "float32",
@@ -130,9 +134,21 @@ class TrainingArgs:
         self.save_total_limit = save_total_limit
         self.grad_checkpoint = grad_checkpoint ### mat not be necessary but helps anticipating hardware constraints
         self.cache_clear_steps = cache_clear_steps
-        self.push_to_hub = push_to_hub 
+        self.push_to_hub = push_to_hub
+        self.hub_repo_id = hub_repo_id
+        self.base_model = base_model
         self.eval_strategy = eval_strategy
         self.multi_precision = multi_precision
+        if gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be at least 1")
+        if save_total_limit is not None and save_total_limit < 1:
+            raise ValueError("save_total_limit must be at least 1 or None")
+        if cache_clear_steps < 0:
+            raise ValueError("cache_clear_steps must be non-negative")
+        if push_to_hub and not hub_repo_id:
+            raise ValueError("hub_repo_id is required when push_to_hub=True")
+        if push_to_hub and not base_model:
+            raise ValueError("base_model is required when push_to_hub=True")
         if gradient_accumulation_dtype not in {"float32", "model"}:
             raise ValueError(
                 "gradient_accumulation_dtype must be 'float32' or 'model'"
@@ -143,8 +159,6 @@ class Trainer:
     """
     A trainer that adapts to the model's training objective.
     The training logic is determined by the model's class implementation.
-
-    TODO : add basemodel and upload repo arguments to upload to HF hub
     """
     def __init__(
         self,
@@ -160,7 +174,7 @@ class Trainer:
         label2id: Optional[Dict[str, int]] = None
     ):
         self.model = model
-        self.tokenizer = tokenizer._tokenizer ### tokenizer is a wrapper around the HF tokenizer (see utils/tokenizer_utils.py)
+        self.tokenizer = tokenizer
         self.task_type = task_type
 
         self.args = training_args
@@ -235,7 +249,15 @@ class Trainer:
                 steps_per_epoch += 1
                 
             # Effective steps considering gradient accumulation
-            num_update_steps_per_epoch = max(steps_per_epoch // training_args.gradient_accumulation_steps, 1)
+            num_update_steps_per_epoch = max(
+                (
+                    steps_per_epoch
+                    + training_args.gradient_accumulation_steps
+                    - 1
+                )
+                // training_args.gradient_accumulation_steps,
+                1,
+            )
             total_update_steps = num_update_steps_per_epoch * training_args.num_train_epochs
             resumed_update_steps = self.resume_from_step // training_args.gradient_accumulation_steps
             if resumed_update_steps >= total_update_steps:
@@ -306,6 +328,7 @@ class Trainer:
         self.start_epoch = 0
         self.resume_microbatches_in_epoch = 0
         self.microbatches_in_epoch = 0
+        self.optimizer_step = int(self.optimizer.step.item())
         if self.resume_from_checkpoint:
             self._restore_checkpoint_state(Path(self.resume_from_checkpoint))
         elif self.resume_from_step:
@@ -381,7 +404,6 @@ class Trainer:
             return total_norm
         
         self.step_update = update_fn
-        self.push_to_hub = training_args.push_to_hub 
         
         print(f"Training {model.__class__.__name__}")
         # Log model type and config           
@@ -447,6 +469,7 @@ class Trainer:
                 "Optimizer state step does not match trainer_state.json: "
                 f"{restored_optimizer_step} != {expected_optimizer_step}"
             )
+        self.optimizer_step = restored_optimizer_step
         print(
             f"Resuming from {checkpoint_path}: epoch {self.start_epoch + 1}, "
             f"microbatch {self.resume_microbatches_in_epoch}, "
@@ -454,12 +477,6 @@ class Trainer:
             f"{restored_optimizer_step}."
         )
 
-
-    def _compute_loss(self, batch_inputs): 
-        """Compute the loss for training"""
-        outputs = self.model(**batch_inputs)
-        return mx.mean(outputs["loss"])
-    
     def _get_collator(self) -> DataCollator:
         if self.task_type == "masked-lm":
             from .collators import DataCollatorForMaskedLanguageModeling
@@ -566,12 +583,89 @@ class Trainer:
         running_loss = mx.array(0.0)
         running_grad_norm = mx.array(0.0)
         n_steps = 0
+        optimizer_updates = 0
         start_time = time.time()
         
         # Accumulation container
         accumulated_grads = None
+        accumulated_microbatches = 0
         steps_to_accumulate = self.args.gradient_accumulation_steps
-        scale_factor = 1.0 / steps_to_accumulate if steps_to_accumulate > 1 else 1.0
+
+        def apply_accumulated_gradients():
+            nonlocal accumulated_grads
+            nonlocal accumulated_microbatches
+            nonlocal n_steps
+            nonlocal optimizer_updates
+            nonlocal running_grad_norm
+            nonlocal running_loss
+            nonlocal start_time
+
+            grad_norm = self._apply_optimizer_update(
+                accumulated_grads,
+                accumulated_microbatches,
+            )
+            running_grad_norm = running_grad_norm + mx.stop_gradient(grad_norm)
+            optimizer_updates += 1
+            accumulated_grads = None
+            accumulated_microbatches = 0
+
+            if self.global_step >= self.next_log_step:
+                mx.eval(running_loss, running_grad_norm)
+                running_loss_value = running_loss.item()
+                running_grad_norm_value = running_grad_norm.item()
+
+                avg_loss = running_loss_value / max(n_steps, 1)
+                avg_grad_norm = running_grad_norm_value / max(
+                    optimizer_updates,
+                    1,
+                )
+
+                # Handle both static float and dynamic schedule
+                if callable(self.optimizer.learning_rate):
+                    current_lr = self.optimizer.learning_rate(self.optimizer.step)
+                else:
+                    current_lr = self.optimizer.learning_rate
+                if isinstance(current_lr, mx.array):
+                    current_lr = current_lr.item()
+
+                mem_gb = mx.get_active_memory() / 1e9
+                footprint_gb = _get_process_footprint_gb()
+                elapsed = time.time() - start_time
+                steps_per_sec = n_steps / elapsed
+                footprint_text = (
+                    f" | Footprint: {footprint_gb:.1f}GB"
+                    if footprint_gb is not None
+                    else ""
+                )
+
+                print(
+                    f"Step {self.global_step} | Loss: {avg_loss:.4f} | "
+                    f"LR: {current_lr:.2e} | GradNorm: {avg_grad_norm:.2f} | "
+                    f"MLX active: {mem_gb:.1f}GB{footprint_text} | "
+                    f"Speed: {steps_per_sec:.2f} steps/s"
+                )
+
+                self.next_log_step += self.logging_steps
+                running_loss = mx.array(0.0)
+                running_grad_norm = mx.array(0.0)
+                n_steps = 0
+                optimizer_updates = 0
+                start_time = time.time()
+
+                if self.global_step >= self.next_save_step:
+                    print("Saving checkpoint...")
+                    self._save_checkpoint(
+                        {
+                            "step": self.global_step,
+                            "step_loss": avg_loss,
+                            "grad_norm": avg_grad_norm,
+                            "learning_rate": current_lr,
+                            "memory_gb": mem_gb,
+                            "footprint_gb": footprint_gb,
+                            "steps_per_sec": steps_per_sec,
+                        }
+                    )
+                    self.next_save_step += self.save_steps
 
         # ensures different shuffling each epoch
         current_seed = 42 + self.epoch 
@@ -609,75 +703,43 @@ class Trainer:
                 accumulated_grads = grads
             else:
                 accumulated_grads = tree_map(lambda x, y: x + y, accumulated_grads, grads)
+            accumulated_microbatches += 1
             
             running_loss = running_loss + mx.stop_gradient(loss)
 
             # Update Optimizer if Accumulation Done
-            if n_steps % steps_to_accumulate == 0:
+            if accumulated_microbatches == steps_to_accumulate:
+                apply_accumulated_gradients()
 
-                # Scale Grads for Accumulation (only once per accumulation cycle)
-                if steps_to_accumulate > 1:
-                    accumulated_grads = tree_map(lambda g: g * scale_factor, accumulated_grads)
+        # Epochs need not contain a multiple of gradient_accumulation_steps.
+        # Flush the final window, averaging by its actual microbatch count.
+        if accumulated_microbatches:
+            apply_accumulated_gradients()
 
-                # Apply updates
-                grad_norm = self.step_update(accumulated_grads)
-                running_grad_norm = running_grad_norm + mx.stop_gradient(grad_norm)
+    def _apply_optimizer_update(self, accumulated_grads, microbatch_count: int):
+        """Average one accumulation window and apply a single optimizer update."""
+        if microbatch_count < 1:
+            raise ValueError("microbatch_count must be at least 1")
 
-                # Reset
-                accumulated_grads = None
-                
-                # Eval state to actually trigger the computation graph
-                mx.eval(self.model.state, self.optimizer.state)
-            
-                if self.global_step >= self.next_log_step:
-                    mx.eval(running_loss, running_grad_norm)
-                    running_loss = running_loss.item()
-                    running_grad_norm = running_grad_norm.item()
+        if microbatch_count > 1:
+            accumulated_grads = tree_map(
+                lambda gradient: gradient / microbatch_count,
+                accumulated_grads,
+            )
 
-                    avg_loss = running_loss / max(n_steps, 1)
-                    avg_grad_norm = running_grad_norm / (max(n_steps, 1) / steps_to_accumulate)
+        grad_norm = self.step_update(accumulated_grads)
+        mx.eval(self.model.state, self.optimizer.state)
+        self.optimizer_step += 1
 
-                    # Handle both static float and dynamic schedule
-                    if callable(self.optimizer.learning_rate):
-                        # We must pass the optimizer step index
-                        current_lr = self.optimizer.learning_rate(self.optimizer.step)
-                    else:
-                        current_lr = self.optimizer.learning_rate
-                    if isinstance(current_lr, mx.array):
-                        current_lr = current_lr.item()
+        # cache_clear_steps is expressed in optimizer updates, not microbatches.
+        if (
+            self.args.cache_clear_steps
+            and self.optimizer_step % self.args.cache_clear_steps == 0
+        ):
+            gc.collect()
+            mx.clear_cache()
 
-                    mem_gb = mx.get_active_memory() / 1e9
-                    footprint_gb = _get_process_footprint_gb()
-                    elapsed = time.time() - start_time
-                    steps_per_sec = n_steps / elapsed
-                    footprint_text = (
-                        f" | Footprint: {footprint_gb:.1f}GB"
-                        if footprint_gb is not None
-                        else ""
-                    )
-                    
-                    print(
-                        f"Step {self.global_step} | Loss: {avg_loss:.4f} | LR: {current_lr:.2e} | GradNorm: {avg_grad_norm:.2f} | MLX active: {mem_gb:.1f}GB{footprint_text} | Speed: {steps_per_sec:.2f} steps/s"
-                    )
-                    
-                    # Reset window counters
-                    self.next_log_step += self.logging_steps
-                    running_loss = mx.array(0.0)
-                    running_grad_norm = mx.array(0.0)
-                    n_steps = 0
-                    start_time = time.time()
-
-                    if self.global_step >= self.next_save_step:
-                        print("Saving checkpoint...")
-                        self._save_checkpoint({"step": self.global_step, "step_loss": avg_loss, "grad_norm": avg_grad_norm, "learning_rate": current_lr, "memory_gb": mem_gb, "footprint_gb": footprint_gb, "steps_per_sec": steps_per_sec})
-                        self.next_save_step += self.save_steps
-            
-                # MLX can hold onto large cached allocations, but clearing every step is slow.
-                if self.args.cache_clear_steps and self.global_step % self.args.cache_clear_steps == 0:
-                    gc.collect()
-                    mx.clear_cache()
-        
-        return 0.0 # placeholder 
+        return grad_norm
     
     def evaluate(self):
         """Evaluation loop."""
@@ -862,9 +924,20 @@ class Trainer:
                 str(save_path / "optimizer.safetensors"),
                 optimizer_weights,
             )
+            optimizer_step = int(self.optimizer.step.item())
+            tracked_optimizer_step = getattr(
+                self,
+                "optimizer_step",
+                optimizer_step,
+            )
+            if tracked_optimizer_step != optimizer_step:
+                raise ValueError(
+                    "Trainer optimizer step counter does not match optimizer "
+                    f"state: {tracked_optimizer_step} != {optimizer_step}"
+                )
             trainer_state = {
                 "global_step": self.global_step,
-                "optimizer_step": int(self.optimizer.step.item()),
+                "optimizer_step": optimizer_step,
                 "epoch": self.epoch,
                 "completed_epochs": self.epoch + 1 if completed_epoch else self.epoch,
                 "microbatches_in_epoch": (
@@ -874,10 +947,11 @@ class Trainer:
             with open(save_path / "trainer_state.json", "w") as f:
                 json.dump(trainer_state, f, indent=2)
 
+        hub_repo_id = getattr(self.args, "hub_repo_id", None)
         model_card_kwargs = {
             "pipeline": self.task_type,
-            "model_path": save_path, # TODO : replace by upload repo id
-            "base_model": self.model.config.model_type, # TODO : replace by base model name
+            "model_path": hub_repo_id or str(save_path),
+            "base_model": getattr(self.args, "base_model", None),
         }
         if hasattr(self.model.config, "use_late_interaction"):
             model_card_kwargs["use_late_interaction"] = self.model.config.use_late_interaction
@@ -889,30 +963,46 @@ class Trainer:
             with open(save_path / "README.md", "w") as f:
                 f.write(card_text)
         except Exception as error:
-            card_text = ""
             warnings.warn(
                 f"Checkpoint saved, but README generation failed: {error}",
                 stacklevel=2,
             )
         
-        # Push to Hub (PLACEHOLDER)
         if self.args.push_to_hub:
-            ### TODO
-            repo_id = self.args.output_dir.split("/")[-1] # Simple heuristic
-            print(f"Pushing to hub: {repo_id}")
-            upload_to_hub(
-                path=str(save_path),
-                upload_repo=repo_id,
-                hf_path=self.model.config.model_type, # Or base model name
-                task_type=self.task_type,
-                card_text=card_text
-            )
+            try:
+                upload_to_hub(
+                    path=save_path,
+                    hub_repo_id=hub_repo_id,
+                )
+            except Exception as error:
+                warnings.warn(
+                    "Checkpoint saved locally, but Hub upload failed: "
+                    f"{type(error).__name__}: {error}",
+                    stacklevel=2,
+                )
         
         # Manage checkpoint rotation
-        if self.args.save_total_limit:
-            ### TODO
-            raise NotImplementedError("Checkpoint rotation not implemented yet")
+        if self.args.save_total_limit is not None:
             self._rotate_checkpoints()
+
+    def _rotate_checkpoints(self):
+        """Delete oldest numbered checkpoints beyond save_total_limit."""
+        limit = self.args.save_total_limit
+        if limit is None:
+            return
+        if limit < 1:
+            raise ValueError("save_total_limit must be at least 1 or None")
+
+        checkpoint_pattern = re.compile(r"checkpoint-(\d+)")
+        checkpoints = []
+        for path in self.output_dir.iterdir():
+            match = checkpoint_pattern.fullmatch(path.name)
+            if match and path.is_dir() and not path.is_symlink():
+                checkpoints.append((int(match.group(1)), path))
+
+        checkpoints.sort(key=lambda checkpoint: checkpoint[0])
+        for _, checkpoint_path in checkpoints[:-limit]:
+            shutil.rmtree(checkpoint_path)
     
     def _save_config(self):
         """Save training configuration."""
@@ -924,67 +1014,24 @@ class Trainer:
             json.dump(config, f, indent=2)
 
 def upload_to_hub(
-        path: str, 
-        upload_repo: str, 
-        hf_path: str,
-        task_type: str,
-        card_text: str,
-        ):
-    """
-    Uploads the model to Hugging Face hub.
+    path: str | Path,
+    hub_repo_id: str,
+) -> None:
+    """Upload one complete local checkpoint to an explicit Hub model repo."""
+    from huggingface_hub import HfApi
 
-    Args:
-        path (str): Local path to the model.
-        upload_repo (str): Name of the HF repo to upload to.
-        hf_path (str): Path to the original Hugging Face model.
-        task_type (str): Type of task the model was trained on.
-    """
-    from huggingface_hub import HfApi, ModelCard, logging
-
-    model_path = Path(path)
-
-    card = ModelCard.load(hf_path) if ModelCard.exist_in_hub(hf_path) else ModelCard()
-    card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"] 
-    card.data.base_model = hf_path
-    card.data.task_type = task_type
-    
-    card.text = card_text
-    # Overwrite README.md to add metadata
-    card.save(model_path / "README.md")
-
-    logging.set_verbosity_info()
+    if not hub_repo_id:
+        raise ValueError("hub_repo_id must be a non-empty Hugging Face repo ID")
 
     api = HfApi()
-    api.create_repo(repo_id=upload_repo, exist_ok=True)
+    api.create_repo(repo_id=hub_repo_id, repo_type="model", exist_ok=True)
     api.upload_folder(
         folder_path=path,
-        repo_id=upload_repo,
+        repo_id=hub_repo_id,
         repo_type="model",
-        multi_commits=True,
-        multi_commits_verbose=True,
+        commit_message=f"Upload {Path(path).name}",
     )
-    print(f"Upload successful, go to https://huggingface.co/{upload_repo} for details.")
-
-## COMMENTED OUT FOR NOW (Sharding not needing for small models)
-# def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
-#     """
-#     Splits the weights into smaller shards.
-
-#     Args:
-#         weights (dict): Model weights.
-#         max_file_size_gb (int): Maximum size of each shard in gigabytes.
-
-#     Returns:
-#         list: List of weight shards.
-#     """
-#     max_file_size_bytes = max_file_size_gb << 30
-#     shards = []
-#     shard, shard_size = {}, 0
-#     for k, v in weights.items():
-#         if shard_size + v.nbytes > max_file_size_bytes:
-#             shards.append(shard)
-#             shard, shard_size = {}, 0
-#         shard[k] = v
-#         shard_size += v.nbytes
-#     shards.append(shard)
-#     return shards
+    print(
+        "Upload successful, go to "
+        f"https://huggingface.co/{hub_repo_id} for details."
+    )

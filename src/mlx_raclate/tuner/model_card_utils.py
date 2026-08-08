@@ -2,6 +2,8 @@ from typing import List, Optional
 import importlib
 import inspect
 
+from huggingface_hub import ModelCardData
+
 # Pipeline to module mapping
 _PIPELINE_TO_MODULE = {
     "text-classification": "text_classification",
@@ -11,6 +13,16 @@ _PIPELINE_TO_MODULE = {
     "masked-lm": "masked_lm",
     "token-classification": "token_classification",
     "zero-shot-classification": "zero_shot",
+}
+
+_HUB_PIPELINE_TAGS = {
+    "text-classification": "text-classification",
+    "sentence-similarity": "sentence-similarity",
+    "sentence-transformers": "sentence-similarity",
+    "embeddings": "feature-extraction",
+    "masked-lm": "fill-mask",
+    "token-classification": "token-classification",
+    "zero-shot-classification": "zero-shot-classification",
 }
 
 
@@ -86,20 +98,7 @@ def _load_inference_example_module(pipeline: str):
 
     module_name = _PIPELINE_TO_MODULE[pipeline]
 
-    # Runtime templates live in the installed package. The tests fallback keeps
-    # compatibility with older source checkouts that predate that package.
-    try:
-        return importlib.import_module(
-            f"mlx_raclate.inference_examples.{module_name}"
-        )
-    except ImportError:
-        try:
-            return importlib.import_module(f"tests.inference_examples.{module_name}")
-        except ImportError as error:
-            raise ImportError(
-                f"Could not import inference example module for {pipeline}. "
-                "The mlx_raclate inference-examples package is incomplete."
-            ) from error
+    return importlib.import_module(f"mlx_raclate.inference_examples.{module_name}")
 
 
 def get_available_pipelines() -> List[str]:
@@ -157,7 +156,7 @@ With `transformers>=5.8.1`, this checkpoint uses the standard Hugging Face `open
 def get_code_for_trained_model(
     pipeline: str,
     model_path: str,
-    base_model: str,
+    base_model: Optional[str] = None,
     training_task: Optional[str] = None,
     **kwargs,
 ) -> str:
@@ -170,13 +169,21 @@ def get_code_for_trained_model(
     Args:
         pipeline: Pipeline the model was trained for
         model_path: Path where the model will be uploaded (e.g., "my-org/my-model")
-        base_model: The base model used for training
+        base_model: Upstream Hugging Face model ID used for training, if known
         training_task: Optional description of the training task
         **kwargs: Additional arguments for the code template
         
     Returns:
         Complete markdown section for the model card
     """
+    card_data = ModelCardData(
+        base_model=base_model,
+        library_name="mlx-raclate",
+        pipeline_tag=_HUB_PIPELINE_TAGS[pipeline],
+        tags=["mlx", "mlx-raclate"],
+    )
+    front_matter = f"---\n{card_data.to_yaml()}\n---\n\n"
+
     section = generate_model_card_section(
         pipeline=pipeline,
         model_path=model_path,
@@ -184,17 +191,21 @@ def get_code_for_trained_model(
     )
     
     # Add metadata about training
-    metadata = f"""
-### Model Details
-
-- **Base Model**: [{base_model}](https://huggingface.co/{base_model})
-- **Pipeline**: `{pipeline}`
-- **Framework**: [mlx-raclate](https://github.com/pappitti/mlx-raclate) (MLX)
-"""
+    metadata_lines = ["", "### Model Details", ""]
+    if base_model:
+        metadata_lines.append(
+            f"- **Base Model**: [{base_model}](https://huggingface.co/{base_model})"
+        )
+    metadata_lines.extend(
+        [
+            f"- **Pipeline**: `{pipeline}`",
+            "- **Framework**: [mlx-raclate](https://github.com/pappitti/mlx-raclate) (MLX)",
+        ]
+    )
     if training_task:
-        metadata += f"- **Training Task**: {training_task}\n"
+        metadata_lines.append(f"- **Training Task**: {training_task}")
     
-    return section + metadata
+    return front_matter + section + "\n".join(metadata_lines) + "\n"
 
 
 # ============================================================================

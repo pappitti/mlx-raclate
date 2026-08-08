@@ -1,3 +1,5 @@
+"""Behavioral contracts for bidirectional encoder routing, masking, and reloads."""
+
 import json
 from dataclasses import asdict
 

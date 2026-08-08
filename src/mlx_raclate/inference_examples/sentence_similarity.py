@@ -23,7 +23,7 @@ def run_inference(
         Dictionary containing:
         - similarities: Similarity matrix [num_queries, num_documents]
     """
-    from mlx_raclate.utils.utils import load
+    from mlx_raclate import load
     
     if "ColBERT" in model_path:
         use_late_interaction = True
@@ -43,7 +43,7 @@ def run_inference(
     max_length = getattr(model.config, "max_position_embeddings", 512)
     
     # Tokenize queries and documents
-    query_tokens = tokenizer._tokenizer(
+    query_tokens = tokenizer(
         queries,
         return_tensors="mlx",
         padding=True,
@@ -51,7 +51,7 @@ def run_inference(
         max_length=max_length
     )
     
-    doc_tokens = tokenizer._tokenizer(
+    doc_tokens = tokenizer(
         documents,
         return_tensors="mlx",
         padding=True,
@@ -73,7 +73,7 @@ def run_inference(
 
 
 _DENSE_EXAMPLE_CODE_TEMPLATE = '''import mlx.core as mx
-from mlx_raclate.utils.utils import load
+from mlx_raclate import load
 
 # Load model and tokenizer
 model, tokenizer = load(
@@ -88,7 +88,7 @@ documents = {documents}
 # Tokenize
 max_length = getattr(model.config, "max_position_embeddings", 512)
 
-query_tokens = tokenizer._tokenizer(
+query_tokens = tokenizer(
     queries,
     return_tensors="mlx",
     padding=True,
@@ -96,7 +96,7 @@ query_tokens = tokenizer._tokenizer(
     max_length=max_length
 )
 
-doc_tokens = tokenizer._tokenizer(
+doc_tokens = tokenizer(
     documents,
     return_tensors="mlx",
     padding=True,
@@ -124,7 +124,7 @@ for i, query in enumerate(queries):
 '''
 
 _LATE_INTERACTION_EXAMPLE_CODE_TEMPLATE = '''import mlx.core as mx
-from mlx_raclate.utils.utils import load
+from mlx_raclate import load
 
 # Load ColBERT-style model with late interaction enabled
 model, tokenizer = load(
@@ -140,7 +140,7 @@ documents = {documents}
 # Tokenize
 max_length = getattr(model.config, "max_position_embeddings", 512)
 
-query_tokens = tokenizer._tokenizer(
+query_tokens = tokenizer(
     queries,
     return_tensors="mlx",
     padding=True,
@@ -148,7 +148,7 @@ query_tokens = tokenizer._tokenizer(
     max_length=max_length
 )
 
-doc_tokens = tokenizer._tokenizer(
+doc_tokens = tokenizer(
     documents,
     return_tensors="mlx",
     padding=True,

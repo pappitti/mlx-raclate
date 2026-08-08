@@ -1,10 +1,13 @@
-# Python-generated files
+# Python-generated files and tool caches
+.DS_Store
 __pycache__/
 *.py[oc]
 build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
+.ruff_cache/
 
 # Virtual environments
 .venv
@@ -13,20 +16,12 @@ wheels/
 data/
 trained_models/
 
-# DEV notes
+# Local development scratch space (never imported by tracked tests)
 NOTES.md
 dev_tests/
 
 # Agents
 .agent
 
-# Pytest cache
-.pytest_cache
-.ruff_cache
-
 # Evals
 eval/
-
-# Dataset preprocessing
-tools/*
-!tools/calibrate_ner_viterbi.py

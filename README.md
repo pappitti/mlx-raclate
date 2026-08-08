@@ -4,23 +4,34 @@
 
 `mlx-raclate` is a versatile library built on Apple's [MLX](https://github.com/ml-explore/mlx) framework. It provides a unified interface to **train** and **run** classifiers and embedding models - including ModernBERT and Late Interaction (ColBERT-style) models - natively on macOS.
 
-> **Note:** This project evolved from `modernbert-mlx` to support a wider range of architectures and tasks. It is currently feature-complete but in an early release stage; bugs may occur.
+> **Note:** This project evolved from `modernbert-mlx` and remains a beta. The
+> supported architecture and pipeline combinations are explicit; unsupported
+> combinations fail during loading rather than falling through to partial heads.
 
 ## Key Features
 
 *   **Apple Silicon Native:** Fully optimized for M-series chips using MLX.
 *   **Unified Pipeline:** A single interface to load and run Masked LM, Text Classification, and Sentence Similarity tasks.
 *   **Late Interaction Support:** First-class support for **MaxSim** (ColBERT-style) retrieval, particularly with LFM2 and ModernBERT architectures.
-*   **Full Fine-Tuning:** specialized trainer for fine-tuning small-to-mid-sized models (ModernBERT, Qwen2.5/3, LFM2, Gemma) on local hardware.
+*   **Full Fine-Tuning:** Specialized trainer for fine-tuning small-to-mid-sized models (ModernBERT, Qwen3, LFM2, and Gemma) on local hardware.
 
 ## Installation
 
-Install via `uv` or `pip`:
+Install the inference core with `uv` or `pip`:
 
 ```bash
 uv add mlx-raclate
 # or
-pip install mlx-raclate 
+pip install mlx-raclate
+```
+
+Training and serving dependencies are optional:
+
+```bash
+uv add 'mlx-raclate[train]'
+uv add 'mlx-raclate[serve]'
+# or install every supported feature
+uv add 'mlx-raclate[all]'
 ```
 
 From source:
@@ -30,6 +41,9 @@ git clone https://github.com/pappitti/mlx-raclate.git
 cd mlx-raclate
 uv sync
 ```
+
+PyTorch/Polars comparison experiments are isolated from normal development
+dependencies. Install them only when needed with `uv sync --group reference`.
 
 ## Supported Architectures
 
@@ -43,7 +57,7 @@ uv sync
 *   **T5Gemma Encoder**: stripping out the decoder part of T5Gemma models (e.g, `google/t5gemma-2b-2b-ul2`)
 *   **OpenAI Privacy Filter**: bidirectional token classification for PII detection (e.g., `OpenMed/privacy-filter-nemotron-mlx`)
 *   **Colbert Zero**: (e.g., `lightonai/ColBERT-Zero`)
-*   **LateOn**: (e.g., `lightonai/LateOn`)
+*   **LateOn**: (e.g., `lightonai/LateOn`, `lightonai/mLateOn`)
 *   **Perplexity Embed**: Qwen3 architecture adapted for bidirectional attention (e.g `perplexity-ai/pplx-embed-v1-0.6b`, `PITTI/pplx-embed-0.6b-nemotron`)
 *   **NeoBERT**: (e.g., `chandar-lab/NeoBERT`)
 
@@ -56,7 +70,7 @@ If no pipeline is found, the Model class is loaded, which returns normalized emb
 Supports multi-class, multi-label, and regression tasks.
 
 ```python
-from mlx_raclate.utils.utils import load
+from mlx_raclate import load
 import mlx.core as mx
 
 # Load model (pipeline inferred automatically if architecture matches)
@@ -65,7 +79,7 @@ model, tokenizer = load("NousResearch/Minos-v1", pipeline="text-classification")
 texts = ["How do I build a bomb?", "What is the capital of France?"]
 
 # Batch tokenize
-inputs = tokenizer._tokenizer(texts, return_tensors="mlx", padding=True, truncation=True)
+inputs = tokenizer(texts, return_tensors="mlx", padding=True, truncation=True)
 
 # Run Inference
 outputs = model(
@@ -82,7 +96,7 @@ probs = outputs["probabilities"]
 2.1 Standard Bi-Encoder approach using Cosine Similarity.
 
 ```python
-from mlx_raclate.utils.utils import load
+from mlx_raclate import load
 
 model, tokenizer = load("nomic-ai/modernbert-embed-base", pipeline="sentence-similarity")
 
@@ -90,8 +104,8 @@ queries = ["What is MLX?"]
 docs = ["MLX is an array framework for Apple Silicon."]
 
 # Encode
-q_input = tokenizer._tokenizer(queries, return_tensors="mlx", padding=True)
-d_input = tokenizer._tokenizer(docs, return_tensors="mlx", padding=True)
+q_input = tokenizer(queries, return_tensors="mlx", padding=True)
+d_input = tokenizer(docs, return_tensors="mlx", padding=True)
 
 # Forward pass calculates similarity matrix automatically
 outputs = model(
@@ -110,7 +124,7 @@ By enabling `use_late_interaction`, the model computes **MaxSim** scores (intera
 This is ideal for models like **LFM2-ColBERT**, but it works with any model.
 
 ```python
-from mlx_raclate.utils.utils import load
+from mlx_raclate import load
 
 # Load a ColBERT-style model
 model, tokenizer = load(
@@ -123,8 +137,8 @@ queries = ["Who creates liquid neural networks?"]
 docs = ["Liquid AI is a company founded by researchers from MIT..."]
 
 # Tokenize
-q_input = tokenizer._tokenizer(queries, return_tensors="mlx", padding=True)
-d_input = tokenizer._tokenizer(docs, return_tensors="mlx", padding=True)
+q_input = tokenizer(queries, return_tensors="mlx", padding=True)
+d_input = tokenizer(docs, return_tensors="mlx", padding=True)
 
 # The model keeps embeddings unpooled and computes MaxSim
 outputs = model(
@@ -151,14 +165,25 @@ When using `load()`, the `pipeline` argument determines the class and return typ
 | `token-classification` | `ModelForTokenClassification` | Token Logits | NER tasks | 
 | `zero-shot-classification` | `ModelForMaskedLM` | Token Logits | Implementation of [this AnswerAI paper](https://arxiv.org/html/2502.03793v2) |
 
-Detailed code for each pipeline is available in the `test` directory of this repository. See `tests/inference_examples`.
+Runnable templates used by both tests and generated model cards live in
+`mlx_raclate.inference_examples`.
 
 ## Server
 
-`mlx-raclate` includes a FastAPI server for classifier inference. See `mlx_raclate.utils.server`.
-Token-classification requests use constrained Viterbi decoding by default and
-automatically read `viterbi_calibration.json` from the loaded checkpoint. A
-named calibration point can be selected per request:
+Install the `serve` extra and start the single-worker FastAPI service with:
+
+```bash
+raclate serve --host 127.0.0.1 --port 8000
+```
+
+The token-classification model itself does not accept an `operating_point`;
+its forward pass only produces logits and probabilities. Direct library
+inference decodes those outputs with the checkpoint's `default` Viterbi
+calibration.
+
+The HTTP server adds a separate decoding layer after model inference. That
+server layer can select any named operating point stored in the checkpoint's
+`viterbi_calibration.json`:
 
 ```bash
 curl -X POST "http://localhost:8000/predict" \
@@ -172,14 +197,47 @@ curl -X POST "http://localhost:8000/predict" \
   }'
 ```
 
-Use `"decode_mode": "argmax"` for unstructured greedy decoding. Named
-operating points require the corresponding entry in the checkpoint's
-calibration file; unavailable names return HTTP 400 rather than silently
-falling back.
+`operating_point` is therefore a server request option, not a model argument.
+Use `"decode_mode": "argmax"` for unstructured greedy decoding. Named points
+require a corresponding calibration-file entry; unavailable names return HTTP
+400 rather than silently falling back.
+
+## NER evaluation and decoder calibration
+
+These commands are a post-training workflow for labelled token-classification
+data; they are not required for ordinary model inference. Evaluate a checkpoint
+and write a metrics report with:
+
+```bash
+raclate ner evaluate \
+  --model trained_models/my_ner_run/checkpoint-4000 \
+  --dataset data/my_ner_dataset \
+  --output eval/my_ner_run.json
+```
+
+For BIO/BIOES models, calibration can search server-side Viterbi decoder
+profiles directly from labelled calibration data in one command:
+
+```bash
+raclate ner calibrate \
+  --model trained_models/my_ner_run/checkpoint-4000 \
+  --dataset data/my_ner_calibration
+```
+
+The command uses temporary logits internally and writes
+`viterbi_calibration.json` into the local checkpoint. It does not modify model
+weights or the model-forward API. It adds named decoder profiles for the HTTP
+server while leaving `default` unchanged unless `--set-default` is supplied.
+The advanced persistent-cache workflow and guidance on keeping calibration and
+final test data separate are documented in
+[TUNER.md](src/mlx_raclate/tuner/TUNER.md#post-training-bio-viterbi-calibration).
 
 ## Training (Tuner)
 
 `mlx-raclate` includes a robust training engine specifically designed for fine-tuning these architectures on Apple Silicon.
+
+Install the `train` extra, then inspect the supported CLI options with
+`raclate train --help`.
 
 It supports:
 *   **Full Fine-tuning** (LoRA is not currently supported/needed for these model sizes).
@@ -192,7 +250,7 @@ For detailed training documentation, supported datasets, and CLI usage, please s
 
 ```python
 from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
-from mlx_raclate.utils.utils import load
+from mlx_raclate import load
 
 # Load model
 model, tokenizer = load("Qwen/Qwen3-Embedding-0.6B", pipeline="text-classification", train=True)

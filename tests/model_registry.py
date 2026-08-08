@@ -12,15 +12,7 @@ additional endpoints via pytest fixtures.
 from typing import Dict, Tuple, Optional, List
 from dataclasses import dataclass, field
 
-PIPELINES = [
-    "embeddings",
-    "masked-lm",
-    "text-classification",
-    "token-classification",
-    "sentence-transformers",
-    "zero-shot-classification",
-    "sentence-similarity",
-]
+from mlx_raclate.registry import ARCHITECTURES, PIPELINES
 
 # Model families supported by the library
 MODEL_FAMILIES = [
@@ -52,20 +44,9 @@ TRAINABLE_PIPELINES = [
     "token-classification",
 ]
 
-# Training support depends on the available local head implementations.
-TRAINABLE_PIPELINES_BY_FAMILY: Dict[str, List[str]] = {
-    "modernbert": TRAINABLE_PIPELINES,
-    "qwen3": ["text-classification", "sentence-similarity"],
-    "gemma3": TRAINABLE_PIPELINES,
-    "t5gemma": TRAINABLE_PIPELINES,
-    "lfm2": ["text-classification", "sentence-similarity"],
-    "lfm2_bidirectional": [
-        "masked-lm",
-        "sentence-similarity",
-        "token-classification",
-    ],
-    "neobert": TRAINABLE_PIPELINES,
-    "openai_privacy_filter": ["text-classification", "sentence-similarity", "token-classification"],
+MODEL_FAMILY_TO_RUNTIME_TYPE = {
+    "gemma3": "gemma3_text",
+    "t5gemma": "t5gemma_encoder",
 }
 
 # Base models for each family (used for training tests when no pretrained head exists)
@@ -223,7 +204,15 @@ def get_all_endpoints() -> Dict[Tuple[str, str], EndpointConfig]:
 
 def get_trainable_pipelines(model_family: str) -> List[str]:
     """Get the trainable pipelines implemented for a model family."""
-    return TRAINABLE_PIPELINES_BY_FAMILY.get(model_family, [])
+    model_type = MODEL_FAMILY_TO_RUNTIME_TYPE.get(model_family, model_family)
+    capabilities = ARCHITECTURES.get(model_type)
+    if capabilities is None:
+        return []
+    return [
+        pipeline
+        for pipeline in TRAINABLE_PIPELINES
+        if pipeline in capabilities.pipeline_classes
+    ]
 
 
 def get_registered_model_families() -> List[str]:

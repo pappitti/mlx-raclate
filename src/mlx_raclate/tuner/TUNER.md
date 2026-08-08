@@ -12,7 +12,7 @@ This trainer supports standard dense retrieval, classification, and masked langu
 *   **Flexible Schedulers:** Linear, Cosine, and Constant learning rate schedules with warmup.
 *   **Smart Collators:** Task-specific data collators that handle padding, masking, and chat templates automatically.
 *   **Embedding Freezing:** Option to freeze embedding layers to speed up fine-tuning or prevent catastrophic forgetting.
-*   **HF Hub Integration (TODO):** Seamless saving and pushing of checkpoints to the Hugging Face Hub.
+*   **Hugging Face Hub Publishing:** Checkpoints can generate Hub-ready model cards and upload to an explicit model repository.
 
 ## Supported Architectures
 
@@ -56,12 +56,12 @@ Named Entity Recognition and Part-of-Speech tagging.
 *   **Task Type:** `token-classification`
 *   **Features:** Handles label alignment for sub-word tokens automatically. The trainer is label-scheme agnostic: BIO, BIOES/BILOU, flat tags, or integer class ids all work as long as there is one label per input word.
 
-For the Finance/CRM BIO run with LFM2.5, prepare model-tokenized, entity-safe
-16k chunks and validate the training plan with:
+For a Finance/CRM BIO run with LFM2.5, prepare model-tokenized, entity-safe
+chunks, then use the normal training CLI:
 
 ```bash
-uv run python tools/prepare_finance_crm_ner_bio_dataset.py
-uv run python dev_tests/train_finance_crm_ner.py --dry-run
+uv run python tools/prepare_finance_crm_ner_dataset.py --help
+uv run raclate train --help
 ```
 
 
@@ -155,7 +155,7 @@ See DataCollatorForSequenceClassification in `collators.py` for more information
 Below is a simplified example of how to set up a training run programmatically.
 
 ```python
-from mlx_raclate.utils.utils import load
+from mlx_raclate import load
 from mlx_raclate.tuner.datasets import load_dataset, DatasetArgs
 from mlx_raclate.tuner.trainer import Trainer, TrainingArgs
 
@@ -222,15 +222,42 @@ if test_ds:
     trainer.test(test_ds)
 ```
 
-## CLI usage 
+## CLI usage
 
-An example of CLI tool including **all** parameters to train a model is available in `mlx_raclate.utils.train.py`.  
+The installed `raclate train` command exposes dataset, model, optimizer,
+checkpointing, and memory controls. Model and dataset are required explicitly;
+the CLI does not assume a developer-local checkpoint or dataset.
 
-WARNING : this example includes default values that override the default values of the DatasetArgs, TrainingArgs and Trainer classes presented below.
+```bash
+raclate train \
+  --model_path answerdotai/ModernBERT-base \
+  --dataset data/my_classifier \
+  --task_type text-classification \
+  --output_dir my_classifier
+```
+
+Hub publishing is opt-in and requires explicit source and destination IDs. This
+keeps a local directory name or architecture `model_type` from being mistaken
+for a Hub repository:
+
+```bash
+raclate train \
+  --model_path answerdotai/ModernBERT-base \
+  --dataset data/my_classifier \
+  --task_type text-classification \
+  --output_dir my_classifier \
+  --push_to_hub \
+  --hub_repo_id my-org/my-classifier \
+  --base_model answerdotai/ModernBERT-base
+```
+
+The checkpoint README uses `hub_repo_id` in its runnable example and records
+`base_model` in standard model-card metadata. If an upload fails, the complete
+local checkpoint is retained and training reports a warning.
 
 ### NER evaluation
 
-Use `tools/evaluate_ner_models.py` to compare saved token-classification
+Use `raclate ner evaluate` to compare saved token-classification
 checkpoints. It reports token accuracy plus macro/micro precision, recall, and
 F1 at both token level and exact entity-boundary level. Entity true-positive,
 false-positive, false-negative, support, precision, recall, and F1 values are
@@ -239,7 +266,7 @@ also included per entity type in the JSON output.
 For a normal dataset directory containing `validation.parquet`:
 
 ```bash
-uv run python tools/evaluate_ner_models.py \
+uv run raclate ner evaluate \
   --model trained_models/my_ner_run/checkpoint-4000 \
   --dataset data/my_ner_dataset \
   --output eval/my_ner_run.json
@@ -250,7 +277,7 @@ A multi-phase root is discovered automatically. The following evaluates both
 `lexical_calibration/validation.parquet` for every checkpoint:
 
 ```bash
-uv run python tools/evaluate_ner_models.py \
+uv run raclate ner evaluate \
   --model \
     trained_models/finance_ner/checkpoint-4000 \
     trained_models/finance_ner/checkpoint-6000 \
@@ -271,11 +298,27 @@ silently producing invalid scores.
 ### Post-training BIO Viterbi calibration
 
 BIO checkpoints support coarse transition biases for starting, continuing,
-ending, and splitting entity spans. Cache validation logits once while running
-the normal evaluator:
+ending, and splitting entity spans. The recommended workflow performs
+inference, searches the transition biases, and writes
+`viterbi_calibration.json` into the checkpoint in one command:
 
 ```bash
-uv run python tools/evaluate_ner_models.py \
+uv run raclate ner calibrate \
+  --model trained_models/finance_ner/checkpoint-4000 \
+  --dataset data/NER-Finance-CRM/bio_pplx_embed_v1_0_6b_16k
+```
+
+Temporary logits caches are removed automatically. A multi-phase dataset root
+is discovered just as it is during evaluation, so all matching validation
+splits are pooled. Use `--output-calibration PATH` to write somewhere other
+than the local checkpoint, or when calibrating a non-local model ID.
+
+For repeated search experiments, keep and reuse logits caches explicitly. This
+advanced two-step workflow avoids loading the model again. First create the
+caches with the evaluator:
+
+```bash
+uv run raclate ner evaluate \
   --model trained_models/finance_ner/checkpoint-4000 \
   --dataset data/NER-Finance-CRM/bio_pplx_embed_v1_0_6b_16k \
   --decode both \
@@ -283,11 +326,10 @@ uv run python tools/evaluate_ner_models.py \
   --output eval/finance_ner_before_calibration.json
 ```
 
-The evaluator prints each generated `.npz` path. Search one cache, or pool
-multiple caches with the same label ontology, without loading the model again:
+Then search one cache, or pool multiple caches with the same label ontology:
 
 ```bash
-uv run python tools/calibrate_ner_viterbi.py \
+uv run raclate ner calibrate \
   --cache \
     eval/finance_ner_logits/MODEL_CACHE/generalization.npz \
     eval/finance_ner_logits/MODEL_CACHE/lexical_calibration.npz \
@@ -296,10 +338,12 @@ uv run python tools/calibrate_ner_viterbi.py \
 
 The tuner preserves the existing `default` point and writes `balanced`,
 `high_precision`, and `high_recall`. The latter two retain at least 95% of the
-balanced point's recall or precision by default. Select one during evaluation:
+balanced point's recall or precision by default. These are post-inference
+decoder profiles, not arguments accepted by the model's forward method. The
+evaluator or HTTP server can select one explicitly:
 
 ```bash
-uv run python tools/evaluate_ner_models.py \
+uv run raclate ner evaluate \
   --model trained_models/finance_ner/checkpoint-4000 \
   --dataset data/NER-Finance-CRM/bio_pplx_embed_v1_0_6b_16k \
   --operating-point balanced
@@ -308,8 +352,9 @@ uv run python tools/evaluate_ner_models.py \
 Use `--set-default` when tuning to promote `balanced` to the default decoder
 setting. Calibration selects a decoder on labelled data, so report final
 metrics on a separate untouched test split rather than on the calibration
-cache itself. Float32 logits are cached by default; `--logits-cache-dtype
-float16` reduces disk use when small score perturbations are acceptable.
+data itself. Float32 logits are cached by default; `--logits-cache-dtype
+float16` reduces temporary or persistent cache use when small score
+perturbations are acceptable.
 
 ## API Reference
 
@@ -370,6 +415,9 @@ Controls the hyperparameters and runtime configuration.
 | `resume_from_step`| `0` | Legacy data-skipping resume without Adam moments; use only when a complete checkpoint is unavailable. |
 | `grad_checkpoint` | `True` | Whether to wrap transformer layers in MLX gradient checkpointing to reduce activation memory. |
 | `cache_clear_steps` | `1` | Clear MLX cache every N optimizer updates. `1` is safest for large/MoE models; higher values can improve speed but may increase process footprint. |
+| `push_to_hub` | `False` | Upload each saved checkpoint to Hugging Face. Requires `hub_repo_id` and `base_model`. |
+| `hub_repo_id` | `None` | Explicit destination model repository, such as `my-org/my-model`. Also used in generated Hub usage examples. |
+| `base_model` | `None` | Upstream Hugging Face model ID recorded in model-card metadata. |
 
 Gradient checkpointing is enabled by default due to RAM constraints of consumer hardware. It is applied at each backbone block call through `GradientCheckpointingMixin`, using MLX's module-aware `mlx.nn.utils.checkpoint` helper so the block's trainable parameters participate in recomputation. A new backbone must inherit that mixin and invoke blocks through `_call_checkpointed_layer`; the trainer fails explicitly if no compatible backbone is present. MLX cache clearing is also aggressive by default because unified-memory footprint can be much larger than `mx.get_active_memory()` for some architectures.
 
